@@ -55,6 +55,9 @@ bool is_interface_ip(const std::string& interface_name,
 
 std::pair<uint32_t, std::string> get_interface_ip(
     const std::string& interface_name) {
+  if (interface_name.empty()) {
+    return {0, ""};
+  }
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
     BOOST_LOG_TRIVIAL(warning)
