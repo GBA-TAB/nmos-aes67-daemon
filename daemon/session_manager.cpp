@@ -567,6 +567,7 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
   info.stream[0].m_uiId = source.id;
   info.stream[0].m_ui32RTCPSrcIP = config_->get_ip_addr();
   info.stream[0].m_ui32SrcIP = config_->get_ip_addr();  // only for Source
+  bool use_source_address = false;
   boost::system::error_code ec;
 #if BOOST_VERSION < 108700
   ip::address_v4::from_string(source.address, ec);
@@ -580,6 +581,7 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
 #else
         ip::make_address(source.address).to_v4().to_uint();
 #endif
+    use_source_address = true;
   } else {
     info.stream[0].m_ui32DestIP =
 #if BOOST_VERSION < 108700
@@ -672,17 +674,19 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
       auto [ip_addr, ip_str] = get_interface_ip(config_->get_interface_name(1));
       if (!ip_str.empty()) {
         memcpy(&info.stream[1], &info.stream[0], sizeof(info.stream[0]));
-        info.stream[1].m_ui32DestIP =
-#if BOOST_VERSION < 108700
-            ip::address_v4::from_string(
-                config_->get_rtp_mcast_base_sec().c_str())
-                .to_ulong() +
-#else
-            ip::make_address(config_->get_rtp_mcast_base_sec().c_str())
-                .to_v4()
-                .to_uint() +
-#endif
-            source.id;
+        if (!use_source_address) {
+          info.stream[1].m_ui32DestIP =
+  #if BOOST_VERSION < 108700
+              ip::address_v4::from_string(
+                  config_->get_rtp_mcast_base_sec().c_str())
+                  .to_ulong() +
+  #else
+              ip::make_address(config_->get_rtp_mcast_base_sec().c_str())
+                  .to_v4()
+                  .to_uint() +
+  #endif
+              source.id;
+        }
         info.stream[1].m_ui32RTCPSrcIP = ip_addr;
         info.stream[1].m_ui32SrcIP = ip_addr;  // only for Source
         info.stream[1].m_uiIfPortId = 1;

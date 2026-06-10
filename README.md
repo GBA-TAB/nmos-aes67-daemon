@@ -116,7 +116,7 @@ When ST-2022-7 is enabled:
  - AES67 control (SAP and mDNS) runs on all interfaces.
 
 Beginning with daemon version 3.1, both the daemon and the WebUI support specifying a separate address and port for the secondary interface (daemon parameters _rtp_mcast_base_sec_ and _rtp_port_sec_).
-When ST-2022-7 is enabled the daemon uses these values for the Sources and advertises the redundant multicast audio flow in the associated SDP file. 
+When ST-2022-7 is enabled the daemon uses these values for the Sources and advertises the redundant multicast audio flow in the associated SDP file.
 For example:
 
 ```
@@ -149,6 +149,8 @@ a=clock-domain:PTPv2 0
 a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-50-36-33:0
 a=mid:2
 ```
+
+If a specific RTP address is defined when the Source is created, that address will be used for both the primary and secondary interfaces, replacing the default addresses.
 
 For a Sink, when ST-2022-7 is enabled, the daemon retrieves the audio media redundant multicast flow address and port from the remote Source’s SDP file. If these are not specified the daemon uses the address and port specified for the primary.
 
