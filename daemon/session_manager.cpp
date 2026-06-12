@@ -64,20 +64,33 @@ static uint8_t get_codec_word_length(std::string_view codec) {
 bool SessionManager::parse_sdp(const std::string& sdp, StreamInfo& info) const {
   /*
   v=0
-  o=- 4 0 IN IP4 10.0.0.12
-  s=ALSA (on ubuntu)_4
-  c=IN IP4 239.1.0.12/15
+  o=- 2831159553 317021570 IN IP4 192.168.1.17
+  s=Daemon a8c01101 ALSA Source 0
   t=0 0
-  a=clock-domain:PTPv2 0
+  a=group:DUP 1 2
   m=audio 5004 RTP/AVP 98
-  c=IN IP4 239.1.0.12/15
-  a=rtpmap:98 L16/44100/8
+  c=IN IP4 239.1.0.1/15
+  a=source-filter: incl IN IP4 239.1.0.1 192.168.1.17
+  a=rtpmap:98 L24/48000/2
   a=sync-time:0
-  a=framecount:64-192
-  a=ptime:4.35374165
+  a=framecount:48
+  a=ptime:1
   a=mediaclk:direct=0
-  a=ts-refclk:ptp=IEEE1588-2008:00-0C-29-FF-FE-0E-90-C8:0
+  a=clock-domain:PTPv2 0
+  a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-50-36-33:0
   a=recvonly
+  a=mid:1
+  m=audio 5006 RTP/AVP 98
+  c=IN IP4 239.1.0.1/15
+  a=source-filter: incl IN IP4 239.1.0.1 192.168.1.18
+  a=rtpmap:98 L24/48000/2
+  a=sync-time:0
+  a=framecount:48
+  a=ptime:1
+  a=mediaclk:direct=0
+  a=clock-domain:PTPv2 0
+  a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-50-36-33:0
+  a=mid:2
   */
 
   int num = 0;
@@ -86,7 +99,9 @@ bool SessionManager::parse_sdp(const std::string& sdp, StreamInfo& info) const {
     sdp_parser_status status = sdp_parser_status::init;
     std::stringstream ssstrem(sdp);
     std::string line;
-    while (getline(ssstrem, line, '\n')) {
+    int mid = -1;
+    bool dup = false;
+    while (getline(ssstrem, line, '\n') && mid < media_max) {
       boost::trim(line);
       ++num;
       if (line[1] != '=') {
@@ -133,10 +148,14 @@ bool SessionManager::parse_sdp(const std::string& sdp, StreamInfo& info) const {
           std::string value = val.substr(pos + 1);
           switch (status) {
             case sdp_parser_status::init:
-              break;
             case sdp_parser_status::time:
-              /* time attributes */
-              if (name == "clock-domain") {
+              /* session level attributes */
+              if (name == "group") {
+                /* a=group:DUP 1 2 */
+                if (value.substr(0, 3) == "DUP") {
+                  dup = true;
+                }
+              } else if (name == "clock-domain") {
                 /* a=clock-domain:PTPv2 0 */
                 if (value.substr(0, 5) != "PTPv2") {
                   BOOST_LOG_TRIVIAL(error)
@@ -161,30 +180,31 @@ bool SessionManager::parse_sdp(const std::string& sdp, StreamInfo& info) const {
                   return false;
                 }
                 // if matching payload
-                if (info.stream[0].m_byPayloadType == std::stoi(fields[0])) {
-                  strncpy(info.stream[0].m_cCodec, fields[1].c_str(),
-                          sizeof(info.stream[0].m_cCodec) - 1);
-                  info.stream[0].m_byWordLength =
+                if (info.stream[mid].m_byPayloadType == std::stoi(fields[0])) {
+                  strncpy(info.stream[mid].m_cCodec, fields[1].c_str(),
+                          sizeof(info.stream[mid].m_cCodec) - 1);
+                  info.stream[mid].m_byWordLength =
                       get_codec_word_length(fields[1]);
-                  info.stream[0].m_ui32SamplingRate = std::stoul(fields[2]);
-                  if (info.stream[0].m_byNbOfChannels != std::stoi(fields[3])) {
+                  info.stream[mid].m_ui32SamplingRate = std::stoul(fields[2]);
+                  if (info.stream[mid].m_byNbOfChannels !=
+                      std::stoi(fields[3])) {
                     BOOST_LOG_TRIVIAL(warning)
                         << "session_manager:: invalid audio channel "
                            "number in SDP at line "
                         << num << ", using "
-                        << (int)info.stream[0].m_byNbOfChannels;
+                        << (int)info.stream[mid].m_byNbOfChannels;
                     /*return false; */
                   }
                 }
               } else if (name == "sync-time") {
                 /* a=sync-time:0 */
-                info.stream[0].m_ui32RTPTimestampOffset = std::stoul(value);
+                info.stream[mid].m_ui32RTPTimestampOffset = std::stoul(value);
               } else if (name == "framecount") {
                 /* a=framecount:64-192 */
               } else if (name == "ptime") {
                 /* a=mediaclk:ptime=4.35374165 */
-                info.stream[0].m_ui32MaxSamplesPerPacket =
-                    (static_cast<double>(info.stream[0].m_ui32SamplingRate) *
+                info.stream[mid].m_ui32MaxSamplesPerPacket =
+                    (static_cast<double>(info.stream[mid].m_ui32SamplingRate) *
                      std::stod(value)) /
                     1000;
               } else if (name == "mediaclk") {
@@ -193,7 +213,7 @@ bool SessionManager::parse_sdp(const std::string& sdp, StreamInfo& info) const {
                 boost::split(fields, value,
                              [line](char c) { return c == '='; });
                 if (fields.size() == 2 && fields[0] == "direct") {
-                  info.stream[0].m_ui32RTPTimestampOffset =
+                  info.stream[mid].m_ui32RTPTimestampOffset =
                       std::stoul(fields[1]);
                 }
               } else if (name == "ts-refclk" && !info.ignore_refclk_gmid) {
@@ -213,6 +233,8 @@ bool SessionManager::parse_sdp(const std::string& sdp, StreamInfo& info) const {
                     return false;
                   }
                 }
+              } else if (name == "mid") {
+                /* a=mid:1*/
               }
               break;
           }
@@ -227,10 +249,13 @@ bool SessionManager::parse_sdp(const std::string& sdp, StreamInfo& info) const {
             return false;
           }
           if (fields[0] == "audio") {
-            info.stream[0].m_usDestPort = std::stoi(fields[1]);
-            info.stream[0].m_byPayloadType =
-                std::stoi(fields[3]); /* take first payload */
-            status = sdp_parser_status::media;
+            /* new audio media */
+            if (++mid < media_max) {
+              info.stream[mid].m_usDestPort = std::stoi(fields[1]);
+              info.stream[mid].m_byPayloadType =
+                  std::stoi(fields[3]); /* take first payload */
+              status = sdp_parser_status::media;
+            }
           }
           break;
         }
@@ -256,23 +281,32 @@ bool SessionManager::parse_sdp(const std::string& sdp, StreamInfo& info) const {
                   << num;
               return false;
             }
-            info.stream[0].m_ui32DestIP =
+
+            uint32_t destIP =
 #if BOOST_VERSION < 108700
                 ip::address_v4::from_string(fields[2].c_str()).to_ulong();
 #else
 
                 ip::make_address(fields[2].c_str()).to_v4().to_uint();
 #endif
-            if (info.stream[0].m_ui32DestIP == INADDR_NONE) {
+            if (destIP == INADDR_NONE) {
               BOOST_LOG_TRIVIAL(error) << "session_manager:: invalid IPv4 "
                                           "connection address in SDP at line "
                                        << num;
               return false;
             }
-            if (fields.size() > 3) {
-              info.stream[0].m_byTTL = std::stoi(fields[3]);
+            uint8_t byTTL = fields.size() > 3 ? std::stoi(fields[3]) : 64;
+
+            if (status == sdp_parser_status::init) {
+              /* generic connection info, copy to all media */
+              for (int i = 0; i < media_max; ++i) {
+                info.stream[i].m_ui32DestIP = destIP;
+                info.stream[i].m_byTTL = byTTL;
+              }
             } else {
-              info.stream[0].m_byTTL = 64;
+              /* connection info of audio media, copy only to current media */
+              info.stream[mid].m_ui32DestIP = destIP;
+              info.stream[mid].m_byTTL = byTTL;
             }
           }
           break;
@@ -284,6 +318,10 @@ bool SessionManager::parse_sdp(const std::string& sdp, StreamInfo& info) const {
           }
           break;
       }
+    }
+    if (dup && mid > 0) {
+      /* DUP attribute and two audio media found */
+      info.st20227_enabled = true;
     }
   } catch (...) {
     BOOST_LOG_TRIVIAL(fatal) << "session_manager:: invalid SDP at line " << num
@@ -517,7 +555,7 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
   strncpy(info.stream[0].m_cName, source.name.c_str(),
           sizeof(info.stream[0].m_cName) - 1);
   info.stream[0].m_ucDSCP = source.dscp;  // IPv4 DSCP
-  // info.stream[0].m_uiIfPortId = 1;
+  info.stream[0].m_uiIfPortId = 0;
   info.stream[0].m_byPayloadType = source.payload_type;
   info.stream[0].m_byWordLength = get_codec_word_length(source.codec);
   info.stream[0].m_byNbOfChannels = source.map.size();
@@ -529,6 +567,7 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
   info.stream[0].m_uiId = source.id;
   info.stream[0].m_ui32RTCPSrcIP = config_->get_ip_addr();
   info.stream[0].m_ui32SrcIP = config_->get_ip_addr();  // only for Source
+  bool use_source_address = false;
   boost::system::error_code ec;
 #if BOOST_VERSION < 108700
   ip::address_v4::from_string(source.address, ec);
@@ -542,6 +581,7 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
 #else
         ip::make_address(source.address).to_v4().to_uint();
 #endif
+    use_source_address = true;
   } else {
     info.stream[0].m_ui32DestIP =
 #if BOOST_VERSION < 108700
@@ -634,9 +674,24 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
       auto [ip_addr, ip_str] = get_interface_ip(config_->get_interface_name(1));
       if (!ip_str.empty()) {
         memcpy(&info.stream[1], &info.stream[0], sizeof(info.stream[0]));
+        if (!use_source_address) {
+          info.stream[1].m_ui32DestIP =
+  #if BOOST_VERSION < 108700
+              ip::address_v4::from_string(
+                  config_->get_rtp_mcast_base_sec().c_str())
+                  .to_ulong() +
+  #else
+              ip::make_address(config_->get_rtp_mcast_base_sec().c_str())
+                  .to_v4()
+                  .to_uint() +
+  #endif
+              source.id;
+        }
         info.stream[1].m_ui32RTCPSrcIP = ip_addr;
         info.stream[1].m_ui32SrcIP = ip_addr;  // only for Source
         info.stream[1].m_uiIfPortId = 1;
+        info.stream[1].m_usSrcPort = config_->get_rtp_port_sec();
+        info.stream[1].m_usDestPort = config_->get_rtp_port_sec();
 
         if (!IN_MULTICAST(info.stream[1].m_ui32DestIP)) {
           /* reuse the MAC address found on interface 0 */
@@ -680,6 +735,11 @@ std::string SessionManager::get_source_sdp_(uint32_t id,
                                             const StreamInfo& info) const {
   std::shared_lock ptp_lock(ptp_mutex_);
   uint32_t sample_rate = driver_->get_current_sample_rate();
+  auto [ip_addr, sec_ip_str] = get_interface_ip(config_->get_interface_name(1));
+  bool dup_entry =
+      info.st20227_enabled && !sec_ip_str.empty()/* &&
+      (info.stream[0].m_ui32DestIP != info.stream[1].m_ui32DestIP ||
+       info.stream[0].m_usDestPort != info.stream[1].m_usDestPort)*/;
 
   // need a 12 digit precision for ptime
   std::ostringstream ss_ptime;
@@ -696,23 +756,20 @@ std::string SessionManager::get_source_sdp_(uint32_t id,
   ss << "v=0\n"
      << "o=- " << info.session_id << " " << info.session_version << " IN IP4 "
      << ip::address_v4(info.stream[0].m_ui32SrcIP).to_string() << "\n"
-     << "s=" << config_->get_node_id() << " " << info.stream[0].m_cName << "\n"
-     << "c=IN IP4 " << ip::address_v4(info.stream[0].m_ui32DestIP).to_string();
-  if (IN_MULTICAST(info.stream[0].m_ui32DestIP)) {
-    ss << "/" << static_cast<unsigned>(info.stream[0].m_byTTL);
+     << "s=" << config_->get_node_id() << " " << info.stream[0].m_cName << "\n";
+    ss << "t=0 0\n";
+  if (dup_entry) {
+    ss << "a=group:DUP 1 2\n";
   }
-  /*ss << "\na=source-filter: incl IN IP4 "
-     << ip::address_v4(info.stream[0].m_ui32DestIP).to_string() << " "
-     << config_->get_ip_addr_str();*/
-  ss << "\nt=0 0\n"
-     << "a=clock-domain:PTPv2 " << static_cast<unsigned>(ptp_config_.domain)
-     << "\n"
-     << "m=audio " << info.stream[0].m_usSrcPort << " RTP/AVP "
+  ss << "m=audio " << info.stream[0].m_usDestPort << " RTP/AVP "
      << static_cast<unsigned>(info.stream[0].m_byPayloadType) << "\n"
      << "c=IN IP4 " << ip::address_v4(info.stream[0].m_ui32DestIP).to_string();
   if (IN_MULTICAST(info.stream[0].m_ui32DestIP)) {
     ss << "/" << static_cast<unsigned>(info.stream[0].m_byTTL);
   }
+  ss << "\na=source-filter: incl IN IP4 "
+     << ip::address_v4(info.stream[0].m_ui32DestIP).to_string() << " "
+     << config_->get_ip_addr_str();
   ss << "\na=rtpmap:" << static_cast<unsigned>(info.stream[0].m_byPayloadType)
      << " " << info.stream[0].m_cCodec << "/" << sample_rate << "/"
      << static_cast<unsigned>(info.stream[0].m_byNbOfChannels) << "\n"
@@ -720,7 +777,8 @@ std::string SessionManager::get_source_sdp_(uint32_t id,
      << "a=framecount:" << info.stream[0].m_ui32MaxSamplesPerPacket << "\n"
      << "a=ptime:" << ptime << "\n"
      << "a=mediaclk:direct=0\n";
-  ss << "a=ts-refclk:ptp=IEEE1588-2008:";
+  ss << "a=clock-domain:PTPv2 " << static_cast<unsigned>(ptp_config_.domain)
+     << "\na=ts-refclk:ptp=IEEE1588-2008:";
   if (info.refclk_ptp_traceable) {
     ss << "traceable\n";
   } else {
@@ -728,7 +786,35 @@ std::string SessionManager::get_source_sdp_(uint32_t id,
        << "\n";
   }
   ss << "a=recvonly\n";
-
+  if (dup_entry) {
+    ss << "a=mid:1\n"
+       << "m=audio " << info.stream[1].m_usDestPort << " RTP/AVP "
+       << static_cast<unsigned>(info.stream[1].m_byPayloadType) << "\n"
+       << "c=IN IP4 "
+       << ip::address_v4(info.stream[1].m_ui32DestIP).to_string();
+    if (IN_MULTICAST(info.stream[1].m_ui32DestIP)) {
+      ss << "/" << static_cast<unsigned>(info.stream[1].m_byTTL);
+    }
+    ss << "\na=source-filter: incl IN IP4 "
+       << ip::address_v4(info.stream[1].m_ui32DestIP).to_string() << " "
+       << sec_ip_str;
+    ss << "\na=rtpmap:" << static_cast<unsigned>(info.stream[1].m_byPayloadType)
+       << " " << info.stream[1].m_cCodec << "/" << sample_rate << "/"
+       << static_cast<unsigned>(info.stream[1].m_byNbOfChannels) << "\n"
+       << "a=sync-time:0\n"
+       << "a=framecount:" << info.stream[1].m_ui32MaxSamplesPerPacket << "\n"
+       << "a=ptime:" << ptime << "\n"
+       << "a=mediaclk:direct=0\n";
+    ss << "a=clock-domain:PTPv2 " << static_cast<unsigned>(ptp_config_.domain)
+       << "\na=ts-refclk:ptp=IEEE1588-2008:";
+    if (info.refclk_ptp_traceable) {
+      ss << "traceable\n";
+    } else {
+      ss << ptp_status_.gmid << ":" << static_cast<unsigned>(ptp_config_.domain)
+         << "\n";
+    }
+    ss << "a=mid:2\n";
+  }
   return ss.str();
 }
 
@@ -825,15 +911,18 @@ std::error_code SessionManager::add_sink(const StreamSink& sink) {
 
   StreamInfo info;
   memset(&info.stream[0], 0, sizeof info.stream[0]);
+  info.st20227_enabled = false;
   info.stream[0].m_bSource = 0;  // sink
   info.stream[0].m_ui32CRTP_stream_info_sizeof = sizeof(info.stream[0]);
   strncpy(info.stream[0].m_cName, sink.name.c_str(),
           sizeof(info.stream[0].m_cName) - 1);
   info.stream[0].m_uiId = sink.id;
+  info.stream[1].m_uiIfPortId = 0;
   info.stream[0].m_byNbOfChannels = sink.map.size();
   std::copy(sink.map.begin(), sink.map.end(), info.stream[0].m_aui32Routing);
   info.stream[0].m_ui32PlayOutDelay = sink.delay;
   info.stream[0].m_ui32RTCPSrcIP = config_->get_ip_addr();
+  memcpy(&info.stream[1], &info.stream[0], sizeof(info.stream[0]));
   info.ignore_refclk_gmid = sink.ignore_refclk_gmid;
   info.io = sink.io;
 
@@ -900,25 +989,34 @@ std::error_code SessionManager::add_sink(const StreamSink& sink) {
   info.sink_source = sink.source;
   info.sink_use_sdp = true;  // save back and use with SDP file
 
-  info.stream[0].m_ui32FrameSize = info.stream[0].m_ui32MaxSamplesPerPacket;
-  if (!info.stream[0].m_ui32FrameSize) {
-    // if not from SDP use config
-    info.stream[0].m_ui32FrameSize = config_->get_max_tic_frame_size();
-  }
+  int media_num = info.st20227_enabled ? media_max : 1;
+  for (int mid = 0; mid < media_num; mid++) {
+    info.stream[mid].m_ui32FrameSize = info.stream[0].m_ui32MaxSamplesPerPacket;
+    if (!info.stream[mid].m_ui32FrameSize) {
+      // if not from SDP use config
+      info.stream[mid].m_ui32FrameSize = config_->get_max_tic_frame_size();
+    }
 
-  BOOST_LOG_TRIVIAL(info) << "session_manager:: sink frame size "
-                          << info.stream[0].m_ui32FrameSize;
-  BOOST_LOG_TRIVIAL(info) << "session_manager:: playout delay "
-                          << info.stream[0].m_ui32PlayOutDelay;
+    BOOST_LOG_TRIVIAL(info)
+        << "session_manager:: media " << mid << " sink addr "
+        << ip::address_v4(info.stream[mid].m_ui32DestIP).to_string() << ":"
+        << info.stream[mid].m_usDestPort;
+    BOOST_LOG_TRIVIAL(info)
+        << "session_manager:: media " << mid << " sink frame size "
+        << info.stream[mid].m_ui32FrameSize;
+    BOOST_LOG_TRIVIAL(info)
+        << "session_manager:: media " << mid << " playout delay "
+        << info.stream[mid].m_ui32PlayOutDelay;
 
-  if (IN_MULTICAST(info.stream[0].m_ui32DestIP)) {
-    auto mcast_mac_addr = get_mcast_mac_addr(info.stream[0].m_ui32DestIP);
-    std::copy(std::begin(mcast_mac_addr), std::end(mcast_mac_addr),
-              info.stream[0].m_ui8DestMAC);
-  } else {
-    auto mac_addr = config_->get_mac_addr();
-    std::copy(std::begin(mac_addr), std::end(mac_addr),
-              info.stream[0].m_ui8DestMAC);
+    if (IN_MULTICAST(info.stream[mid].m_ui32DestIP)) {
+      auto mcast_mac_addr = get_mcast_mac_addr(info.stream[0].m_ui32DestIP);
+      std::copy(std::begin(mcast_mac_addr), std::end(mcast_mac_addr),
+                info.stream[mid].m_ui8DestMAC);
+    } else {
+      auto mac_addr = config_->get_mac_addr();
+      std::copy(std::begin(mac_addr), std::end(mac_addr),
+                info.stream[mid].m_ui8DestMAC);
+    }
   }
 
   std::unique_lock sinks_lock(sinks_mutex_);
@@ -948,13 +1046,15 @@ std::error_code SessionManager::add_sink(const StreamSink& sink) {
     return ret;
   }
 
-  info.st20227_enabled = false;
   if (config_->get_interface_name(1).length() > 0) {
     auto [ip_addr, ip_str] = get_interface_ip(config_->get_interface_name(1));
     if (!ip_str.empty()) {
-      memcpy(&info.stream[1], &info.stream[0], sizeof(info.stream[0]));
+      if (!info.st20227_enabled) {
+        /* if no DUP in SDP, duplicate information of primary audio media */
+        memcpy(&info.stream[1], &info.stream[0], sizeof(info.stream[0]));
+      }
+
       info.stream[1].m_ui32RTCPSrcIP = ip_addr;
-      // info.stream[0].m_ui32SrcIP = ntohl(ip_addr);  // only for Source
       info.stream[1].m_uiIfPortId = 1;
 
       if (!IN_MULTICAST(info.stream[1].m_ui32DestIP)) {
@@ -976,6 +1076,8 @@ std::error_code SessionManager::add_sink(const StreamSink& sink) {
       }
       info.st20227_enabled = true;
     }
+  } else {
+    info.st20227_enabled = false;
   }
   on_add_sink(sink, info);
 

@@ -89,7 +89,10 @@ std::string config_to_json(const Config& config) {
      << ",\n  \"sample_rate\": " << config.get_sample_rate()
      << ",\n  \"rtp_mcast_base\": \""
      << escape_json(config.get_rtp_mcast_base()) << "\""
+     << ",\n  \"rtp_mcast_base_sec\": \""
+     << escape_json(config.get_rtp_mcast_base_sec()) << "\""
      << ",\n  \"rtp_port\": " << config.get_rtp_port()
+     << ",\n  \"rtp_port_sec\": " << config.get_rtp_port_sec()
      << ",\n  \"ptp_domain\": " << unsigned(config.get_ptp_domain())
      << ",\n  \"ptp_dscp\": " << unsigned(config.get_ptp_dscp())
      << ",\n  \"sap_mcast_addr\": \""
@@ -371,8 +374,15 @@ Config json_to_config_(std::istream& js, Config& config) {
       } else if (key == "rtp_mcast_base") {
         config.set_rtp_mcast_base(
             remove_undesired_chars(val.get_value<std::string>()));
+      } else if (key == "rtp_mcast_base_sec") {
+        config.set_rtp_mcast_base_sec(
+            remove_undesired_chars(val.get_value<std::string>()));
       } else if (key == "rtp_port") {
         config.set_rtp_port(val.get_value<uint16_t>());
+      } else if (key == "rtp_port") {
+        config.set_rtp_port(val.get_value<uint16_t>());
+      } else if (key == "rtp_port_sec") {
+        config.set_rtp_port_sec(val.get_value<uint16_t>());
       } else if (key == "ptp_domain") {
         config.set_ptp_domain(val.get_value<uint8_t>());
       } else if (key == "ptp_dscp") {

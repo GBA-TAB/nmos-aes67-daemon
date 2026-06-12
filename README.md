@@ -59,7 +59,7 @@ See [Armbian NanoPi NEO2 ](https://www.armbian.com/nanopi-neo-2/) for additional
 A Mini PC N40 with Intel® Celeron® Processor N4020 , 2 Cores/2 Threads (4M Cache, up to 2.80 GHz).
 See [Minisforum N40 Mini PC](https://store.minisforum.com/products/minisforum-n40-mini-pc) and [how to Install Ubuntu on a fanless Mini PC](https://www.youtube.com/watch?v=2djTPJ02xK0).
 
-The [ubuntu-packages.sh](ubuntu-packages.sh) script can be used to install all the packages required to compile and run the AES67 daemon, and the [platform compatibility test](#test).
+The [debian-packages.sh](debian-packages.sh) script can be used to install all the packages required to compile and run the AES67 daemon, and the [platform compatibility test](#test).
 
 **_Important_** CPU scaling events could affect daemon streams causing unexpected distortions, see [CPU scaling events and scripts notes](#notes).
 
@@ -114,6 +114,48 @@ When ST-2022-7 is enabled:
  - for a Source, outgoing packets are transmitted through both interfaces.
  - for a Sink, packets are received from both interfaces, and the incoming streams are merged accordingly.
  - AES67 control (SAP and mDNS) runs on all interfaces.
+
+Beginning with daemon version 3.1, both the daemon and the WebUI support specifying a separate address and port for the secondary interface (daemon parameters _rtp_mcast_base_sec_ and _rtp_port_sec_).
+When ST-2022-7 is enabled the daemon uses these values for the Sources and advertises the redundant multicast audio flow in the associated SDP file.
+For example:
+
+```
+v=0
+o=- 2831159553 317021570 IN IP4 192.168.1.17
+s=Daemon a8c01101 ALSA Source 0
+t=0 0
+a=group:DUP 1 2
+m=audio 5004 RTP/AVP 98
+c=IN IP4 239.1.0.1/15
+a=source-filter: incl IN IP4 239.1.0.1 192.168.1.17
+a=rtpmap:98 L24/48000/2
+a=sync-time:0
+a=framecount:48
+a=ptime:1
+a=mediaclk:direct=0
+a=clock-domain:PTPv2 0
+a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-50-36-33:0
+a=recvonly
+a=mid:1
+m=audio 5006 RTP/AVP 98
+c=IN IP4 239.1.0.1/15
+a=source-filter: incl IN IP4 239.1.0.1 192.168.1.18
+a=rtpmap:98 L24/48000/2
+a=sync-time:0
+a=framecount:48
+a=ptime:1
+a=mediaclk:direct=0
+a=clock-domain:PTPv2 0
+a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-50-36-33:0
+a=mid:2
+```
+
+If a specific RTP address is defined when the Source is created, that address will be used for both the primary and secondary interfaces, replacing the default addresses.
+
+For a Sink, when ST-2022-7 is enabled, the daemon retrieves the audio media redundant multicast flow address and port from the remote Source’s SDP file. If these are not specified the daemon uses the address and port specified for the primary.
+
+The primary audio stream is always transmitted and received via the primary interface, while the redundant audio stream is always transmitted and received via the secondary interface.
+A single interface can be configured both as primary and secondary at the same time.
 
 ## HTTP Streamer ##
 The HTTP Streamer was introduced with the daemon version 2.0 and it is used to receive AES67 audio streams via HTTP file streaming.
@@ -198,6 +240,7 @@ The [aes67-daemon branch of ravenna-alsa-lkm repository](https://github.com/bond
 
  The following patches have been applied to the original module:
 
+* set of patches to improve driver stability and performance, see [367c166](https://github.com/bondagit/ravenna-alsa-lkm/commit/367c1665e8038272514a637ea03799350e8e12a8). Added _audio_cpu_affinity_ module parameter to have the audio timer pinned to a specific CPU (from driver 2.1).
 * added support for ST-2022-7 (from driver version 2.0). This version breaks compatibility with the older and requires a new daemon. See [issue 248](https://github.com/bondagit/aes67-linux-daemon/issues/248)
 * patch to update the grand master clock ID of the current master clock when it gets updated in the ANNOUNCE messages (from driver version v1.18). See driver [issue 34](https://github.com/bondagit/ravenna-alsa-lkm/issues/34)
 * patch to fix the PTP master sync timeout and to have a less restrictive spin lock (from driver version v1.17). See [issue 246](https://github.com/bondagit/aes67-linux-daemon/issues/246)

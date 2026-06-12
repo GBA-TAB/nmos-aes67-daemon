@@ -70,15 +70,19 @@ fi
 
 if [ $SAMPLE_RATE == "44100" ]; then
   PTIME="1.08843537415"
-elif  [ $SAMPLE_RATE == "48000" ]; then
+elif [ $SAMPLE_RATE == "48000" ]; then
   PTIME="1"
 elif [ $SAMPLE_RATE == "88200" ]; then
   PTIME="0.54421768707"
-elif  [ $SAMPLE_RATE == "96000" ]; then
+elif [ $SAMPLE_RATE == "96000" ]; then
   PTIME="0.5"
-elif  [ $SAMPLE_RATE == "192000" ]; then
+elif [ $SAMPLE_RATE == "176400" ]; then
+  PTIME="0.272108844"
+elif [ $SAMPLE_RATE == "192000" ]; then
   PTIME="0.25"
-elif  [ $SAMPLE_RATE == "384000" ]; then
+elif [ $SAMPLE_RATE == "352800" ]; then
+  PTIME="0.136054422"
+elif [ $SAMPLE_RATE == "384000" ]; then
   PTIME="0.125"
 fi
 

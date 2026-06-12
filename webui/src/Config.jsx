@@ -48,6 +48,10 @@ class Config extends Component {
       rtpMcastBaseErr: false,
       rtpPort: '',
       rtpPortErr: false,
+      rtpMcastBaseSec: '',
+      rtpMcastBaseSecErr: false,
+      rtpPortSec: '',
+      rtpPortSecErr: false,      
       ptpDomain: '',
       ptpDscp: '',
       sapInterval: '',
@@ -115,7 +119,9 @@ class Config extends Component {
             maxTicFrameSize: data.max_tic_frame_size,
             sampleRate: data.sample_rate,
             rtpMcastBase: data.rtp_mcast_base,
+            rtpMcastBaseSec: data.rtp_mcast_base_sec,
             rtpPort: data.rtp_port,
+            rtpPortSec: data.rtp_port_sec,
             ptpDomain: data.ptp_domain,
             ptpDscp: data.ptp_dscp,
             sapMcastAddr: data.sap_mcast_addr,
@@ -157,8 +163,10 @@ class Config extends Component {
     return !this.state.playoutDelayErr &&
       !this.state.maxTicFrameSizeErr &&
       !this.state.rtpMcastBaseErr &&
+      !this.state.rtpMcastBaseSecErr &&
       !this.state.sapMcastAddrErr &&
       !this.state.rtpPortErr &&
+      !this.state.rtpPortSecErr &&
       !this.state.rtspPortErr &&
       !this.state.sapIntervalErr &&
       !this.state.streamerChIntervalErr &&
@@ -182,7 +190,9 @@ class Config extends Component {
       this.state.syslogProto,
       this.state.syslogServer,
       this.state.rtpMcastBase,
+      this.state.rtpMcastBaseSec,
       this.state.rtpPort,
+      this.state.rtpPortSec,
       this.state.rtspPort,
       this.state.playoutDelay,
       this.state.ticFrameSizeAt1fs,
@@ -332,9 +342,17 @@ class Config extends Component {
             <th align="left"> <input type="text" minLength="7" maxLength="15" size="15" pattern="^2(?:2[4-9]|3\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d?|0)){3}$" value={this.state.rtpMcastBase} onChange={e => this.setState({rtpMcastBase: e.target.value, rtpMcastBaseErr: !e.currentTarget.checkValidity()})} required/> </th>
           </tr>
           <tr>
+            <th align="left"> <label>Secondary RTP address</label> </th>
+            <th align="left"> <input type="text" minLength="7" maxLength="15" size="15" pattern="^2(?:2[4-9]|3\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d?|0)){3}$" value={this.state.rtpMcastBaseSec} onChange={e => this.setState({rtpMcastBaseSec: e.target.value, rtpMcastBaseSecErr: !e.currentTarget.checkValidity()})} required/> </th>
+          </tr>          
+          <tr>
             <th align="left"> <label>RTP port</label> </th>
             <th align="left"> <input type='number' min='1024' max='65536'  className='input-number' value={this.state.rtpPort} onChange={e => this.setState({rtpPort: e.target.value, rtpPortErr: !e.currentTarget.checkValidity()})} required/> </th>
           </tr>
+          <tr>
+            <th align="left"> <label>Secondary RTP port</label> </th>
+            <th align="left"> <input type='number' min='1024' max='65536'  className='input-number' value={this.state.rtpPortSec} onChange ={e => this.setState({rtpPortSec: e.target.value, rtpPortSecErr: !e.currentTarget.checkValidity()})} required/> </th>
+          </tr>          
           <tr>
             <th align="left"> <label>SAP multicast address</label> </th>
             <th align="left"> <input type="text" minLength="7" maxLength="15" size="15" pattern="^2(?:2[4-9]|3\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d?|0)){3}$" value={this.state.sapMcastAddr} onChange={e => this.setState({sapMcastAddr: e.target.value, sapMcastAddrErr: !e.currentTarget.checkValidity()})} required/> </th>

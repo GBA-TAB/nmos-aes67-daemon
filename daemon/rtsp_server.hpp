@@ -30,7 +30,7 @@
 #include "session_manager.hpp"
 
 using namespace std::chrono;
-using boost::asio::deadline_timer;
+//using boost::asio::deadline_timer;
 using boost::asio::ip::tcp;
 using second_t = duration<double, std::ratio<1> >;
 

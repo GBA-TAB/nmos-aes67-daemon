@@ -67,8 +67,12 @@ class Config {
   uint32_t get_max_tic_frame_size() const { return max_tic_frame_size_; };
   uint32_t get_sample_rate() const { return sample_rate_; };
   const std::string& get_rtp_mcast_base() const { return rtp_mcast_base_; };
+  const std::string& get_rtp_mcast_base_sec() const {
+    return rtp_mcast_base_sec_;
+  };
   const std::string& get_sap_mcast_addr() const { return sap_mcast_addr_; };
   uint16_t get_rtp_port() const { return rtp_port_; };
+  uint16_t get_rtp_port_sec() const { return rtp_port_sec_; };
   uint8_t get_ptp_domain() const { return ptp_domain_; };
   uint8_t get_ptp_dscp() const { return ptp_dscp_; };
   uint16_t get_sap_interval() const { return sap_interval_; };
@@ -158,12 +162,18 @@ class Config {
   void set_rtp_mcast_base(std::string_view rtp_mcast_base) {
     rtp_mcast_base_ = rtp_mcast_base;
   };
+  void set_rtp_mcast_base_sec(std::string_view rtp_mcast_base_sec) {
+    rtp_mcast_base_sec_ = rtp_mcast_base_sec;
+  };
+  void set_rtp_port(uint16_t rtp_port) { rtp_port_ = rtp_port; };
+  void set_rtp_port_sec(uint16_t rtp_port_sec) {
+    rtp_port_sec_ = rtp_port_sec;
+  };
+  void set_ptp_domain(uint8_t ptp_domain) { ptp_domain_ = ptp_domain; };
+  void set_ptp_dscp(uint8_t ptp_dscp) { ptp_dscp_ = ptp_dscp; };
   void set_sap_mcast_addr(std::string_view sap_mcast_addr) {
     sap_mcast_addr_ = sap_mcast_addr;
   };
-  void set_rtp_port(uint16_t rtp_port) { rtp_port_ = rtp_port; };
-  void set_ptp_domain(uint8_t ptp_domain) { ptp_domain_ = ptp_domain; };
-  void set_ptp_dscp(uint8_t ptp_dscp) { ptp_dscp_ = ptp_dscp; };
   void set_sap_interval(uint16_t sap_interval) {
     sap_interval_ = sap_interval;
   };
@@ -225,8 +235,10 @@ class Config {
            lhs.get_max_tic_frame_size() != rhs.get_max_tic_frame_size() ||
            lhs.get_sample_rate() != rhs.get_sample_rate() ||
            lhs.get_rtp_mcast_base() != rhs.get_rtp_mcast_base() ||
+           lhs.get_rtp_mcast_base_sec() != rhs.get_rtp_mcast_base_sec() ||
            lhs.get_sap_mcast_addr() != rhs.get_sap_mcast_addr() ||
            lhs.get_rtp_port() != rhs.get_rtp_port() ||
+           lhs.get_rtp_port_sec() != rhs.get_rtp_port_sec() ||
            lhs.get_ptp_domain() != rhs.get_ptp_domain() ||
            lhs.get_ptp_dscp() != rhs.get_ptp_dscp() ||
            lhs.get_sap_interval() != rhs.get_sap_interval() ||
@@ -267,8 +279,10 @@ class Config {
   uint32_t max_tic_frame_size_{1024};
   uint32_t sample_rate_{48000};
   std::string rtp_mcast_base_{"239.1.0.1"};
+  std::string rtp_mcast_base_sec_{"239.1.0.1"};
   std::string sap_mcast_addr_{"224.2.127.254"};
   uint16_t rtp_port_{5004};
+  uint16_t rtp_port_sec_{5004};
   uint8_t ptp_domain_{0};
   uint8_t ptp_dscp_{46};
   uint16_t sap_interval_{300};

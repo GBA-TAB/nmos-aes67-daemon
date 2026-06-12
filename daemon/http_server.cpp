@@ -385,7 +385,7 @@ bool HttpServer::init() {
   svr_.Get("/api/streamer/stream/([0-9]+)", [this](const Request& req,
                                                    Response& res) {
 #ifdef _USE_STREAMER_
-    if (!config_->get_streamer_enabled()) {
+    if (!this->config_->get_streamer_enabled()) {
       set_error(400, "streamer not enabled", res);
       return;
     }
@@ -423,7 +423,7 @@ bool HttpServer::init() {
   svr_.Get("/api/streamer/stream/([0-9]+)/([0-9]+)", [this](const Request& req,
                                                             Response& res) {
 #ifdef _USE_STREAMER_
-    if (!config_->get_streamer_enabled()) {
+    if (!this->config_->get_streamer_enabled()) {
       set_error(400, "streamer not enabled", res);
       return;
     }
@@ -555,8 +555,7 @@ bool HttpServer::init() {
   });
 
   /* wait for HTTP server to show up */
-  httplib::Client cli(http_addr.c_str(),
-                      config_->get_http_port());
+  httplib::Client cli(http_addr.c_str(), config_->get_http_port());
   int retry = 3;
   while (retry) {
     auto res = cli.Get("/api/config");

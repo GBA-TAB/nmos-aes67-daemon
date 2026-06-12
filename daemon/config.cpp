@@ -99,6 +99,14 @@ std::shared_ptr<Config> Config::parse(const std::string& filename,
     config.rtp_mcast_base_ = "239.1.0.1";
   }
 #if BOOST_VERSION < 108700
+  ip::address_v4::from_string(config.rtp_mcast_base_sec_.c_str(), ec);
+#else
+  ip::make_address(config.rtp_mcast_base_sec_.c_str(), ec);
+#endif
+  if (ec) {
+    config.rtp_mcast_base_sec_ = "239.1.0.1";
+  }
+#if BOOST_VERSION < 108700
   ip::address_v4::from_string(config.sap_mcast_addr_.c_str(), ec);
 #else
   ip::make_address(config.sap_mcast_addr_.c_str(), ec);
@@ -108,7 +116,6 @@ std::shared_ptr<Config> Config::parse(const std::string& filename,
   }
   if (config.ptp_domain_ > 127)
     config.ptp_domain_ = 0;
-
 
   boost::algorithm::erase_all(config.interface_name_, " ");
   boost::split(config.interfaces_, config.interface_name_,
@@ -172,8 +179,10 @@ bool Config::save(const Config& config) {
         get_rtsp_port() != config.get_rtsp_port() ||
         get_http_base_dir() != config.get_http_base_dir() ||
         get_rtp_mcast_base() != config.get_rtp_mcast_base() ||
+        get_rtp_mcast_base_sec() != config.get_rtp_mcast_base_sec() ||
         get_sap_mcast_addr() != config.get_sap_mcast_addr() ||
         get_rtp_port() != config.get_rtp_port() ||
+        get_rtp_port_sec() != config.get_rtp_port_sec() ||
         get_status_file() != config.get_status_file() ||
         get_mdns_enabled() != config.get_mdns_enabled() ||
         get_custom_node_id() != config.get_custom_node_id() ||

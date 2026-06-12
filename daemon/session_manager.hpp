@@ -33,6 +33,8 @@
 #include "igmp.hpp"
 #include "sap.hpp"
 
+constexpr static uint8_t media_max = 2;
+
 struct StreamSource {
   uint8_t id{0};
   bool enabled{false};
@@ -84,8 +86,8 @@ struct PTPStatus {
 };
 
 struct StreamInfo {
-  TRTP_stream_info stream[2];
-  uint64_t handle[2]{0};
+  TRTP_stream_info stream[media_max];
+  uint64_t handle[media_max]{0};
   bool enabled{false};
   bool st20227_enabled{false};
   bool refclk_ptp_traceable{false};

@@ -214,8 +214,10 @@ Example
       "syslog_proto": "none",
       "syslog_server": "255.255.255.254:1234",
       "rtp_mcast_base": "239.2.0.1",
+      "rtp_mcast_base_sec": "239.2.0.1",
       "status_file": "./status.json",
       "rtp_port": "5004",
+      "rtp_port_sec": "5006",
       "ptp_domain": 0,
       "ptp_dscp": 46,
       "playout_delay": 0,
@@ -279,8 +281,16 @@ where:
 > The specific multicast RTP address is the base address plus the source id number.    
 > For example if the base address is 239.2.0.1 and source id is 1 the RTP source address used is 239.2.0.2.
 
+> **rtp\_mcast\_base\_sec**
+> JSON string specifying the default base RTP IPv4 multicast address used for the secondary interface by a source.
+> The specific multicast RTP address is the base address plus the source id number.
+> For example if the secondary base address is 239.2.1.1 and source id is 1 the RTP source address used is 239.2.1.2.
+
 > **rtp\_port**
 > JSON number specifying the RTP port used by the sources.
+
+> **rtp\_port\_sec**
+> JSON number specifying the RTP port used for the secondary interface by the sources.
 
 > **ptp\_domain**
 > JSON number specifying the PTP clock domain of the master clock the driver will attempt to synchronize to.

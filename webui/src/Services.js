@@ -86,14 +86,16 @@ export default class RestAPI {
     });
   }
 
-  static setConfig(log_severity, syslog_proto, syslog_server, rtp_mcast_base, rtp_port, rtsp_port, playout_delay, tic_frame_size_at_1fs, sample_rate, max_tic_frame_size, sap_mcast_addr, sap_interval, mdns_enabled, custom_node_id, auto_sinks_update, streamer_enabled, streamer_channels, streamer_files_num, streamer_file_duration, streamer_player_buffer_files_num, transcriber_enabled, transcriber_channels, transcriber_files_num, transcriber_file_duration, transcriber_model, transcriber_language) {
+  static setConfig(log_severity, syslog_proto, syslog_server, rtp_mcast_base, rtp_mcast_base_sec, rtp_port, rtp_port_sec, rtsp_port, playout_delay, tic_frame_size_at_1fs, sample_rate, max_tic_frame_size, sap_mcast_addr, sap_interval, mdns_enabled, custom_node_id, auto_sinks_update, streamer_enabled, streamer_channels, streamer_files_num, streamer_file_duration, streamer_player_buffer_files_num, transcriber_enabled, transcriber_channels, transcriber_files_num, transcriber_file_duration, transcriber_model, transcriber_language) {
     return this.doFetch(config, {
       body: JSON.stringify({
         log_severity: parseInt(log_severity, 10),
         syslog_proto: syslog_proto,
         syslog_server: syslog_server,
         rtp_mcast_base: rtp_mcast_base,
+        rtp_mcast_base_sec: rtp_mcast_base_sec,
         rtp_port: parseInt(rtp_port, 10),
+        rtp_port_sec: parseInt(rtp_port_sec, 10), 
         rtsp_port: parseInt(rtsp_port, 10),
         playout_delay: parseInt(playout_delay, 10),
         tic_frame_size_at_1fs: parseInt(tic_frame_size_at_1fs, 10),
