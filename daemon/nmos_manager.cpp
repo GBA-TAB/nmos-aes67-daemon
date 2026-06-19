@@ -51,6 +51,14 @@ static std::string get_system_hostname() {
   return "localhost";
 }
 
+// Build NMOS label: "<hostname> ALSA <first>-<last>" using 1-indexed channel numbers.
+static std::string make_nmos_label(const std::vector<uint8_t>& map) {
+  std::string h = get_system_hostname();
+  if (map.empty()) return h + " ALSA";
+  return h + " ALSA " + std::to_string(map.front() + 1)
+         + "-" + std::to_string(map.back() + 1);
+}
+
 static std::string make_uuid5(const std::string& ns_str, const std::string& name) {
   boost::uuids::string_generator sgen;
   boost::uuids::uuid ns = sgen(ns_str);
@@ -310,7 +318,7 @@ std::string NmosManager::build_source_json(const StreamSource& src,
   ss << "{"
      << "\n  \"id\": \"" << source_id << "\""
      << ",\n  \"version\": \"" << make_version() << "\""
-     << ",\n  \"label\": \"" << src.name << "\""
+     << ",\n  \"label\": \"" << make_nmos_label(src.map) << "\""
      << ",\n  \"description\": \"\""
      << ",\n  \"tags\": {}"
      << ",\n  \"device_id\": \"" << device_id_ << "\""
@@ -337,7 +345,7 @@ std::string NmosManager::build_flow_json(const StreamSource& src,
   ss << "{"
      << "\n  \"id\": \"" << flow_id << "\""
      << ",\n  \"version\": \"" << make_version() << "\""
-     << ",\n  \"label\": \"" << src.name << "\""
+     << ",\n  \"label\": \"" << make_nmos_label(src.map) << "\""
      << ",\n  \"description\": \"\""
      << ",\n  \"tags\": {}"
      << ",\n  \"grain_rate\": {\"numerator\": " << sample_rate
@@ -368,7 +376,7 @@ std::string NmosManager::build_sender_json(const StreamSource& src,
   ss << "{"
      << "\n  \"id\": \"" << sender_id << "\""
      << ",\n  \"version\": \"" << make_version() << "\""
-     << ",\n  \"label\": \"" << src.name << "\""
+     << ",\n  \"label\": \"" << make_nmos_label(src.map) << "\""
      << ",\n  \"description\": \"\""
      << ",\n  \"tags\": {}"
      << ",\n  \"flow_id\": \"" << flow_id << "\""
@@ -395,7 +403,7 @@ std::string NmosManager::build_receiver_json(const StreamSink& sink,
   ss << "{"
      << "\n  \"id\": \"" << receiver_id << "\""
      << ",\n  \"version\": \"" << make_version() << "\""
-     << ",\n  \"label\": \"" << sink.name << "\""
+     << ",\n  \"label\": \"" << make_nmos_label(sink.map) << "\""
      << ",\n  \"description\": \"\""
      << ",\n  \"tags\": {}"
      << ",\n  \"device_id\": \"" << device_id_ << "\""
