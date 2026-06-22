@@ -1,3 +1,7 @@
+This fork adds NMOS Functionnality to the project (IS-04 and IS-05)
+It is a work in progress, works seamlessly with a registry. 
+
+
 # AES67 Linux Daemon
 
 AES67 Linux Daemon is a Linux implementation of AES67 interoperability standard used to distribute and synchronize real time audio over Ethernet.
