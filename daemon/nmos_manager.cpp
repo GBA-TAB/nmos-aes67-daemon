@@ -1084,6 +1084,15 @@ void NmosManager::apply_receiver_activation(uint8_t daemon_id) {
       tp = build_receiver_tp_from_sdp(sdp);
   }
 
+  // Reject non-audio SDPs before touching active state or calling add_sink.
+  if (master_enable && !sdp.empty() &&
+      sdp.find("m=audio") == std::string::npos) {
+    BOOST_LOG_TRIVIAL(warning)
+        << "NmosManager:: receiver " << +daemon_id
+        << " activation rejected: SDP has no audio media section";
+    return;
+  }
+
   // Promote staged → active BEFORE calling add_sink.
   // add_sink fires remove+add observers which cause register_sink to run in the
   // registration_worker thread. We set preserved_active_sender_ids_ so that
