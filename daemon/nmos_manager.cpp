@@ -29,6 +29,10 @@
 #include "log.hpp"
 #include "nmos_manager.hpp"
 
+#ifdef _USE_AVAHI_
+#include <avahi-common/address.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Static helpers
 // ---------------------------------------------------------------------------
@@ -141,6 +145,170 @@ static void nmos_not_found(httplib::Response& res) {
 }
 
 // ---------------------------------------------------------------------------
+// DNS-SD registry discovery helpers
+// ---------------------------------------------------------------------------
+
+std::string NmosManager::effective_registry_address() const {
+  if (config_->get_nmos_registry_auto_discover()) {
+    std::lock_guard<std::mutex> lock(registry_disc_mutex_);
+    if (!discovered_registry_address_.empty())
+      return discovered_registry_address_;
+  }
+  return config_->get_nmos_registry_address();
+}
+
+uint16_t NmosManager::effective_registry_port() const {
+  if (config_->get_nmos_registry_auto_discover()) {
+    std::lock_guard<std::mutex> lock(registry_disc_mutex_);
+    if (!discovered_registry_address_.empty())
+      return discovered_registry_port_;
+  }
+  return config_->get_nmos_registry_port();
+}
+
+#ifdef _USE_AVAHI_
+void NmosManager::registry_client_callback(AvahiClient* client,
+                                            AvahiClientState state,
+                                            void* userdata) {
+  NmosManager& mgr = *reinterpret_cast<NmosManager*>(userdata);
+  switch (state) {
+    case AVAHI_CLIENT_S_RUNNING:
+    case AVAHI_CLIENT_S_REGISTERING:
+    case AVAHI_CLIENT_S_COLLISION:
+      mgr.registry_browser_.reset(avahi_service_browser_new(
+          client, AVAHI_IF_UNSPEC, AVAHI_PROTO_INET,
+          "_nmos-register._tcp", nullptr, (AvahiLookupFlags)0,
+          registry_browse_callback, &mgr));
+      if (!mgr.registry_browser_) {
+        BOOST_LOG_TRIVIAL(error)
+            << "NmosManager:: failed to create registry browser: "
+            << avahi_strerror(avahi_client_errno(client));
+      }
+      break;
+    case AVAHI_CLIENT_FAILURE:
+      BOOST_LOG_TRIVIAL(error)
+          << "NmosManager:: Avahi client failure: "
+          << avahi_strerror(avahi_client_errno(client));
+      break;
+    default:
+      break;
+  }
+}
+
+void NmosManager::registry_browse_callback(AvahiServiceBrowser* b,
+                                            AvahiIfIndex interface,
+                                            AvahiProtocol protocol,
+                                            AvahiBrowserEvent event,
+                                            const char* name,
+                                            const char* type,
+                                            const char* domain,
+                                            AvahiLookupResultFlags /*flags*/,
+                                            void* userdata) {
+  NmosManager& mgr = *reinterpret_cast<NmosManager*>(userdata);
+  switch (event) {
+    case AVAHI_BROWSER_NEW:
+      BOOST_LOG_TRIVIAL(info)
+          << "NmosManager:: DNS-SD found NMOS registry: " << name;
+      avahi_service_resolver_new(avahi_service_browser_get_client(b),
+          interface, protocol, name, type, domain,
+          AVAHI_PROTO_UNSPEC, (AvahiLookupFlags)0,
+          registry_resolve_callback, &mgr);
+      break;
+    case AVAHI_BROWSER_REMOVE:
+      BOOST_LOG_TRIVIAL(info)
+          << "NmosManager:: DNS-SD NMOS registry removed: " << name;
+      {
+        std::lock_guard<std::mutex> lock(mgr.registry_disc_mutex_);
+        mgr.discovered_registry_address_.clear();
+        mgr.discovered_registry_port_ = 0;
+      }
+      {
+        std::unique_lock<std::mutex> lock(mgr.events_mutex_);
+        mgr.pending_events_.push({EventType::RegistryLost, 0});
+      }
+      mgr.events_cv_.notify_one();
+      break;
+    case AVAHI_BROWSER_FAILURE:
+      BOOST_LOG_TRIVIAL(error)
+          << "NmosManager:: Avahi browser failure: "
+          << avahi_strerror(avahi_client_errno(
+                 avahi_service_browser_get_client(b)));
+      break;
+    default:
+      break;
+  }
+}
+
+void NmosManager::registry_resolve_callback(AvahiServiceResolver* r,
+                                             AvahiIfIndex /*iface*/,
+                                             AvahiProtocol /*proto*/,
+                                             AvahiResolverEvent event,
+                                             const char* name,
+                                             const char* /*type*/,
+                                             const char* /*domain*/,
+                                             const char* /*host*/,
+                                             const AvahiAddress* address,
+                                             uint16_t port,
+                                             AvahiStringList* /*txt*/,
+                                             AvahiLookupResultFlags /*flags*/,
+                                             void* userdata) {
+  NmosManager& mgr = *reinterpret_cast<NmosManager*>(userdata);
+  if (event == AVAHI_RESOLVER_FOUND) {
+    char addr[AVAHI_ADDRESS_STR_MAX];
+    avahi_address_snprint(addr, sizeof(addr), address);
+    BOOST_LOG_TRIVIAL(info)
+        << "NmosManager:: DNS-SD resolved NMOS registry \"" << name
+        << "\" at " << addr << ":" << port;
+    {
+      std::lock_guard<std::mutex> lock(mgr.registry_disc_mutex_);
+      mgr.discovered_registry_address_ = addr;
+      mgr.discovered_registry_port_    = port;
+    }
+    {
+      std::unique_lock<std::mutex> lock(mgr.events_mutex_);
+      mgr.pending_events_.push({EventType::RegistryUpdated, 0});
+    }
+    mgr.events_cv_.notify_one();
+  } else {
+    BOOST_LOG_TRIVIAL(warning)
+        << "NmosManager:: DNS-SD failed to resolve NMOS registry \"" << name << "\"";
+  }
+  avahi_service_resolver_free(r);
+}
+
+void NmosManager::start_registry_discovery() {
+  registry_poll_.reset(avahi_threaded_poll_new());
+  if (!registry_poll_) {
+    BOOST_LOG_TRIVIAL(error)
+        << "NmosManager:: failed to create Avahi poll for registry discovery";
+    return;
+  }
+  int error;
+  registry_avahi_client_.reset(avahi_client_new(
+      avahi_threaded_poll_get(registry_poll_.get()),
+      AVAHI_CLIENT_NO_FAIL, registry_client_callback, this, &error));
+  if (!registry_avahi_client_) {
+    BOOST_LOG_TRIVIAL(error)
+        << "NmosManager:: failed to create Avahi client: "
+        << avahi_strerror(error);
+    registry_poll_.reset();
+    return;
+  }
+  avahi_threaded_poll_start(registry_poll_.get());
+  BOOST_LOG_TRIVIAL(info) << "NmosManager:: DNS-SD registry discovery started";
+}
+
+void NmosManager::stop_registry_discovery() {
+  if (registry_poll_) {
+    avahi_threaded_poll_stop(registry_poll_.get());
+    registry_browser_.reset();
+    registry_avahi_client_.reset();
+    registry_poll_.reset();
+  }
+}
+#endif  // _USE_AVAHI_
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
@@ -209,6 +377,10 @@ bool NmosManager::init() {
   svr_res_ = std::async(std::launch::async, &NmosManager::server_worker, this);
   BOOST_LOG_TRIVIAL(info) << "NmosManager:: starting async registration thread";
   reg_res_ = std::async(std::launch::async, &NmosManager::registration_worker, this);
+#ifdef _USE_AVAHI_
+  if (config_->get_nmos_registry_auto_discover())
+    start_registry_discovery();
+#endif
   BOOST_LOG_TRIVIAL(info) << "NmosManager::init() complete";
   return true;
 }
@@ -219,6 +391,9 @@ bool NmosManager::terminate() {
   node_api_svr_.stop();
   if (svr_res_.valid()) svr_res_.get();
   if (reg_res_.valid()) reg_res_.get();
+#ifdef _USE_AVAHI_
+  stop_registry_discovery();
+#endif
   return true;
 }
 
@@ -947,8 +1122,8 @@ void NmosManager::fetch_remote_sender_sdp(const std::string& sender_uuid,
   sdp.clear();
 
   // Step 1: query registry query API for sender
-  const std::string reg_host = config_->get_nmos_registry_address();
-  const uint16_t    reg_port = config_->get_nmos_registry_port();
+  const std::string reg_host = effective_registry_address();
+  const uint16_t    reg_port = effective_registry_port();
   std::string manifest_href;
 
   {
@@ -1541,8 +1716,8 @@ bool NmosManager::server_worker() {
 
 bool NmosManager::register_resource(const std::string& type,
                                      const std::string& data_json) {
-  httplib::Client cli(config_->get_nmos_registry_address(),
-                      config_->get_nmos_registry_port());
+  httplib::Client cli(effective_registry_address(),
+                      effective_registry_port());
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(10, 0);
 
@@ -1564,8 +1739,8 @@ bool NmosManager::register_resource(const std::string& type,
 
 bool NmosManager::unregister_resource(const std::string& type,
                                        const std::string& id) {
-  httplib::Client cli(config_->get_nmos_registry_address(),
-                      config_->get_nmos_registry_port());
+  httplib::Client cli(effective_registry_address(),
+                      effective_registry_port());
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(10, 0);
 
@@ -1585,8 +1760,8 @@ bool NmosManager::unregister_resource(const std::string& type,
 }
 
 bool NmosManager::heartbeat() {
-  httplib::Client cli(config_->get_nmos_registry_address(),
-                      config_->get_nmos_registry_port());
+  httplib::Client cli(effective_registry_address(),
+                      effective_registry_port());
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(10, 0);
 
@@ -1768,8 +1943,8 @@ bool NmosManager::full_registration() {
   }
 
   BOOST_LOG_TRIVIAL(info) << "NmosManager:: registering with registry at "
-                          << config_->get_nmos_registry_address() << ":"
-                          << config_->get_nmos_registry_port();
+                          << effective_registry_address() << ":"
+                          << effective_registry_port();
   for (const auto& [type, json] : to_push)
     register_resource(type, json);
 
@@ -1848,10 +2023,19 @@ bool NmosManager::registration_worker() {
         lock.unlock();
 
         switch (ev.type) {
-          case EventType::SourceAdded:   register_source(ev.id);   break;
-          case EventType::SourceRemoved: unregister_source(ev.id); break;
-          case EventType::SinkAdded:     register_sink(ev.id);     break;
-          case EventType::SinkRemoved:   unregister_sink(ev.id);   break;
+          case EventType::SourceAdded:    register_source(ev.id);   break;
+          case EventType::SourceRemoved:  unregister_source(ev.id); break;
+          case EventType::SinkAdded:      register_sink(ev.id);     break;
+          case EventType::SinkRemoved:    unregister_sink(ev.id);   break;
+          case EventType::RegistryUpdated:
+            BOOST_LOG_TRIVIAL(info)
+                << "NmosManager:: DNS-SD registry available, re-registering";
+            full_registration();
+            break;
+          case EventType::RegistryLost:
+            BOOST_LOG_TRIVIAL(info)
+                << "NmosManager:: DNS-SD registry lost";
+            break;
         }
 
         lock.lock();

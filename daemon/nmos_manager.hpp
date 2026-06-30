@@ -8,6 +8,14 @@
 #ifndef _NMOS_MANAGER_HPP_
 #define _NMOS_MANAGER_HPP_
 
+#ifdef _USE_AVAHI_
+#include <avahi-client/client.h>
+#include <avahi-client/lookup.h>
+#include <avahi-common/error.h>
+#include <avahi-common/malloc.h>
+#include <avahi-common/thread-watch.h>
+#endif
+
 #include <atomic>
 #include <condition_variable>
 #include <future>
@@ -102,7 +110,8 @@ class NmosManager {
     int64_t deadline_ns;
   };
 
-  enum class EventType { SourceAdded, SourceRemoved, SinkAdded, SinkRemoved };
+  enum class EventType { SourceAdded, SourceRemoved, SinkAdded, SinkRemoved,
+                         RegistryUpdated, RegistryLost };
   struct Event { EventType type; uint8_t id; };
 
   explicit NmosManager(std::shared_ptr<SessionManager> session_manager,
@@ -215,6 +224,34 @@ class NmosManager {
   std::mutex                  events_mutex_;
   std::condition_variable     events_cv_;
   std::queue<Event>           pending_events_;
+
+  // ---- DNS-SD registry discovery ----
+  std::string effective_registry_address() const;
+  uint16_t    effective_registry_port() const;
+
+#ifdef _USE_AVAHI_
+  void start_registry_discovery();
+  void stop_registry_discovery();
+  static void registry_client_callback(AvahiClient*, AvahiClientState, void*);
+  static void registry_browse_callback(AvahiServiceBrowser*, AvahiIfIndex,
+      AvahiProtocol, AvahiBrowserEvent, const char*, const char*, const char*,
+      AvahiLookupResultFlags, void*);
+  static void registry_resolve_callback(AvahiServiceResolver*, AvahiIfIndex,
+      AvahiProtocol, AvahiResolverEvent, const char*, const char*, const char*,
+      const char*, const AvahiAddress*, uint16_t, AvahiStringList*,
+      AvahiLookupResultFlags, void*);
+
+  std::unique_ptr<AvahiThreadedPoll, decltype(&avahi_threaded_poll_free)>
+      registry_poll_{nullptr, &avahi_threaded_poll_free};
+  std::unique_ptr<AvahiClient, decltype(&avahi_client_free)>
+      registry_avahi_client_{nullptr, &avahi_client_free};
+  std::unique_ptr<AvahiServiceBrowser, decltype(&avahi_service_browser_free)>
+      registry_browser_{nullptr, &avahi_service_browser_free};
+#endif
+
+  mutable std::mutex  registry_disc_mutex_;
+  std::string         discovered_registry_address_;
+  uint16_t            discovered_registry_port_{0};
 };
 
 #endif

@@ -76,7 +76,15 @@ class Config extends Component {
       errors: 0,
       isConfigLoading: false,
       isVersionLoading: false,
-      autoSinksUpdate: false
+      autoSinksUpdate: false,
+      nmosEnabled: false,
+      nmosRegistryAutoDiscover: true,
+      nmosRegistryAddress: '',
+      nmosRegistryAddressErr: false,
+      nmosRegistryPort: 8010,
+      nmosRegistryPortErr: false,
+      nmosNodePort: 3212,
+      nmosNodePortErr: false
     };
     this.onSubmit = this.onSubmit.bind(this);
     this.inputIsValid = this.inputIsValid.bind(this);
@@ -130,6 +138,11 @@ class Config extends Component {
             ipAddr: data.ip_addr,
             nodeId: data.node_id,
             autoSinksUpdate: data.auto_sinks_update,
+            nmosEnabled: data.nmos_enabled,
+            nmosRegistryAutoDiscover: data.nmos_registry_autodiscovery,
+            nmosRegistryAddress: data.nmos_registry_address,
+            nmosRegistryPort: data.nmos_registry_port,
+            nmosNodePort: data.nmos_node_port,
             isConfigLoading: false
 	  }))
       .catch(err => this.setState({isConfigLoading: false}));
@@ -157,6 +170,9 @@ class Config extends Component {
       !this.state.streamerFileDurationIntervalErr &&
       !this.state.syslogServerErr &&
       (!this.state.customNodeIdErr || this.state.customNodeId  === '') &&
+      !this.state.nmosRegistryAddressErr &&
+      !this.state.nmosRegistryPortErr &&
+      !this.state.nmosNodePortErr &&
       !this.state.isVersionLoading &&
       !this.state.isConfigLoading;
   }
@@ -185,7 +201,12 @@ class Config extends Component {
       this.state.streamerChannels,
       this.state.streamerFiles,
       this.state.streamerFileDuration,
-      this.state.streamerPlayerBufferFiles)
+      this.state.streamerPlayerBufferFiles,
+      this.state.nmosEnabled,
+      this.state.nmosRegistryAutoDiscover,
+      this.state.nmosRegistryAddress,
+      this.state.nmosRegistryPort,
+      this.state.nmosNodePort)
     .then(response => toast.success('Applying new configuration ...'));
   }
 
@@ -355,6 +376,30 @@ class Config extends Component {
                 <option value="5">fatal</option>
               </select>
             </th>
+          </tr>
+        </tbody></table>
+        <br/>
+	{this.state.isConfigLoading ? <Loader/> : <h3>NMOS Config</h3>}
+        <table><tbody>
+          <tr height="35">
+            <th align="left"> <label>NMOS enabled</label> </th>
+            <th align="left"> <input type="checkbox" onChange={e => this.setState({nmosEnabled: e.target.checked})} checked={this.state.nmosEnabled ? true : undefined}/> </th>
+          </tr>
+          <tr height="35">
+            <th align="left"> <label>Auto-discover registry (DNS-SD)</label> </th>
+            <th align="left"> <input type="checkbox" onChange={e => this.setState({nmosRegistryAutoDiscover: e.target.checked})} checked={this.state.nmosRegistryAutoDiscover ? true : undefined} disabled={!this.state.nmosEnabled ? true : undefined}/> </th>
+          </tr>
+          <tr>
+            <th align="left"> <label>Registry address</label> </th>
+            <th align="left"> <input type="text" minLength="0" maxLength="253" size="32" value={this.state.nmosRegistryAddress} onChange={e => this.setState({nmosRegistryAddress: e.target.value, nmosRegistryAddressErr: !e.currentTarget.checkValidity()})} disabled={(!this.state.nmosEnabled || this.state.nmosRegistryAutoDiscover) ? true : undefined}/> </th>
+          </tr>
+          <tr>
+            <th align="left"> <label>Registry port</label> </th>
+            <th align="left"> <input type='number' min='1' max='65535' className='input-number' value={this.state.nmosRegistryPort} onChange={e => this.setState({nmosRegistryPort: e.target.value, nmosRegistryPortErr: !e.currentTarget.checkValidity()})} disabled={!this.state.nmosEnabled ? true : undefined} required/> </th>
+          </tr>
+          <tr>
+            <th align="left"> <label>Node API port</label> </th>
+            <th align="left"> <input type='number' min='1' max='65535' className='input-number' value={this.state.nmosNodePort} onChange={e => this.setState({nmosNodePort: e.target.value, nmosNodePortErr: !e.currentTarget.checkValidity()})} disabled={!this.state.nmosEnabled ? true : undefined} required/> </th>
           </tr>
         </tbody></table>
         <br/>

@@ -130,6 +130,7 @@ std::string config_to_json(const Config& config) {
      << ",\n  \"nmos_registry_port\": " << config.get_nmos_registry_port()
      << ",\n  \"nmos_node_port\": " << config.get_nmos_node_port()
      << ",\n  \"nmos_label\": \"" << escape_json(config.get_nmos_label()) << "\""
+     << ",\n  \"nmos_registry_autodiscovery\": " << std::boolalpha << config.get_nmos_registry_auto_discover()
      << "\n}\n";
   return ss.str();
 }
@@ -398,6 +399,8 @@ Config json_to_config_(std::istream& js, Config& config) {
       } else if (key == "nmos_label") {
         config.set_nmos_label(
             remove_undesired_chars(val.get_value<std::string>()));
+      } else if (key == "nmos_registry_autodiscovery") {
+        config.set_nmos_registry_auto_discover(val.get_value<bool>());
       } else if (key == "ip_addr") {
         config.set_ip_addr_str(val.get_value<std::string>());
       } else if (key == "mac_addr" || key == "node_id") {

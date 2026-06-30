@@ -84,7 +84,7 @@ export default class RestAPI {
     });
   }
 
-  static setConfig(log_severity, syslog_proto, syslog_server, rtp_mcast_base, rtp_mcast_base_sec, rtp_port, rtp_port_sec, rtsp_port, playout_delay, tic_frame_size_at_1fs, sample_rate, max_tic_frame_size, sap_mcast_addr, sap_interval, mdns_enabled, custom_node_id, auto_sinks_update, streamer_enabled, streamer_channels, streamer_files_num, streamer_file_duration, streamer_player_buffer_files_num) {
+  static setConfig(log_severity, syslog_proto, syslog_server, rtp_mcast_base, rtp_mcast_base_sec, rtp_port, rtp_port_sec, rtsp_port, playout_delay, tic_frame_size_at_1fs, sample_rate, max_tic_frame_size, sap_mcast_addr, sap_interval, mdns_enabled, custom_node_id, auto_sinks_update, streamer_enabled, streamer_channels, streamer_files_num, streamer_file_duration, streamer_player_buffer_files_num, nmos_enabled, nmos_registry_autodiscovery, nmos_registry_address, nmos_registry_port, nmos_node_port) {
     return this.doFetch(config, {
       body: JSON.stringify({
         log_severity: parseInt(log_severity, 10),
@@ -93,7 +93,7 @@ export default class RestAPI {
         rtp_mcast_base: rtp_mcast_base,
         rtp_mcast_base_sec: rtp_mcast_base_sec,
         rtp_port: parseInt(rtp_port, 10),
-        rtp_port_sec: parseInt(rtp_port_sec, 10), 
+        rtp_port_sec: parseInt(rtp_port_sec, 10),
         rtsp_port: parseInt(rtsp_port, 10),
         playout_delay: parseInt(playout_delay, 10),
         tic_frame_size_at_1fs: parseInt(tic_frame_size_at_1fs, 10),
@@ -109,6 +109,11 @@ export default class RestAPI {
         streamer_files_num: parseInt(streamer_files_num, 10),
         streamer_file_duration: parseInt(streamer_file_duration, 10),
         streamer_player_buffer_files_num: parseInt(streamer_player_buffer_files_num, 10),
+        nmos_enabled: nmos_enabled,
+        nmos_registry_autodiscovery: nmos_registry_autodiscovery,
+        nmos_registry_address: nmos_registry_address,
+        nmos_registry_port: parseInt(nmos_registry_port, 10),
+        nmos_node_port: parseInt(nmos_node_port, 10),
       }),
       method: 'POST'
     }).catch(err => {
