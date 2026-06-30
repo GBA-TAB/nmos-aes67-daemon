@@ -1046,14 +1046,10 @@ std::error_code SessionManager::add_sink(const StreamSink& sink) {
     return ret;
   }
 
-  if (config_->get_interface_name(1).length() > 0) {
+  if (config_->get_interface_name(1).length() > 0 && info.st20227_enabled) {
+    /* Only register secondary leg when SDP has a=group:DUP — networks are segregated */
     auto [ip_addr, ip_str] = get_interface_ip(config_->get_interface_name(1));
     if (!ip_str.empty()) {
-      if (!info.st20227_enabled) {
-        /* if no DUP in SDP, duplicate information of primary audio media */
-        memcpy(&info.stream[1], &info.stream[0], sizeof(info.stream[0]));
-      }
-
       info.stream[1].m_ui32RTCPSrcIP = ip_addr;
       info.stream[1].m_uiIfPortId = 1;
 
@@ -1067,14 +1063,15 @@ std::error_code SessionManager::add_sink(const StreamSink& sink) {
       }
       ret = driver_->add_rtp_stream(info.stream[1], info.handle[1]);
       if (ret) {
-        (void)driver_->remove_rtp_stream((*it).second.handle[0]);
+        (void)driver_->remove_rtp_stream(info.handle[0]);
         if (it != sinks_.end()) {
           /* update operation failed */
           sinks_.erase(sink.id);
         }
         return ret;
       }
-      info.st20227_enabled = true;
+    } else {
+      info.st20227_enabled = false;
     }
   } else {
     info.st20227_enabled = false;

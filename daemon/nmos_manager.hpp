@@ -79,12 +79,12 @@ class NmosManager {
     bool        staged_master_enable{true};
     std::string staged_receiver_id; // "" = null
     Is05Activation staged_act;
-    SenderTp    staged_tp;
+    std::vector<SenderTp> staged_tp;
     // IS-05 active (copy of staged after activation)
     bool        active_master_enable{true};
     std::string active_receiver_id;
     Is05Activation active_act;
-    SenderTp    active_tp;
+    std::vector<SenderTp> active_tp;
   };
 
   struct ReceiverResources {
@@ -95,12 +95,12 @@ class NmosManager {
     bool        staged_master_enable{false};
     std::string staged_sender_id;   // "" = null
     Is05Activation staged_act;
-    ReceiverTp  staged_tp;
+    std::vector<ReceiverTp> staged_tp;
     // IS-05 active
     bool        active_master_enable{false};
     std::string active_sender_id;
     Is05Activation active_act;
-    ReceiverTp  active_tp;
+    std::vector<ReceiverTp> active_tp;
   };
 
   // Scheduled activation awaiting its deadline
@@ -141,8 +141,9 @@ class NmosManager {
   // ---- IS-05 ----
   void setup_connection_api();
 
-  SenderTp   build_sender_tp(const StreamSource& src) const;
-  ReceiverTp build_receiver_tp_from_sdp(const std::string& sdp) const;
+  std::vector<SenderTp>   build_sender_tp(const StreamSource& src) const;
+  std::vector<ReceiverTp> build_receiver_tp_from_sdp(const std::string& sdp) const;
+  bool is_dual_leg() const { return !config_->get_interface_name(1).empty(); }
 
   std::string tp_sender_json(const SenderTp& tp) const;
   std::string tp_receiver_json(const ReceiverTp& tp) const;
@@ -252,6 +253,7 @@ class NmosManager {
   mutable std::mutex  registry_disc_mutex_;
   std::string         discovered_registry_address_;
   uint16_t            discovered_registry_port_{0};
+  std::string         sec_interface_ip_str_;
 };
 
 #endif

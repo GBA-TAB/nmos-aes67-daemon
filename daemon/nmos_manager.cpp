@@ -26,6 +26,7 @@
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_io.hpp>
 
+#include "interface.hpp"
 #include "log.hpp"
 #include "nmos_manager.hpp"
 
@@ -373,6 +374,12 @@ bool NmosManager::init() {
   for (const auto& sink : session_manager_->get_sinks())
     register_sink_local(sink.id);
 
+  if (!config_->get_interface_name(1).empty()) {
+    auto [unused_ip, ip_str] = get_interface_ip(config_->get_interface_name(1));
+    sec_interface_ip_str_ = ip_str;
+    BOOST_LOG_TRIVIAL(info) << "NmosManager:: secondary interface IP = " << ip_str;
+  }
+
   BOOST_LOG_TRIVIAL(info) << "NmosManager:: starting async server thread";
   svr_res_ = std::async(std::launch::async, &NmosManager::server_worker, this);
   BOOST_LOG_TRIVIAL(info) << "NmosManager:: starting async registration thread";
@@ -561,8 +568,9 @@ std::string NmosManager::build_sender_json(const StreamSource& src,
      << "\""
      << ",\n  \"device_id\": \"" << device_id_ << "\""
      << ",\n  \"manifest_href\": \"" << manifest << "\""
-     << ",\n  \"interface_bindings\": [\""
-     << config_->get_interface_name(0) << "\"]"
+     << ",\n  \"interface_bindings\": [\"" << config_->get_interface_name(0) << "\"";
+  if (is_dual_leg()) ss << ", \"" << config_->get_interface_name(1) << "\"";
+  ss << "]"
      << ",\n  \"subscription\": {\"receiver_id\": ";
   if (active_receiver_id.empty()) ss << "null";
   else ss << "\"" << active_receiver_id << "\"";
@@ -583,8 +591,9 @@ std::string NmosManager::build_receiver_json(const StreamSink& sink,
      << ",\n  \"tags\": {}"
      << ",\n  \"device_id\": \"" << device_id_ << "\""
      << ",\n  \"transport\": \"urn:x-nmos:transport:rtp.mcast\""
-     << ",\n  \"interface_bindings\": [\""
-     << config_->get_interface_name(0) << "\"]"
+     << ",\n  \"interface_bindings\": [\"" << config_->get_interface_name(0) << "\"";
+  if (is_dual_leg()) ss << ", \"" << config_->get_interface_name(1) << "\"";
+  ss << "]"
      << ",\n  \"format\": \"urn:x-nmos:format:audio\""
      << ",\n  \"caps\": {\"media_types\": [\"audio/L24\", \"audio/L16\"]}"
      << ",\n  \"subscription\": {\"sender_id\": ";
@@ -786,39 +795,51 @@ void NmosManager::setup_node_api() {
 
 // --- Static SDP helpers ---
 
-static std::string sdp_extract_field(const std::string& sdp,
-                                     const std::string& prefix) {
-  auto pos = sdp.find(prefix);
-  if (pos == std::string::npos) return "";
-  pos += prefix.size();
-  auto end = sdp.find_first_of("\r\n", pos);
-  return sdp.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-}
-
 // Extract first multicast/unicast destination IP from c= line.
-static std::string sdp_connection_ip(const std::string& sdp) {
-  std::string c = sdp_extract_field(sdp, "c=IN IP4 ");
-  // strip /ttl/layers suffix
-  auto slash = c.find('/');
-  if (slash != std::string::npos) c = c.substr(0, slash);
-  return c;
+static bool sdp_has_dup(const std::string& sdp) {
+  return sdp.find("a=group:DUP") != std::string::npos;
 }
 
-// Extract port from first m= line.
-static uint16_t sdp_media_port(const std::string& sdp) {
-  auto pos = sdp.find("m=audio ");
-  if (pos == std::string::npos) return 5004;
+// Extract destination IP from the (leg+1)th m=audio section's c= line.
+static std::string sdp_connection_ip(const std::string& sdp, int leg = 0) {
+  size_t pos = 0;
+  for (int i = 0; i <= leg; i++) {
+    pos = sdp.find("m=audio ", pos);
+    if (pos == std::string::npos) return "";
+    if (i < leg) pos++;
+  }
+  size_t next_m = sdp.find("\nm=", pos + 1);
+  size_t c = sdp.find("c=IN IP4 ", pos);
+  if (c == std::string::npos || (next_m != std::string::npos && c > next_m)) return "";
+  size_t start = c + 9;
+  size_t end = sdp.find_first_of("/\r\n", start);
+  return sdp.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
+// Extract port from the (leg+1)th m=audio line.
+static uint16_t sdp_media_port(const std::string& sdp, int leg = 0) {
+  size_t pos = 0;
+  for (int i = 0; i <= leg; i++) {
+    pos = sdp.find("m=audio ", pos);
+    if (pos == std::string::npos) return 5004;
+    if (i < leg) pos++;
+  }
   pos += 8;
   auto end = sdp.find(' ', pos);
   try { return static_cast<uint16_t>(std::stoi(sdp.substr(pos, end - pos))); }
   catch (...) { return 5004; }
 }
 
-// Extract source from a=source-filter line (SSM).
-static std::string sdp_source_filter_ip(const std::string& sdp) {
-  auto pos = sdp.find("a=source-filter: incl IN IP4 ");
-  if (pos == std::string::npos) return "";
-  pos += 29;
+// Extract source IP from the (leg+1)th a=source-filter line (SSM).
+static std::string sdp_source_filter_ip(const std::string& sdp, int leg = 0) {
+  const std::string prefix = "a=source-filter: incl IN IP4 ";
+  size_t pos = 0;
+  for (int i = 0; i <= leg; i++) {
+    pos = sdp.find(prefix, pos);
+    if (pos == std::string::npos) return "";
+    if (i < leg) pos += prefix.size();
+  }
+  pos += prefix.size();
   // format: <mcast> <source>
   auto sp = sdp.find(' ', pos);
   if (sp == std::string::npos) return "";
@@ -874,7 +895,12 @@ std::string NmosManager::staged_sender_json(const SenderResources& sr) const {
   if (sr.staged_receiver_id.empty()) ss << "null";
   else ss << "\"" << sr.staged_receiver_id << "\"";
   ss << ", \"activation\": " << activation_json(sr.staged_act)
-     << ", \"transport_params\": [" << tp_sender_json(sr.staged_tp) << "]}";
+     << ", \"transport_params\": [";
+  for (size_t i = 0; i < sr.staged_tp.size(); ++i) {
+    if (i) ss << ", ";
+    ss << tp_sender_json(sr.staged_tp[i]);
+  }
+  ss << "]}";
   return ss.str();
 }
 
@@ -886,7 +912,12 @@ std::string NmosManager::active_sender_json(const SenderResources& sr) const {
   if (sr.active_receiver_id.empty()) ss << "null";
   else ss << "\"" << sr.active_receiver_id << "\"";
   ss << ", \"activation\": " << activation_json(sr.active_act)
-     << ", \"transport_params\": [" << tp_sender_json(sr.active_tp) << "]}";
+     << ", \"transport_params\": [";
+  for (size_t i = 0; i < sr.active_tp.size(); ++i) {
+    if (i) ss << ", ";
+    ss << tp_sender_json(sr.active_tp[i]);
+  }
+  ss << "]}";
   return ss.str();
 }
 
@@ -898,7 +929,12 @@ std::string NmosManager::staged_receiver_json(const ReceiverResources& rr) const
   if (rr.staged_sender_id.empty()) ss << "null";
   else ss << "\"" << rr.staged_sender_id << "\"";
   ss << ", \"activation\": " << activation_json(rr.staged_act)
-     << ", \"transport_params\": [" << tp_receiver_json(rr.staged_tp) << "]}";
+     << ", \"transport_params\": [";
+  for (size_t i = 0; i < rr.staged_tp.size(); ++i) {
+    if (i) ss << ", ";
+    ss << tp_receiver_json(rr.staged_tp[i]);
+  }
+  ss << "]}";
   return ss.str();
 }
 
@@ -910,35 +946,78 @@ std::string NmosManager::active_receiver_json(const ReceiverResources& rr) const
   if (rr.active_sender_id.empty()) ss << "null";
   else ss << "\"" << rr.active_sender_id << "\"";
   ss << ", \"activation\": " << activation_json(rr.active_act)
-     << ", \"transport_params\": [" << tp_receiver_json(rr.active_tp) << "]}";
+     << ", \"transport_params\": [";
+  for (size_t i = 0; i < rr.active_tp.size(); ++i) {
+    if (i) ss << ", ";
+    ss << tp_receiver_json(rr.active_tp[i]);
+  }
+  ss << "]}";
   return ss.str();
 }
 
 // --- Transport param builders from daemon state ---
 
-NmosManager::SenderTp NmosManager::build_sender_tp(const StreamSource& src) const {
-  SenderTp tp;
-  tp.source_ip       = config_->get_ip_addr_str();
-  tp.destination_ip  = src.address;
-  tp.source_port     = config_->get_rtp_port();
-  tp.destination_port = config_->get_rtp_port();
-  tp.rtp_enabled     = src.enabled;
-  return tp;
+std::vector<NmosManager::SenderTp> NmosManager::build_sender_tp(
+    const StreamSource& src) const {
+  std::vector<SenderTp> tps;
+  SenderTp tp0;
+  tp0.source_ip       = config_->get_ip_addr_str();
+  tp0.destination_ip  = src.address;
+  tp0.source_port     = config_->get_rtp_port();
+  tp0.destination_port = config_->get_rtp_port();
+  tp0.rtp_enabled     = src.enabled;
+  tps.push_back(tp0);
+
+  if (is_dual_leg()) {
+    SenderTp tp1;
+    tp1.source_ip   = sec_interface_ip_str_;
+    tp1.rtp_enabled = src.enabled;
+    std::string sdp;
+    session_manager_->get_source_sdp(src.id, sdp);
+    if (sdp_has_dup(sdp)) {
+      tp1.destination_ip   = sdp_connection_ip(sdp, 1);
+      tp1.source_port = tp1.destination_port = sdp_media_port(sdp, 1);
+    } else {
+      tp1.destination_ip   = src.address;
+      tp1.source_port = tp1.destination_port = config_->get_rtp_port_sec();
+    }
+    tps.push_back(tp1);
+  }
+  return tps;
 }
 
-NmosManager::ReceiverTp NmosManager::build_receiver_tp_from_sdp(
+std::vector<NmosManager::ReceiverTp> NmosManager::build_receiver_tp_from_sdp(
     const std::string& sdp) const {
-  ReceiverTp tp;
-  tp.interface_ip      = config_->get_ip_addr_str();
-  std::string dest_ip  = sdp_connection_ip(sdp);
-  if (is_multicast(dest_ip)) {
-    tp.multicast_ip = dest_ip;
+  std::vector<ReceiverTp> tps;
+  ReceiverTp tp0;
+  tp0.interface_ip     = config_->get_ip_addr_str();
+  std::string dest0    = sdp_connection_ip(sdp, 0);
+  if (is_multicast(dest0)) tp0.multicast_ip = dest0;
+  tp0.destination_port = sdp_media_port(sdp, 0);
+  std::string src0     = sdp_source_filter_ip(sdp, 0);
+  tp0.source_ip        = src0.empty() ? "auto" : src0;
+  tp0.rtp_enabled      = true;
+  tps.push_back(tp0);
+
+  if (is_dual_leg()) {
+    ReceiverTp tp1;
+    tp1.interface_ip = sec_interface_ip_str_;
+    tp1.rtp_enabled  = true;
+    if (sdp_has_dup(sdp)) {
+      std::string dest1 = sdp_connection_ip(sdp, 1);
+      if (is_multicast(dest1)) tp1.multicast_ip = dest1;
+      tp1.destination_port = sdp_media_port(sdp, 1);
+      std::string src1     = sdp_source_filter_ip(sdp, 1);
+      tp1.source_ip        = src1.empty() ? "auto" : src1;
+    } else {
+      /* Segregated 2022-7 network: primary stream not present on secondary leg */
+      tp1.rtp_enabled      = false;
+      tp1.source_ip        = "auto";
+      tp1.destination_port = 5004;
+    }
+    tps.push_back(tp1);
   }
-  tp.destination_port  = sdp_media_port(sdp);
-  std::string src_ip   = sdp_source_filter_ip(sdp);
-  tp.source_ip         = src_ip.empty() ? "auto" : src_ip;
-  tp.rtp_enabled       = true;
-  return tp;
+  return tps;
 }
 
 // --- PATCH body parsing ---
@@ -975,20 +1054,25 @@ bool NmosManager::patch_sender_staged(uint8_t daemon_id,
   if (auto v = pt.get_optional<std::string>("activation.requested_time"))
     act.requested_time = (*v == "null") ? "" : *v;
 
-  // transport_params (array, first leg only)
+  // transport_params (array — iterate all legs up to resource leg count)
   auto tp_child = pt.get_child_optional("transport_params");
-  if (tp_child && !tp_child->empty()) {
-    const auto& leg = tp_child->begin()->second;
-    if (auto v = leg.get_optional<std::string>("source_ip"))
-      sr.staged_tp.source_ip = *v;
-    if (auto v = leg.get_optional<std::string>("destination_ip"))
-      sr.staged_tp.destination_ip = *v;
-    if (auto v = leg.get_optional<uint16_t>("source_port"))
-      sr.staged_tp.source_port = *v;
-    if (auto v = leg.get_optional<uint16_t>("destination_port"))
-      sr.staged_tp.destination_port = *v;
-    if (auto v = leg.get_optional<bool>("rtp_enabled"))
-      sr.staged_tp.rtp_enabled = *v;
+  if (tp_child) {
+    int leg_idx = 0;
+    for (auto it = tp_child->begin();
+         it != tp_child->end() && leg_idx < (int)sr.staged_tp.size();
+         ++it, ++leg_idx) {
+      const auto& leg = it->second;
+      if (auto v = leg.get_optional<std::string>("source_ip"))
+        sr.staged_tp[leg_idx].source_ip = *v;
+      if (auto v = leg.get_optional<std::string>("destination_ip"))
+        sr.staged_tp[leg_idx].destination_ip = *v;
+      if (auto v = leg.get_optional<uint16_t>("source_port"))
+        sr.staged_tp[leg_idx].source_port = *v;
+      if (auto v = leg.get_optional<uint16_t>("destination_port"))
+        sr.staged_tp[leg_idx].destination_port = *v;
+      if (auto v = leg.get_optional<bool>("rtp_enabled"))
+        sr.staged_tp[leg_idx].rtp_enabled = *v;
+    }
   }
 
   // Capture staged JSON BEFORE activation fires observer events
@@ -1062,18 +1146,23 @@ bool NmosManager::patch_receiver_staged(uint8_t daemon_id,
     act.requested_time = (*v == "null") ? "" : *v;
 
   auto tp_child = pt.get_child_optional("transport_params");
-  if (tp_child && !tp_child->empty()) {
-    const auto& leg = tp_child->begin()->second;
-    if (auto v = leg.get_optional<std::string>("interface_ip"))
-      rr.staged_tp.interface_ip = *v;
-    if (auto v = leg.get_optional<std::string>("multicast_ip"))
-      rr.staged_tp.multicast_ip = (*v == "null") ? "" : *v;
-    if (auto v = leg.get_optional<uint16_t>("destination_port"))
-      rr.staged_tp.destination_port = *v;
-    if (auto v = leg.get_optional<std::string>("source_ip"))
-      rr.staged_tp.source_ip = *v;
-    if (auto v = leg.get_optional<bool>("rtp_enabled"))
-      rr.staged_tp.rtp_enabled = *v;
+  if (tp_child) {
+    int leg_idx = 0;
+    for (auto it2 = tp_child->begin();
+         it2 != tp_child->end() && leg_idx < (int)rr.staged_tp.size();
+         ++it2, ++leg_idx) {
+      const auto& leg = it2->second;
+      if (auto v = leg.get_optional<std::string>("interface_ip"))
+        rr.staged_tp[leg_idx].interface_ip = *v;
+      if (auto v = leg.get_optional<std::string>("multicast_ip"))
+        rr.staged_tp[leg_idx].multicast_ip = (*v == "null") ? "" : *v;
+      if (auto v = leg.get_optional<uint16_t>("destination_port"))
+        rr.staged_tp[leg_idx].destination_port = *v;
+      if (auto v = leg.get_optional<std::string>("source_ip"))
+        rr.staged_tp[leg_idx].source_ip = *v;
+      if (auto v = leg.get_optional<bool>("rtp_enabled"))
+        rr.staged_tp[leg_idx].rtp_enabled = *v;
+    }
   }
 
   // Capture staged JSON BEFORE activation fires observer events
@@ -1224,7 +1313,7 @@ void NmosManager::apply_receiver_activation(uint8_t daemon_id) {
   // Snapshot staged state
   bool        master_enable;
   std::string sender_id;
-  ReceiverTp  tp;
+  std::vector<ReceiverTp> tp;
   std::string activation_time;
   std::string staged_act_mode;
   {
@@ -1442,7 +1531,15 @@ void NmosManager::setup_connection_api() {
       std::string uuid = req.matches[1];
       std::shared_lock lock(resources_mutex_);
       for (const auto& [id, sr] : senders_) {
-        if (sr.sender_id == uuid) { conn_ok(res, "[{}]"); return; }
+        if (sr.sender_id == uuid) {
+          std::string c = "[";
+          for (size_t i = 0; i < sr.staged_tp.size(); ++i) {
+            if (i) c += ", ";
+            c += "{}";
+          }
+          c += "]";
+          conn_ok(res, c); return;
+        }
       }
       conn_not_found(res);
     });
@@ -1561,7 +1658,15 @@ void NmosManager::setup_connection_api() {
       std::string uuid = req.matches[1];
       std::shared_lock lock(resources_mutex_);
       for (const auto& [id, rr] : receivers_) {
-        if (rr.receiver_id == uuid) { conn_ok(res, "[{}]"); return; }
+        if (rr.receiver_id == uuid) {
+          std::string c = "[";
+          for (size_t i = 0; i < rr.staged_tp.size(); ++i) {
+            if (i) c += ", ";
+            c += "{}";
+          }
+          c += "]";
+          conn_ok(res, c); return;
+        }
       }
       conn_not_found(res);
     });
@@ -1797,7 +1902,7 @@ bool NmosManager::register_source_local(uint8_t id) {
   std::string source_id = make_resource_uuid("source", id);
   std::string flow_id   = make_resource_uuid("flow",   id);
   std::string sender_id = make_resource_uuid("sender", id);
-  SenderTp tp = build_sender_tp(src);
+  auto tp = build_sender_tp(src);
   std::unique_lock lock(resources_mutex_);
   SenderResources& sr   = senders_[id];
   sr.source_id          = source_id;
@@ -1861,19 +1966,28 @@ bool NmosManager::register_sink_local(uint8_t id) {
     return false;
   }
   std::string receiver_id = make_resource_uuid("receiver", id);
-  ReceiverTp tp;
-  tp.interface_ip = config_->get_ip_addr_str();
-  if (sink.use_sdp && !sink.sdp.empty())
-    tp = build_receiver_tp_from_sdp(sink.sdp);
+  std::vector<ReceiverTp> tps;
+  if (sink.use_sdp && !sink.sdp.empty()) {
+    tps = build_receiver_tp_from_sdp(sink.sdp);
+  } else {
+    ReceiverTp tp0;
+    tp0.interface_ip = config_->get_ip_addr_str();
+    tps.push_back(tp0);
+    if (is_dual_leg()) {
+      ReceiverTp tp1;
+      tp1.interface_ip = sec_interface_ip_str_;
+      tps.push_back(tp1);
+    }
+  }
   bool connected = sink.use_sdp && !sink.sdp.empty();
   std::unique_lock lock(resources_mutex_);
   ReceiverResources& rr   = receivers_[id];
   rr.receiver_id          = receiver_id;
   rr.receiver_json        = build_receiver_json(sink, receiver_id, "");
   rr.staged_master_enable = connected;
-  rr.staged_tp            = tp;
+  rr.staged_tp            = tps;
   rr.active_master_enable = connected;
-  rr.active_tp            = tp;
+  rr.active_tp            = tps;
   // Restore IS-05 active sender preserved through a remove+add cycle
   auto pres = preserved_active_sender_ids_.find(id);
   if (pres != preserved_active_sender_ids_.end()) {
