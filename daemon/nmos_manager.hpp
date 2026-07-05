@@ -90,7 +90,7 @@ class NmosManager {
   struct ReceiverResources {
     // IS-04
     std::string receiver_id;
-    std::string receiver_json;
+    StreamSink  sink;
     // IS-05 staged
     bool        staged_master_enable{false};
     std::string staged_sender_id;   // "" = null
@@ -120,7 +120,24 @@ class NmosManager {
 
   // ---- IS-04 ----
   void setup_node_api();
+  void setup_query_api();
   void rebuild_device_json_locked();
+
+  // IS-04 Query API WebSocket subscriptions
+  struct Subscription {
+    std::string id;
+    std::string resource_path;
+    std::string source_id;  // deterministic UUID for grain source
+    std::string flow_id;    // deterministic UUID for grain flow
+    bool persist{false};
+  };
+
+  void ws_server_worker();
+  void ws_handle_session(int socket_fd);  // takes ownership of fd
+  std::string build_initial_grain(const std::string& resource_path,
+                                   const std::string& grain_source_id,
+                                   const std::string& grain_flow_id) const;
+  std::string subscription_json(const Subscription& sub) const;
 
   std::string make_resource_uuid(const std::string& type, uint8_t id) const;
   std::string build_node_json() const;
@@ -137,6 +154,7 @@ class NmosManager {
   std::string build_receiver_json(const StreamSink& sink,
                                   const std::string& receiver_id,
                                   const std::string& active_sender_id) const;
+  std::string build_receiver_json(const ReceiverResources& rr) const;
 
   // ---- IS-05 ----
   void setup_connection_api();
@@ -216,6 +234,11 @@ class NmosManager {
   // IS-05 active-sender preservation across unregister/register cycles
   // (session_manager::add_sink triggers remove+add observers for existing sinks)
   std::map<uint8_t, std::string>  preserved_active_sender_ids_; // guarded by resources_mutex_
+
+  std::map<std::string, Subscription> subscriptions_;
+  mutable std::mutex subscriptions_mutex_;
+  std::atomic_bool     ws_running_{false};
+  std::thread          ws_thread_;
 
   httplib::Server      node_api_svr_;
   std::atomic_bool     running_{false};

@@ -84,7 +84,8 @@ class Config extends Component {
       nmosRegistryPort: 8010,
       nmosRegistryPortErr: false,
       nmosNodePort: 3212,
-      nmosNodePortErr: false
+      nmosNodePortErr: false,
+      nmosMdnsEnabled: true
     };
     this.onSubmit = this.onSubmit.bind(this);
     this.inputIsValid = this.inputIsValid.bind(this);
@@ -143,6 +144,7 @@ class Config extends Component {
             nmosRegistryAddress: data.nmos_registry_address,
             nmosRegistryPort: data.nmos_registry_port,
             nmosNodePort: data.nmos_node_port,
+            nmosMdnsEnabled: data.nmos_mdns_enabled !== undefined ? data.nmos_mdns_enabled : true,
             isConfigLoading: false
 	  }))
       .catch(err => this.setState({isConfigLoading: false}));
@@ -206,7 +208,8 @@ class Config extends Component {
       this.state.nmosRegistryAutoDiscover,
       this.state.nmosRegistryAddress,
       this.state.nmosRegistryPort,
-      this.state.nmosNodePort)
+      this.state.nmosNodePort,
+      this.state.nmosMdnsEnabled)
     .then(response => toast.success('Applying new configuration ...'));
   }
 
@@ -400,6 +403,10 @@ class Config extends Component {
           <tr>
             <th align="left"> <label>Node API port</label> </th>
             <th align="left"> <input type='number' min='1' max='65535' className='input-number' value={this.state.nmosNodePort} onChange={e => this.setState({nmosNodePort: e.target.value, nmosNodePortErr: !e.currentTarget.checkValidity()})} disabled={!this.state.nmosEnabled ? true : undefined} required/> </th>
+          </tr>
+          <tr height="35">
+            <th align="left"> <label>Advertise via mDNS (DNS-SD)</label> </th>
+            <th align="left"> <input type="checkbox" onChange={e => this.setState({nmosMdnsEnabled: e.target.checked})} checked={this.state.nmosMdnsEnabled ? true : undefined} disabled={!this.state.nmosEnabled ? true : undefined}/> </th>
           </tr>
         </tbody></table>
         <br/>

@@ -147,6 +147,39 @@ bool MDNSServer::create_services(AvahiClient* client) {
     return false;
   }
 
+  /* Register NMOS IS-04 Node and Query API services if NMOS and mDNS advertisement are enabled */
+  if (config_->get_nmos_enabled() && config_->get_nmos_mdns_enabled()) {
+    ret = avahi_entry_group_add_service(
+        group.get(), this->config_->get_interface_idx(), AVAHI_PROTO_INET, {},
+        node_id_.c_str(), "_nmos-node._tcp", nullptr, nullptr,
+        this->config_->get_nmos_node_port(),
+        "api_proto=http", "api_ver=v1.3", "api_auth=false",
+        "ver_slf=0", "ver_src=0", "ver_flw=0",
+        "ver_dvc=0", "ver_snd=0", "ver_rcv=0",
+        nullptr);
+    if (ret < 0) {
+      BOOST_LOG_TRIVIAL(warning)
+          << "mdns_server:: failed to add _nmos-node._tcp: " << avahi_strerror(ret);
+    } else {
+      BOOST_LOG_TRIVIAL(info) << "mdns_server:: adding service _nmos-node._tcp for "
+                              << node_id_;
+    }
+
+    ret = avahi_entry_group_add_service(
+        group.get(), this->config_->get_interface_idx(), AVAHI_PROTO_INET, {},
+        node_id_.c_str(), "_nmos-query._tcp", nullptr, nullptr,
+        this->config_->get_nmos_node_port(),
+        "api_proto=http", "api_ver=v1.3", "api_auth=false", "pri=100",
+        nullptr);
+    if (ret < 0) {
+      BOOST_LOG_TRIVIAL(warning)
+          << "mdns_server:: failed to add _nmos-query._tcp: " << avahi_strerror(ret);
+    } else {
+      BOOST_LOG_TRIVIAL(info) << "mdns_server:: adding service _nmos-query._tcp for "
+                              << node_id_;
+    }
+  }
+
   /* Tell the server to register the service */
   ret = avahi_entry_group_commit(group.get());
   if (ret < 0) {
