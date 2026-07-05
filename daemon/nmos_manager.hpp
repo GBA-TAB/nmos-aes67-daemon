@@ -18,15 +18,16 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <future>
 #include <map>
 #include <mutex>
 #include <queue>
+#include <regex>
 #include <shared_mutex>
 #include <string>
+#include <utility>
 #include <vector>
-
-#include <httplib.h>
 
 #include "config.hpp"
 #include "session_manager.hpp"
@@ -37,12 +38,62 @@ class NmosManager {
       std::shared_ptr<SessionManager> session_manager,
       std::shared_ptr<Config> config);
   NmosManager() = delete;
+  NmosManager(std::shared_ptr<SessionManager> sm, std::shared_ptr<Config> cfg)
+      : session_manager_(std::move(sm)), config_(std::move(cfg)) {}
   NmosManager(const NmosManager&) = delete;
   NmosManager& operator=(const NmosManager&) = delete;
   virtual ~NmosManager() = default;
 
   bool init();
   bool terminate();
+
+ // ---- Minimal HTTP request/response types used by route handlers ----
+ //      Public so file-scope static helpers in nmos_manager.cpp can name them.
+ public:
+  struct NmosReq {
+    std::string body;
+    std::smatch matches;
+    std::string qs_;  // raw query string (after '?')
+
+    std::string get_param_value(const std::string& key) const {
+      if (qs_.empty()) return "";
+      const std::string kv = key + "=";
+      auto pos = qs_.find(kv);
+      while (pos != std::string::npos) {
+        if (pos == 0 || qs_[pos - 1] == '&') {
+          pos += kv.size();
+          auto end = qs_.find('&', pos);
+          return qs_.substr(pos,
+              end == std::string::npos ? std::string::npos : end - pos);
+        }
+        pos = qs_.find(kv, pos + 1);
+      }
+      return "";
+    }
+  };
+
+  struct NmosRes {
+    int         status{200};
+    std::string body_;
+    std::string ct_{"application/json"};
+    std::vector<std::pair<std::string, std::string>> hdrs_;
+
+    void set_content(const std::string& b, const std::string& ct) {
+      body_ = b;
+      ct_   = ct;
+    }
+    void set_header(const std::string& k, const std::string& v) {
+      hdrs_.emplace_back(k, v);
+    }
+  };
+
+  using NmosHandler = std::function<void(const NmosReq&, NmosRes&)>;
+
+  struct NmosRoute {
+    std::string method;
+    std::regex  pattern;
+    NmosHandler handler;
+  };
 
  private:
   // IS-05 activation record
@@ -114,9 +165,17 @@ class NmosManager {
                          RegistryUpdated, RegistryLost };
   struct Event { EventType type; uint8_t id; };
 
-  explicit NmosManager(std::shared_ptr<SessionManager> session_manager,
-                       std::shared_ptr<Config> config)
-      : session_manager_(session_manager), config_(config) {}
+  void nmos_add(const std::string& m, const std::string& p, NmosHandler h) {
+    nmos_routes_.push_back({m, std::regex(p), std::move(h)});
+  }
+  void nmos_get    (const std::string& p, NmosHandler h) { nmos_add("GET",     p, h); }
+  void nmos_post   (const std::string& p, NmosHandler h) { nmos_add("POST",    p, h); }
+  void nmos_put    (const std::string& p, NmosHandler h) { nmos_add("PUT",     p, h); }
+  void nmos_patch  (const std::string& p, NmosHandler h) { nmos_add("PATCH",   p, h); }
+  void nmos_delete (const std::string& p, NmosHandler h) { nmos_add("DELETE",  p, h); }
+  void nmos_options(const std::string& p, NmosHandler h) { nmos_add("OPTIONS", p, h); }
+
+  void serve_connection(int fd);  // owns fd; handles HTTP and WebSocket
 
   // ---- IS-04 ----
   void setup_node_api();
@@ -132,8 +191,6 @@ class NmosManager {
     bool persist{false};
   };
 
-  void ws_server_worker();
-  void ws_handle_session(int socket_fd);  // takes ownership of fd
   std::string build_initial_grain(const std::string& resource_path,
                                    const std::string& grain_source_id,
                                    const std::string& grain_flow_id) const;
@@ -171,9 +228,6 @@ class NmosManager {
   std::string staged_receiver_json(const ReceiverResources& rr) const;
   std::string active_receiver_json(const ReceiverResources& rr) const;
 
-  // PATCH body parsing; returns false + error message on bad input.
-  // staged_json_out receives the staged state JSON to return to the caller
-  // (captured before activation fires observer events that may erase the entry).
   bool patch_sender_staged(uint8_t daemon_id,
                            const std::string& body,
                            std::string& error_out,
@@ -183,14 +237,9 @@ class NmosManager {
                              std::string& error_out,
                              std::string& staged_json_out);
 
-  // Immediate: apply staged → active, call session_manager if needed.
-  // Must be called WITHOUT resources_mutex_ held (it acquires it internally).
   void apply_sender_activation(uint8_t daemon_id);
   void apply_receiver_activation(uint8_t daemon_id);
-
-  // Fetch SDP for a remote sender via IS-04 registry + manifest_href.
   void fetch_remote_sender_sdp(const std::string& sender_uuid, std::string& sdp);
-
   void process_scheduled_activations();
 
   // ---- Registration ----
@@ -199,7 +248,6 @@ class NmosManager {
   bool heartbeat();
 
   bool full_registration();
-  // Update senders_[id] / receivers_[id] from session_manager (no network I/O).
   bool register_source_local(uint8_t id);
   bool register_sink_local(uint8_t id);
   bool register_source(uint8_t id);
@@ -223,31 +271,28 @@ class NmosManager {
   std::string device_id_;
   std::string node_json_;
 
-  mutable std::shared_mutex       resources_mutex_;
+  mutable std::shared_mutex            resources_mutex_;
   std::map<uint8_t, SenderResources>   senders_;
   std::map<uint8_t, ReceiverResources> receivers_;
   std::string device_json_;
 
-  mutable std::mutex              pending_act_mutex_;
-  std::vector<PendingActivation>  pending_activations_;
+  mutable std::mutex             pending_act_mutex_;
+  std::vector<PendingActivation> pending_activations_;
 
-  // IS-05 active-sender preservation across unregister/register cycles
-  // (session_manager::add_sink triggers remove+add observers for existing sinks)
-  std::map<uint8_t, std::string>  preserved_active_sender_ids_; // guarded by resources_mutex_
+  std::map<uint8_t, std::string> preserved_active_sender_ids_;
 
   std::map<std::string, Subscription> subscriptions_;
-  mutable std::mutex subscriptions_mutex_;
-  std::atomic_bool     ws_running_{false};
-  std::thread          ws_thread_;
+  mutable std::mutex                  subscriptions_mutex_;
 
-  httplib::Server      node_api_svr_;
-  std::atomic_bool     running_{false};
-  std::future<bool>    reg_res_;
-  std::future<bool>    svr_res_;
+  std::vector<NmosRoute> nmos_routes_;
 
-  std::mutex                  events_mutex_;
-  std::condition_variable     events_cv_;
-  std::queue<Event>           pending_events_;
+  std::atomic_bool  running_{false};
+  std::future<bool> reg_res_;
+  std::future<bool> svr_res_;
+
+  std::mutex              events_mutex_;
+  std::condition_variable events_cv_;
+  std::queue<Event>       pending_events_;
 
   // ---- DNS-SD registry discovery ----
   std::string effective_registry_address() const;
