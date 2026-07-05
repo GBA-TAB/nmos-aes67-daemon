@@ -189,8 +189,9 @@ bool Config::save(const Config& config) {
         get_nmos_node_port() != config.get_nmos_node_port() ||
         get_nmos_label() != config.get_nmos_label();
 
-    if (!daemon_restart_)
-      *this = config;
+    bool needs_restart = daemon_restart_;
+    *this = config;
+    daemon_restart_ = needs_restart;
 
     BOOST_LOG_TRIVIAL(info) << "Config:: file saved";
   } else {
