@@ -157,6 +157,30 @@ int get_interface_index(const std::string& interface_name) {
   return ifr.ifr_ifindex;
 }
 
+// BCP-008: physical link ("carrier") state, shared across every Source/Sink
+// bound to this interface. IFF_RUNNING reflects carrier presence (distinct
+// from IFF_UP, which is only the administrative up/down state) — no kernel
+// driver support needed, this is standard Linux networking state.
+bool get_interface_link_up(const std::string& interface_name) {
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) {
+    BOOST_LOG_TRIVIAL(warning)
+        << "Cannot retrieve link state for interface " << interface_name;
+    return false;
+  }
+  struct ifreq ifr;
+  ifr.ifr_addr.sa_family = AF_INET;
+  strncpy(ifr.ifr_name, interface_name.c_str(), IFNAMSIZ - 1);
+  if (ioctl(fd, SIOCGIFFLAGS, &ifr) < 0) {
+    close(fd);
+    BOOST_LOG_TRIVIAL(warning)
+        << "Cannot retrieve link state for interface " << interface_name;
+    return false;
+  }
+  close(fd);
+  return (ifr.ifr_flags & IFF_RUNNING) != 0;
+}
+
 std::pair<std::array<uint8_t, 6>, std::string> get_mac_from_arp_cache(
     const std::string& ip) {
   const std::string arpProcPath("/proc/net/arp");

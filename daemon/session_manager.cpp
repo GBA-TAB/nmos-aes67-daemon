@@ -1149,6 +1149,34 @@ std::error_code SessionManager::get_sink_status(
   return ret;
 }
 
+std::error_code SessionManager::get_source_status(
+    uint32_t id,
+    SourceStreamStatus& source_status) const {
+  if (id > stream_id_max) {
+    BOOST_LOG_TRIVIAL(error) << "session_manager:: source id "
+                             << std::to_string(id) << " is not valid";
+    return DaemonErrc::invalid_stream_id;
+  }
+
+  std::shared_lock sources_lock(sources_mutex_);
+  auto const it = sources_.find(id);
+  if (it == sources_.end()) {
+    BOOST_LOG_TRIVIAL(error)
+        << "session_manager:: source " << std::to_string(id) << " not in use";
+    return DaemonErrc::stream_id_not_in_use;
+  }
+
+  TRTP_stream_status status;
+  const auto& info = (*it).second;
+  auto ret = driver_->get_rtp_stream_status(info.handle[0], status);
+  if (!ret) {
+    source_status.is_transmitting = status.u.flags & 0x100;
+    source_status.is_underrun = status.u.flags & 0x200;
+  }
+
+  return ret;
+}
+
 std::error_code SessionManager::set_driver_config(std::string_view name,
                                                   uint32_t value) const {
   if (name == "sample_rate")

@@ -408,6 +408,7 @@ bool NmosManager::init() {
   setup_node_api();
   setup_connection_api();
   setup_query_api();
+  if (config_->get_is08_enabled()) setup_is08_api();
 
   // Populate IS-04/IS-05 local state from existing session_manager snapshot
   // synchronously so the Node API serves correct responses from the first request,
@@ -427,6 +428,10 @@ bool NmosManager::init() {
   svr_res_ = std::async(std::launch::async, &NmosManager::server_worker, this);
   BOOST_LOG_TRIVIAL(info) << "NmosManager:: starting async registration thread";
   reg_res_ = std::async(std::launch::async, &NmosManager::registration_worker, this);
+  if (config_->get_is12_enabled()) {
+    BOOST_LOG_TRIVIAL(info) << "NmosManager:: starting async IS-12 notify thread";
+    is12_notify_res_ = std::async(std::launch::async, &NmosManager::is12_notify_worker, this);
+  }
 #ifdef _USE_AVAHI_
   if (config_->get_nmos_registry_auto_discover())
     start_registry_discovery();
@@ -440,6 +445,7 @@ bool NmosManager::terminate() {
   events_cv_.notify_all();
   if (svr_res_.valid()) svr_res_.get();
   if (reg_res_.valid()) reg_res_.get();
+  if (is12_notify_res_.valid()) is12_notify_res_.get();
 #ifdef _USE_AVAHI_
   stop_registry_discovery();
 #endif
@@ -531,6 +537,8 @@ void NmosManager::rebuild_device_json_locked() {
   }
   std::string base = "http://" + config_->get_ip_addr_str() + ":" +
                      std::to_string(config_->get_nmos_node_port());
+  std::string ws_base = "ws://" + config_->get_ip_addr_str() + ":" +
+                        std::to_string(config_->get_nmos_node_port());
   ss << "]"
      << ",\n  \"controls\": ["
      << "\n    {\"href\": \"" << base << "/x-nmos/connection/v1.1/\","
@@ -538,8 +546,18 @@ void NmosManager::rebuild_device_json_locked() {
      << " \"authorization\": false},"
      << "\n    {\"href\": \"" << base << "/x-manifest/\","
      << " \"type\": \"urn:x-nmos:control:manifest-base/v1.0\","
-     << " \"authorization\": false}"
-     << "\n  ]"
+     << " \"authorization\": false}";
+  if (config_->get_is12_enabled()) {
+    ss << ",\n    {\"href\": \"" << ws_base << "/x-nmos/ncp/v1.0/\","
+       << " \"type\": \"urn:x-nmos:control:ncp/v1.0\","
+       << " \"authorization\": false}";
+  }
+  if (config_->get_is08_enabled()) {
+    ss << ",\n    {\"href\": \"" << base << "/x-nmos/channelmapping/v1.0/\","
+       << " \"type\": \"urn:x-nmos:control:cm-ctrl/v1.0\","
+       << " \"authorization\": false}";
+  }
+  ss << "\n  ]"
      << "\n}";
   device_json_ = ss.str();
 }
@@ -2310,6 +2328,20 @@ void NmosManager::serve_connection(int fd) {
     if (websocket::is_upgrade(req)) {
       // --- WebSocket upgrade path ---
       std::string target{req.target()};
+
+      const std::string ncp_prefix{"/x-nmos/ncp/v1.0"};
+      if (config_->get_is12_enabled() && target.rfind(ncp_prefix, 0) == 0) {
+        websocket::stream<beast::tcp_stream> ncp_ws{std::move(stream)};
+        ncp_ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
+        ncp_ws.accept(req);
+        serve_is12_connection(ncp_ws);
+        {
+          boost::system::error_code ec;
+          ncp_ws.close(websocket::close_code::normal, ec);
+        }
+        return;
+      }
+
       const std::string ws_prefix{"/x-nmos/query/v1.3/subscriptions/"};
       std::string sub_id;
       if (target.rfind(ws_prefix, 0) == 0) {

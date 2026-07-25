@@ -27,6 +27,7 @@ import Config from './Config';
 import Sources from './Sources';
 import Sinks from './Sinks';
 import RemoteSources from './RemoteSources';
+import Topology from './Topology';
 
 class ConfigTabs extends Component {
   static propTypes = {
@@ -66,6 +67,9 @@ class ConfigTabs extends Component {
           </div>
           <div label="Browser">
             <RemoteSources/>
+          </div>
+          <div label="Topology">
+            <Topology/>
           </div>
         </Tabs>
        </div>

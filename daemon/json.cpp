@@ -132,6 +132,8 @@ std::string config_to_json(const Config& config) {
      << ",\n  \"nmos_label\": \"" << escape_json(config.get_nmos_label()) << "\""
      << ",\n  \"nmos_registry_autodiscovery\": " << std::boolalpha << config.get_nmos_registry_auto_discover()
      << ",\n  \"nmos_mdns_enabled\": " << std::boolalpha << config.get_nmos_mdns_enabled()
+     << ",\n  \"is12_enabled\": " << std::boolalpha << config.get_is12_enabled()
+     << ",\n  \"is08_enabled\": " << std::boolalpha << config.get_is08_enabled()
      << "\n}\n";
   return ss.str();
 }
@@ -404,6 +406,10 @@ Config json_to_config_(std::istream& js, Config& config) {
         config.set_nmos_registry_auto_discover(val.get_value<bool>());
       } else if (key == "nmos_mdns_enabled") {
         config.set_nmos_mdns_enabled(val.get_value<bool>());
+      } else if (key == "is12_enabled") {
+        config.set_is12_enabled(val.get_value<bool>());
+      } else if (key == "is08_enabled") {
+        config.set_is08_enabled(val.get_value<bool>());
       } else if (key == "ip_addr") {
         config.set_ip_addr_str(val.get_value<std::string>());
       } else if (key == "mac_addr" || key == "node_id") {

@@ -81,6 +81,8 @@ class Config {
   const std::string& get_nmos_label() const { return nmos_label_; }
   bool get_nmos_registry_auto_discover() const { return nmos_registry_auto_discover_; }
   bool get_nmos_mdns_enabled() const { return nmos_mdns_enabled_; }
+  bool get_is12_enabled() const { return is12_enabled_; }
+  bool get_is08_enabled() const { return is08_enabled_; }
 
   /* attributes set during init */
   const std::array<uint8_t, 6>& get_mac_addr() const { return mac_addr_; };
@@ -186,6 +188,8 @@ class Config {
   void set_nmos_label(std::string_view v) { nmos_label_ = v; }
   void set_nmos_registry_auto_discover(bool v) { nmos_registry_auto_discover_ = v; }
   void set_nmos_mdns_enabled(bool v) { nmos_mdns_enabled_ = v; }
+  void set_is12_enabled(bool v) { is12_enabled_ = v; }
+  void set_is08_enabled(bool v) { is08_enabled_ = v; }
 
   friend bool operator!=(const Config& lhs, const Config& rhs) {
     return lhs.get_http_addr_str() != rhs.get_http_addr_str() ||
@@ -225,7 +229,9 @@ class Config {
            lhs.get_nmos_node_port() != rhs.get_nmos_node_port() ||
            lhs.get_nmos_label() != rhs.get_nmos_label() ||
            lhs.get_nmos_registry_auto_discover() != rhs.get_nmos_registry_auto_discover() ||
-           lhs.get_nmos_mdns_enabled() != rhs.get_nmos_mdns_enabled();
+           lhs.get_nmos_mdns_enabled() != rhs.get_nmos_mdns_enabled() ||
+           lhs.get_is12_enabled() != rhs.get_is12_enabled() ||
+           lhs.get_is08_enabled() != rhs.get_is08_enabled();
   };
   friend bool operator==(const Config& lhs, const Config& rhs) {
     return !(lhs != rhs);
@@ -273,6 +279,8 @@ class Config {
   std::string nmos_label_{"AES67 Daemon"};
   bool nmos_registry_auto_discover_{true};
   bool nmos_mdns_enabled_{true};
+  bool is12_enabled_{false};
+  bool is08_enabled_{false};
 
   /* set during init */
   std::array<uint8_t, 6> mac_addr_{0, 0, 0, 0, 0, 0};

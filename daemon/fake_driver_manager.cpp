@@ -131,11 +131,18 @@ std::error_code DriverManager::add_rtp_stream(
 std::error_code DriverManager::get_rtp_stream_status(
     uint64_t stream_handle,
     TRTP_stream_status& stream_status) {
-  stream_status.u.flags = 0x0;
-  stream_status.sink_min_time = 0;
   if (handles_.find(stream_handle) == handles_.end()) {
+    stream_status.u.flags = 0x0;
+    stream_status.sink_min_time = 0;
     return DriverErrc::invalid_value;
   }
+  // Fake driver doesn't distinguish Source/Sink handles, so report both
+  // "receiving" (bit 4, 0x10, used by get_sink_status) and "transmitting"
+  // (bit 8, 0x100, used by get_source_status) — whichever the caller asked
+  // for the status of picks out the bits relevant to it. Good enough to
+  // exercise the BCP-008 plumbing end-to-end without real hardware.
+  stream_status.u.flags = 0x110;
+  stream_status.sink_min_time = 0;
   return std::error_code{};
 }
 

@@ -9,3 +9,6 @@ Makefile
 CTestTestfile.cmake
 aes67-daemon
 
+# runtime-generated stream status
+status.json
+

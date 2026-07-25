@@ -47,7 +47,7 @@ endif()
 if(WITH_NMOS)
   MESSAGE(STATUS "WITH_NMOS")
   add_definitions(-D_USE_NMOS_)
-  list(APPEND SOURCES nmos_manager.cpp)
+  list(APPEND SOURCES nmos_manager.cpp nmos_is12.cpp nmos_is08.cpp)
 endif()
 
 if(FAKE_DRIVER)

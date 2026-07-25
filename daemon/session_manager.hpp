@@ -74,6 +74,13 @@ struct SinkStreamStatus {
   int min_time{0};
 };
 
+// TX-side equivalent of SinkStreamStatus, backed by the source_transmitting/
+// source_underrun bits added to TRTP_stream_status for BCP-008-02.
+struct SourceStreamStatus {
+  bool is_transmitting{false};
+  bool is_underrun{false};
+};
+
 struct PTPConfig {
   uint8_t domain{0};
   uint8_t dscp{0};
@@ -145,6 +152,7 @@ class SessionManager {
   std::error_code get_source(uint8_t id, StreamSource& source) const;
   std::list<StreamSource> get_sources() const;
   std::error_code get_source_sdp(uint32_t id, std::string& sdp) const;
+  std::error_code get_source_status(uint32_t id, SourceStreamStatus& status) const;
   std::error_code remove_source(uint32_t id);
   uint8_t get_source_id(const std::string& name) const;
 

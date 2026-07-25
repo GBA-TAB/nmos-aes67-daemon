@@ -1,5 +1,14 @@
-This fork adds NMOS Functionnality to the project (IS-04 and IS-05)
-It is a work in progress, works seamlessly with a registry. 
+This fork adds NMOS Functionnality to the project (IS-04, IS-05, IS-08 and IS-12/BCP-008)
+It is a work in progress, works seamlessly with a registry.
+
+IS-08 (Audio Channel Mapping) and IS-12 (NMOS Control Protocol, used here for BCP-008-01/02
+Receiver/Sender Status Monitoring) are each gated behind their own config option (`is08_enabled`,
+`is12_enabled`, both default `false`) on top of the existing `nmos_enabled`/`WITH_NMOS` build flag —
+see `daemon/nmos_manager.hpp`/`nmos_is08.cpp`/`nmos_is12.cpp`. BCP-008-02 (Sender/transmit health)
+requires the small kernel driver patch in `3rdparty/ravenna-alsa-lkm` that adds TX stream status bits
+(`source_transmitting`/`source_underrun`) — without a matching kernel module, sender monitoring reports
+degraded/unknown status. All four specs can be exercised without real hardware by building with
+`-DFAKE_DRIVER=ON` (see `daemon/CMakeLists.txt`).
 
 
 # AES67 Linux Daemon

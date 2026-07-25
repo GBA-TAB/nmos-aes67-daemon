@@ -1,0 +1,35 @@
+[Unit]
+Description=PTP Clock Manager — disciplines CLOCK_TAI from RAVENNA PTP
+Documentation=https://github.com/bondagit/aes67-linux-daemon
+After=network-online.target
+Wants=network-online.target
+# Start before aes67-daemon so CLOCK_TAI is ready when streams launch
+Before=aes67-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ptp-clock-manager
+Restart=on-failure
+RestartSec=5
+
+# Run as dedicated user (create with: useradd -r -s /sbin/nologin ptpclock)
+User=ptpclock
+Group=ptpclock
+
+# Drop all capabilities except what is needed:
+#   CAP_SYS_TIME  — clock_settime / clock_adjtime / adjtimex
+#   CAP_NET_ADMIN — AF_NETLINK/SOCK_RAW for RAVENNA netlink
+CapabilityBoundingSet=CAP_SYS_TIME CAP_NET_ADMIN
+AmbientCapabilities=CAP_SYS_TIME CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# Restrict filesystem access
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# Allow /dev/shm writes for the SHM segment
+ReadWritePaths=/dev/shm
+
+[Install]
+WantedBy=multi-user.target

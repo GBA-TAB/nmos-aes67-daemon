@@ -25,6 +25,11 @@ import {toast} from 'react-toastify';
 import RestAPI from './Services';
 import Loader from './Loader';
 
+function fmtAge(sec) {
+  if (sec < 60) return `${sec}s`;
+  return `${Math.round(sec / 60)}m`;
+}
+
 
 class PTPConfig extends Component {
   static propTypes = {
@@ -64,7 +69,20 @@ class PTPConfig extends Component {
         </tr>
         <tr>
           <th align="left"> <label>Domain</label> </th>
-           <th align="left"> <input type='number' min='0' max='127' className='input-number' value={this.state.domain} onChange={e => this.setState({domain: e.target.value, domainErr: !e.currentTarget.checkValidity()})} required/> </th>
+          <th align="left">
+            <select value={[0, 127].includes(+this.state.domain) ? +this.state.domain : 'custom'}
+                    onChange={e => e.target.value !== 'custom' && this.setState({domain: +e.target.value, domainErr: false})}>
+              <option value={0}>0 — IEEE standard</option>
+              <option value={127}>127 — broadcast/AV</option>
+              {![0, 127].includes(+this.state.domain) && <option value="custom">{this.state.domain} — custom</option>}
+            </select>
+            {![0, 127].includes(+this.state.domain) &&
+              <input type='number' min='0' max='127' className='input-number'
+                style={{marginLeft: '6px'}}
+                value={this.state.domain}
+                onChange={e => this.setState({domain: e.target.value, domainErr: !e.currentTarget.checkValidity()})}
+                required/>}
+          </th>
         </tr>
         <tr>
           <th align="left"> <label>DSCP</label> </th>
@@ -93,9 +111,102 @@ class PTPStatus extends Component {
     status: PropTypes.string.isRequired,
     gmid: PropTypes.string.isRequired,
     jitter: PropTypes.number.isRequired,
+    jitterHistory: PropTypes.array.isRequired,
   };
 
+  constructor(props) {
+    super(props);
+    this.canvasRef = React.createRef();
+  }
+
+  drawChart() {
+    const cv = this.canvasRef.current;
+    if (!cv) return;
+    const hist = this.props.jitterHistory;
+    if (hist.length < 2) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth || 380, H = cv.clientHeight || 90;
+    cv.width = W * dpr; cv.height = H * dpr;
+    const ctx = cv.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+      (!document.documentElement.getAttribute('data-theme') &&
+       window.matchMedia('(prefers-color-scheme: dark)').matches);
+    const p = isDark
+      ? { bg: '#1a1f2e', text: '#9ca3af', grid: 'rgba(255,255,255,0.06)', axis: '#374151', line: '#60a5fa', fill: 'rgba(96,165,250,0.13)' }
+      : { bg: '#f3f4f6', text: '#6b7280', grid: 'rgba(0,0,0,0.07)', axis: '#d1d5db', line: '#1967a8', fill: 'rgba(25,103,168,0.10)' };
+
+    ctx.fillStyle = p.bg;
+    ctx.fillRect(0, 0, W, H);
+
+    const mL = 46, mR = 6, mT = 7, mB = 18;
+    const cW = W - mL - mR, cH = H - mT - mB;
+
+    const min = Math.min(...hist), max = Math.max(...hist);
+    const span = max - min || 1;
+    const toY = v => mT + (1 - (v - min) / span) * cH;
+    const toX = i => mL + (i / (hist.length - 1)) * cW;
+
+    // Y grid + ticks + labels (3 levels)
+    ctx.font = '9px monospace';
+    const yTicks = [min, (min + max) / 2, max];
+    yTicks.forEach(v => {
+      const y = toY(v);
+      ctx.strokeStyle = p.grid; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(mL, y); ctx.lineTo(mL + cW, y); ctx.stroke();
+      ctx.strokeStyle = p.axis;
+      ctx.beginPath(); ctx.moveTo(mL - 3, y); ctx.lineTo(mL, y); ctx.stroke();
+      ctx.fillStyle = p.text; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      ctx.fillText(Math.round(v), mL - 6, y);
+    });
+
+    // X ticks + labels
+    const POLL_S = 5;
+    const xIdxs = hist.length > 4
+      ? [0, Math.floor((hist.length - 1) / 2), hist.length - 1]
+      : [0, hist.length - 1];
+    xIdxs.forEach((idx, i) => {
+      const x = toX(idx);
+      const ageSec = (hist.length - 1 - idx) * POLL_S;
+      const label = ageSec === 0 ? 'now' : `-${fmtAge(ageSec)}`;
+      ctx.strokeStyle = p.axis; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, mT + cH); ctx.lineTo(x, mT + cH + 3); ctx.stroke();
+      ctx.fillStyle = p.text; ctx.textBaseline = 'top';
+      ctx.textAlign = i === 0 ? 'left' : (i === xIdxs.length - 1 ? 'right' : 'center');
+      ctx.fillText(label, x, mT + cH + 4);
+    });
+
+    // Axes
+    ctx.strokeStyle = p.axis; ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(mL, mT); ctx.lineTo(mL, mT + cH); ctx.lineTo(mL + cW, mT + cH);
+    ctx.stroke();
+
+    // Area fill
+    const pts = hist.map((v, i) => ({ x: toX(i), y: toY(v) }));
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, mT + cH);
+    pts.forEach(p2 => ctx.lineTo(p2.x, p2.y));
+    ctx.lineTo(pts[pts.length - 1].x, mT + cH);
+    ctx.closePath();
+    ctx.fillStyle = p.fill; ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    pts.forEach((p2, i) => i ? ctx.lineTo(p2.x, p2.y) : ctx.moveTo(p2.x, p2.y));
+    ctx.strokeStyle = p.line; ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
+    ctx.stroke();
+  }
+
+  componentDidUpdate() { this.drawChart(); }
+  componentDidMount()  { this.drawChart(); }
+
   render() {
+    const locked  = this.props.status === 'locked';
+    const locking = this.props.status === 'locking';
+    const stColor = locked ? '#16a34a' : locking ? '#b45309' : '#b91c1c';
     return (
      <div>
       <h3>Status</h3>
@@ -106,17 +217,28 @@ class PTPStatus extends Component {
         </tr>
         <tr>
           <th align="left"> <label>Status</label> </th>
-          <th align="left"> <input value={this.props.status} disabled/> </th>
+          <th align="left">
+            <input value={this.props.status} disabled
+              style={{color: stColor, fontWeight: 600}}/>
+          </th>
         </tr>
         <tr>
           <th align="left"> <label>GMID</label> </th>
-          <th align="left"> <input value={this.props.gmid} disabled/> </th>
+          <th align="left"> <input value={this.props.gmid} disabled style={{fontFamily: 'monospace', width: '16em'}}/> </th>
         </tr>
         <tr>
-          <th align="left"> <label>Delta</label> </th>
+          <th align="left"> <label>Jitter (ns)</label> </th>
           <th align="left"> <input value={this.props.jitter} disabled/> </th>
         </tr>
       </tbody></table>
+      {this.props.jitterHistory.length > 0 && (
+        <div style={{marginTop: '8px'}}>
+          <small style={{color: '#888'}}>Jitter history · {this.props.jitterHistory.length} samples</small>
+          <canvas ref={this.canvasRef} width="380" height="90"
+            style={{display: 'block', width: '380px', height: '90px', marginTop: '4px', borderRadius: '4px'}}/>
+          {this.props.jitterHistory.length < 2 && <small style={{color: '#bbb', display: 'block'}}>collecting…</small>}
+        </div>
+      )}
      </div>
     )
   }
@@ -132,6 +254,7 @@ class PTP extends Component {
       status: '',
       gmid: '',
       jitter: 0,
+      jitterHistory: [],
       isConfigLoading: false,
       isStatusLoading: false,
     };
@@ -142,12 +265,16 @@ class PTP extends Component {
     RestAPI.getPTPStatus()
       .then(response => response.json())
       .then(
-        data => this.setState({
-           status: data.status,
-           gmid: data.gmid,
-           jitter: parseInt(data.jitter, 10),
-           isStatusLoading: false
-        }))
+        data => {
+          const jitter = parseInt(data.jitter, 10);
+          this.setState(prev => ({
+            status: data.status,
+            gmid: data.gmid,
+            jitter,
+            jitterHistory: [...prev.jitterHistory.slice(-59), jitter],
+            isStatusLoading: false
+          }));
+        })
       .catch(err => this.setState({isStatusLoading: false}));
   }
 
@@ -167,7 +294,7 @@ class PTP extends Component {
   componentDidMount() {
     this.fetchStatus();
     this.fetchConfig();
-    this.interval = setInterval(() => { this.fetchStatus() }, 10000)
+    this.interval = setInterval(() => { this.fetchStatus() }, 5000)
   }
 
   componentWillUnmount() {
@@ -180,8 +307,9 @@ class PTP extends Component {
         { this.state.isConfigLoading ? <Loader/> :
            <PTPConfig domain={this.state.domain} dscp={this.state.dscp}/> }
         <br/>
-        { this.state.isStatusLoading ? <Loader/> :
-           <PTPStatus status={this.state.status} gmid={this.state.gmid} jitter={this.state.jitter}/> }
+        { (this.state.isStatusLoading && this.state.jitterHistory.length === 0) ? <Loader/> :
+           <PTPStatus status={this.state.status} gmid={this.state.gmid}
+             jitter={this.state.jitter} jitterHistory={this.state.jitterHistory}/> }
       </div>
     )
   }

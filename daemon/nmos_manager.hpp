@@ -18,16 +18,21 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <future>
 #include <map>
 #include <mutex>
 #include <queue>
 #include <regex>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <boost/beast/core.hpp>
+#include <boost/beast/websocket.hpp>
 
 #include "config.hpp"
 #include "session_manager.hpp"
@@ -241,6 +246,74 @@ class NmosManager {
   void apply_receiver_activation(uint8_t daemon_id);
   void fetch_remote_sender_sdp(const std::string& sender_uuid, std::string& sdp);
   void process_scheduled_activations();
+
+  // ---- IS-12 (NMOS Control Protocol) ----
+  // Property value already encoded as a JSON literal ready to splice into a
+  // response/notification body — keeps the daemon's "hand-rolled ostringstream
+  // JSON" convention instead of introducing a variant/JSON-value type.
+  struct NcPropEntry {
+    int level;
+    int index;
+    std::string json_value;
+  };
+
+  // One IS-12 WebSocket connection: the connection's own thread blocks in
+  // ws.read() (see serve_connection) while a companion writer thread drains
+  // this queue — Boost.Beast allows one concurrent reader + one concurrent
+  // writer on the same stream, so this is the only way to push async
+  // Notifications without blocking (or being blocked by) that read loop.
+  struct Is12Session {
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::deque<std::string> outbox;
+    std::set<long>          subscribed;
+    bool                    closing{false};
+  };
+
+  void serve_is12_connection(
+      boost::beast::websocket::stream<boost::beast::tcp_stream>& ws);
+  void handle_is12_message(const std::string& msg,
+                           const std::shared_ptr<Is12Session>& session);
+  bool is12_notify_worker();
+
+  std::vector<NcPropEntry> ncp_receiver_monitor_props(uint8_t sink_id) const;
+  std::vector<NcPropEntry> ncp_sender_monitor_props(uint8_t source_id) const;
+  std::string ncp_member_descriptors_json() const;
+  bool ncp_class_descriptor_json(const std::vector<int>& class_id,
+                                 std::string& out) const;
+
+  std::mutex                              is12_sessions_mutex_;
+  std::vector<std::shared_ptr<Is12Session>> is12_sessions_;
+  std::future<bool>                       is12_notify_res_;
+
+  // ---- IS-08 (Audio Channel Mapping) ----
+  void setup_is08_api();
+
+  // Inputs/Outputs are Channel Mapping API resources, not IS-04 resources —
+  // deliberately distinct ids from receiver_id/sender_id (own "cm_input"/
+  // "cm_output" make_resource_uuid namespace) even though there's a 1:1
+  // relationship, one Input per Sink and one Output per Source.
+  std::string is08_input_id(uint8_t sink_id) const {
+    return make_resource_uuid("cm_input", sink_id);
+  }
+  std::string is08_output_id(uint8_t source_id) const {
+    return make_resource_uuid("cm_output", source_id);
+  }
+  bool find_cm_input_sink_id(const std::string& uuid, uint8_t& sink_id) const;
+  bool find_cm_output_source_id(const std::string& uuid, uint8_t& source_id) const;
+
+  std::string is08_channels_json(size_t channel_count) const;
+  std::string is08_map_active_json() const;
+
+  // Bookkeeping only — the actual audio routing is realized immediately by
+  // copying the ALSA channel number into the Source's map (see
+  // apply_is08_activation); this just remembers the logical input/channel
+  // that was last activated onto an output channel so GET /map/active has
+  // something meaningful to report back.
+  std::map<uint8_t /* source daemon id */,
+           std::map<int /* output channel */,
+                    std::pair<std::string /* input uuid */, int /* input channel */>>>
+      is08_active_map_;
 
   // ---- Registration ----
   bool register_resource(const std::string& type, const std::string& data_json);
