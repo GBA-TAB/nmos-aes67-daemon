@@ -10,6 +10,13 @@ requires the small kernel driver patch in `3rdparty/ravenna-alsa-lkm` that adds 
 degraded/unknown status. All four specs can be exercised without real hardware by building with
 `-DFAKE_DRIVER=ON` (see `daemon/CMakeLists.txt`).
 
+If the standalone [`ptp-clock-manager`](ptp-clock-manager/) is running, the daemon reads its lock
+state (locked/locking, grandmaster id, measured offset) from shared memory (`daemon/ptp_clock_shm.{hpp,cpp}`)
+and prefers it over the driver's raw PTP status for both the IS-04 `self.clocks[]` entry and the
+IS-12 `externalSynchronizationStatus` reported by every receiver/sender monitor — see
+`NmosManager::get_ptp_clock_manager_sync`. It's a soft dependency: with `ptp-clock-manager` not
+running, both fall back to the driver's own PTP status as before.
+
 
 # AES67 Linux Daemon
 

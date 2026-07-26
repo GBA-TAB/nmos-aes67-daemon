@@ -69,6 +69,36 @@ std::string json_method_descriptor(int level, int index, const std::string& name
 // BCP-008 status computation (Part 3)
 // ---------------------------------------------------------------------------
 
+// externalSynchronizationStatus for both receiver and sender monitors:
+// prefers ptp-clock-manager's discipline state (locked/locking against the
+// grandmaster, with measured offset) over the driver's raw PTP message
+// reception when ptp-clock-manager is running — see
+// NmosManager::get_ptp_clock_manager_sync.
+void NmosManager::ncp_sync_status(int& status, std::string& message) const {
+  PtpSyncInfo pcm = get_ptp_clock_manager_sync();
+  if (pcm.available) {
+    status = pcm.locked            ? kHealthHealthy
+             : pcm.locking         ? kHealthPartiallyHealthy
+                                    : kHealthUnhealthy;
+    if (pcm.locked) {
+      message = "null";
+    } else {
+      std::ostringstream m;
+      m << "\"PTP " << (pcm.locking ? "locking" : "unlocked") << ", offset "
+        << pcm.offset_ns << "ns\"";
+      message = m.str();
+    }
+    return;
+  }
+
+  PTPStatus ptp;
+  session_manager_->get_ptp_status(ptp);
+  status = ptp.status == "locked"   ? kHealthHealthy
+           : ptp.status == "locking" ? kHealthPartiallyHealthy
+                                     : kHealthUnhealthy;
+  message = ptp.status == "locked" ? "null" : ("\"PTP " + ptp.status + "\"");
+}
+
 std::vector<NmosManager::NcPropEntry> NmosManager::ncp_receiver_monitor_props(
     uint8_t sink_id) const {
   std::vector<NcPropEntry> props;
@@ -119,11 +149,9 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_receiver_monitor_props(
     connection_status = kHealthHealthy;
   }
 
-  PTPStatus ptp;
-  session_manager_->get_ptp_status(ptp);
-  int sync_status = ptp.status == "locked"   ? kHealthHealthy
-                    : ptp.status == "locking" ? kHealthPartiallyHealthy
-                                              : kHealthUnhealthy;
+  int sync_status;
+  std::string sync_msg;
+  ncp_sync_status(sync_status, sync_msg);
 
   // No direct "is this stream still valid" query is exposed by SessionManager
   // outside its own worker loop, so streamStatus proxies the sink's mute
@@ -149,7 +177,7 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_receiver_monitor_props(
   props.push_back({4, 3, std::to_string(connection_status)});
   props.push_back({4, 4, connection_msg});
   props.push_back({4, 5, std::to_string(sync_status)});
-  props.push_back({4, 6, ptp.status == "locked" ? "null" : ("\"PTP " + ptp.status + "\"")});
+  props.push_back({4, 6, sync_msg});
   props.push_back({4, 7, std::to_string(stream_status)});
   props.push_back({4, 8, stream_msg});
   return props;
@@ -204,11 +232,9 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_sender_monitor_props(
     transmission_status = kHealthHealthy;
   }
 
-  PTPStatus ptp;
-  session_manager_->get_ptp_status(ptp);
-  int sync_status = ptp.status == "locked"   ? kHealthHealthy
-                    : ptp.status == "locking" ? kHealthPartiallyHealthy
-                                              : kHealthUnhealthy;
+  int sync_status;
+  std::string sync_msg;
+  ncp_sync_status(sync_status, sync_msg);
 
   // No bitstream/essence-level inspection is available in this daemon —
   // essenceStatus proxies the transmitting bit rather than any real
@@ -224,7 +250,7 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_sender_monitor_props(
   props.push_back({4, 3, std::to_string(transmission_status)});
   props.push_back({4, 4, transmission_msg});
   props.push_back({4, 5, std::to_string(sync_status)});
-  props.push_back({4, 6, ptp.status == "locked" ? "null" : ("\"PTP " + ptp.status + "\"")});
+  props.push_back({4, 6, sync_msg});
   props.push_back({4, 7, std::to_string(essence_status)});
   props.push_back({4, 8, "null"});
   return props;

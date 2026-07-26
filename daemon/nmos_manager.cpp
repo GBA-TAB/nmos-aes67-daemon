@@ -56,6 +56,20 @@ static std::string colon_to_dash_mac(const std::string& mac) {
   return out;
 }
 
+// Formats an 8-byte EUI-64 (e.g. PtpClockShm::gmid) as IS-04's dash-separated
+// hex form, "xx-xx-xx-xx-xx-xx-xx-xx".
+static std::string eui64_to_dash_hex(const uint8_t bytes[8]) {
+  static const char* hex = "0123456789abcdef";
+  std::string out;
+  out.reserve(23);
+  for (int i = 0; i < 8; ++i) {
+    if (i) out += '-';
+    out += hex[(bytes[i] >> 4) & 0xf];
+    out += hex[bytes[i] & 0xf];
+  }
+  return out;
+}
+
 static std::string get_system_hostname() {
   char buf[256];
   if (gethostname(buf, sizeof(buf)) == 0) {
@@ -462,15 +476,44 @@ std::string NmosManager::make_resource_uuid(const std::string& type,
 }
 
 // ---------------------------------------------------------------------------
+// ptp-clock-manager integration
+// ---------------------------------------------------------------------------
+
+NmosManager::PtpSyncInfo NmosManager::get_ptp_clock_manager_sync() const {
+  PtpSyncInfo info;
+  PtpClockShm shm;
+  if (!read_ptp_clock_shm_fresh(shm)) return info;  // not running / stale
+
+  info.available = true;
+  info.locked = (shm.lock_state == PTP_LOCK_LOCKED);
+  info.locking = (shm.lock_state == PTP_LOCK_LOCKING);
+  info.gmid_dash = eui64_to_dash_hex(shm.gmid);
+  info.offset_ns = shm.offset_ns;
+  info.freq_ppb = shm.freq_ppb;
+  return info;
+}
+
+// ---------------------------------------------------------------------------
 // JSON builders
 // ---------------------------------------------------------------------------
 
 std::string NmosManager::build_node_json() const {
-  PTPStatus ptp;
-  session_manager_->get_ptp_status(ptp);
-  bool ptp_locked = (ptp.status == "locked");
-  // IS-04 gmid is "xx-xx-xx-xx-xx-xx-xx-xx"; ptp.gmid may use colons — normalise.
-  std::string gmid = ptp_locked ? colon_to_dash_mac(ptp.gmid) : "00-00-00-00-00-00-00-00";
+  // Prefer ptp-clock-manager's discipline state when it's running: it
+  // reflects whether the local system clock has actually converged on the
+  // grandmaster, not just whether the driver is receiving PTP messages.
+  PtpSyncInfo pcm = get_ptp_clock_manager_sync();
+  bool ptp_locked;
+  std::string gmid;
+  if (pcm.available) {
+    ptp_locked = pcm.locked;
+    gmid = ptp_locked ? pcm.gmid_dash : "00-00-00-00-00-00-00-00";
+  } else {
+    PTPStatus ptp;
+    session_manager_->get_ptp_status(ptp);
+    ptp_locked = (ptp.status == "locked");
+    // IS-04 gmid is "xx-xx-xx-xx-xx-xx-xx-xx"; ptp.gmid may use colons — normalise.
+    gmid = ptp_locked ? colon_to_dash_mac(ptp.gmid) : "00-00-00-00-00-00-00-00";
+  }
 
   std::ostringstream ss;
   ss << "{"

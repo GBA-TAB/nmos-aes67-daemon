@@ -35,6 +35,7 @@
 #include <boost/beast/websocket.hpp>
 
 #include "config.hpp"
+#include "ptp_clock_shm.hpp"
 #include "session_manager.hpp"
 
 class NmosManager {
@@ -246,6 +247,26 @@ class NmosManager {
   void apply_receiver_activation(uint8_t daemon_id);
   void fetch_remote_sender_sdp(const std::string& sender_uuid, std::string& sdp);
   void process_scheduled_activations();
+
+  // ---- ptp-clock-manager integration ----
+  // ptp-clock-manager is an optional standalone process (see
+  // ../ptp-clock-manager/) that disciplines the local system clock from the
+  // RAVENNA PTP grandmaster and reports its own lock state via shared
+  // memory. When it's running, its lock state is a better signal than the
+  // driver's raw PTP message reception (session_manager_->get_ptp_status):
+  // it reflects whether the local clock has actually converged, not just
+  // whether PTP messages are being seen. Used by both build_node_json
+  // (IS-04 self.clocks) and the IS-12 monitor sync-status properties.
+  struct PtpSyncInfo {
+    bool available{false};  // ptp-clock-manager running and shm snapshot fresh
+    bool locked{false};
+    bool locking{false};
+    std::string gmid_dash;  // "xx-xx-xx-xx-xx-xx-xx-xx", set only if available
+    int64_t offset_ns{0};
+    int64_t freq_ppb{0};
+  };
+  PtpSyncInfo get_ptp_clock_manager_sync() const;
+  void ncp_sync_status(int& status, std::string& message) const;
 
   // ---- IS-12 (NMOS Control Protocol) ----
   // Property value already encoded as a JSON literal ready to splice into a
