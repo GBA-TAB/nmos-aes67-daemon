@@ -299,9 +299,32 @@ class NmosManager {
 
   std::vector<NcPropEntry> ncp_receiver_monitor_props(uint8_t sink_id) const;
   std::vector<NcPropEntry> ncp_sender_monitor_props(uint8_t source_id) const;
+  std::vector<NcPropEntry> ncp_device_manager_props() const;
   std::string ncp_member_descriptors_json() const;
   bool ncp_class_descriptor_json(const std::vector<int>& class_id,
                                  std::string& out) const;
+
+  // Per-oid last-observed status + BCP-008 transition counters. "secondary"
+  // is connectionStatus (receiver) / transmissionStatus (sender); "tertiary"
+  // is streamStatus (receiver) / essenceStatus (sender) — named generically
+  // since both monitor props functions share this one counters map.
+  // -1 means "never observed" so the first Get doesn't count as a transition.
+  struct NcMonitorCounters {
+    int link_status{-1};
+    int secondary_status{-1};
+    int sync_status{-1};
+    int tertiary_status{-1};
+    int link_transitions{0};
+    int secondary_transitions{0};
+    int sync_transitions{0};
+    int tertiary_transitions{0};
+    bool auto_reset{true};
+  };
+  void update_monitor_counters(long oid, int link, int secondary, int sync,
+                               int tertiary) const;
+
+  mutable std::mutex                  monitor_counters_mutex_;
+  mutable std::map<long, NcMonitorCounters> monitor_counters_;
 
   std::mutex                              is12_sessions_mutex_;
   std::vector<std::shared_ptr<Is12Session>> is12_sessions_;
@@ -323,6 +346,22 @@ class NmosManager {
   bool find_cm_input_sink_id(const std::string& uuid, uint8_t& sink_id) const;
   bool find_cm_output_source_id(const std::string& uuid, uint8_t& source_id) const;
 
+  // Raw-ALSA Input/Output: one per physical ALSA channel (0..alsa_channels-1),
+  // independent of any Source/Sink. Input.parent is {id:null, type:null};
+  // Output.sourceid is null. Lets a controller pick "which ALSA capture
+  // channel feeds this Sender" and "which ALSA playback channel this
+  // Receiver lands on" — the two crosspoints the Sink<->Source-only model
+  // couldn't express. Own "cm_alsa_in"/"cm_alsa_out" uuid namespace, same
+  // linear-scan lookup pattern as find_cm_input_sink_id/find_cm_output_source_id.
+  std::string is08_alsa_input_id(uint8_t channel) const {
+    return make_resource_uuid("cm_alsa_in", channel);
+  }
+  std::string is08_alsa_output_id(uint8_t channel) const {
+    return make_resource_uuid("cm_alsa_out", channel);
+  }
+  bool find_alsa_input_channel(const std::string& uuid, uint8_t& channel) const;
+  bool find_alsa_output_channel(const std::string& uuid, uint8_t& channel) const;
+
   std::string is08_channels_json(size_t channel_count) const;
   std::string is08_map_active_json() const;
 
@@ -335,6 +374,51 @@ class NmosManager {
            std::map<int /* output channel */,
                     std::pair<std::string /* input uuid */, int /* input channel */>>>
       is08_active_map_;
+
+  // Same bookkeeping for raw-ALSA Outputs — single-channel, so keyed
+  // directly by ALSA channel number rather than an output-channel map.
+  std::map<uint8_t /* alsa channel */,
+           std::pair<std::string /* input uuid */, int /* input channel */>>
+      is08_active_alsa_out_map_;
+
+  // A scheduled (activate_scheduled_relative/absolute) IS-08 activation
+  // awaiting its deadline. Mirrors IS-05's PendingActivation mechanism
+  // (see patch_sender_staged/process_scheduled_activations) rather than
+  // introducing a separate scheduling thread. deadline_ns and requested_time
+  // are on the same system_clock-epoch basis as make_version() — this
+  // codebase doesn't implement real leap-second-correct TAI anywhere
+  // (make_tai_timestamp() is unused dead code), so this matches the existing
+  // level of precision rather than introducing a new, inconsistent one.
+  struct Is08PendingActivation {
+    std::string mode;
+    std::string requested_time;
+    std::string activation_time;  // computed at creation time, not left null —
+                                   // for scheduled_absolute this equals
+                                   // requested_time; for scheduled_relative
+                                   // it's requested_time resolved to an
+                                   // absolute point, per the spec's own
+                                   // examples (a client needs to know exactly
+                                   // when a relative request will fire).
+    int64_t deadline_ns{0};
+    std::string action_json;  // the "action" object, verbatim; re-applied when due
+    std::set<std::string> locked_outputs;
+  };
+  // dry_run=true validates without mutating anything — used to reject a bad
+  // scheduled activation with 400 up front, before it's even stored.
+  // canonical_json, if non-null, is filled with a re-typed, hand-built copy
+  // of the "action" object (int channel_index, not boost::property_tree's
+  // stringified round-trip) — this is what's echoed back / stored for later
+  // firing, not the client's raw (possibly loosely-typed) request body.
+  bool is08_apply_action_json(const std::string& action_json, std::string& err,
+                              bool dry_run = false, std::string* canonical_json = nullptr);
+  bool is08_output_locked(const std::string& output_id, std::string& err) const;
+  void is08_process_scheduled_activations();
+  std::string is08_activation_json(const std::string& id,
+                                   const Is08PendingActivation& pa) const;
+
+  mutable std::mutex is08_activations_mutex_;
+  std::map<std::string, Is08PendingActivation> is08_activations_;
+  uint64_t is08_activation_counter_{0};
 
   // ---- Registration ----
   bool register_resource(const std::string& type, const std::string& data_json);

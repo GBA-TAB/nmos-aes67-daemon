@@ -33,6 +33,7 @@ const sdp = '/sdp';
 const sink = '/sink';
 const status = '/status';
 const browseSources = '/browse/sources/all';
+const channelMapping = '/x-nmos/channelmapping/v1.0';
 
 const defaultParams = {
   credentials: 'same-origin',
@@ -65,6 +66,30 @@ export default class RestAPI {
       ).catch(
         err => {
           console.log(this.getBaseUrl() + API + url + ' failed: ' + err.message);
+          return Promise.reject(Error(err.message));
+        }
+      );
+  }
+
+  // Like doFetch, but against the daemon's real NMOS API paths directly
+  // (e.g. IS-08 Channel Mapping) instead of the /api proxy layer.
+  static doFetchRaw(url, params = {}) {
+    if (params.method === undefined) {
+      params.method = 'GET';
+    }
+
+    return fetch(this.getBaseUrl() + url, Object.assign({}, defaultParams, params))
+      .then(
+        response => {
+          if (response.ok) {
+            return response;
+          }
+          console.log(this.getBaseUrl() + url + ' HTTP ' + response.status);
+          return Promise.reject(Error('HTTP ' + response.status));
+        }
+      ).catch(
+        err => {
+          console.log(this.getBaseUrl() + url + ' failed: ' + err.message);
           return Promise.reject(Error(err.message));
         }
       );
@@ -251,6 +276,84 @@ export default class RestAPI {
   static getRemoteSources() {
     return this.doFetch(browseSources).catch(err => {
       toast.error('Browse sources get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  // ---- IS-08 (Audio Channel Mapping) ----
+
+  static getChannelMapInputs() {
+    return this.doFetchRaw(channelMapping + '/inputs/').catch(err => {
+      toast.error('Channel map inputs get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapInputParent(id) {
+    return this.doFetchRaw(channelMapping + '/inputs/' + id + '/parent/').catch(err => {
+      toast.error('Channel map input parent get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapInputProperties(id) {
+    return this.doFetchRaw(channelMapping + '/inputs/' + id + '/properties/').catch(err => {
+      toast.error('Channel map input properties get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapOutputs() {
+    return this.doFetchRaw(channelMapping + '/outputs/').catch(err => {
+      toast.error('Channel map outputs get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapOutputCaps(id) {
+    return this.doFetchRaw(channelMapping + '/outputs/' + id + '/caps/').catch(err => {
+      toast.error('Channel map output caps get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapOutputChannels(id) {
+    return this.doFetchRaw(channelMapping + '/outputs/' + id + '/channels/').catch(err => {
+      toast.error('Channel map output channels get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapOutputProperties(id) {
+    return this.doFetchRaw(channelMapping + '/outputs/' + id + '/properties/').catch(err => {
+      toast.error('Channel map output properties get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapActive() {
+    return this.doFetchRaw(channelMapping + '/map/active/').catch(err => {
+      toast.error('Channel map active get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static setChannelMapActivation(outputId, outputChannel, inputId, inputChannel) {
+    return this.doFetchRaw(channelMapping + '/map/activations/', {
+      body: JSON.stringify({
+        activation: { mode: 'activate_immediate' },
+        map: {
+          [outputId]: {
+            [outputChannel]: {
+              input: inputId,
+              channel_index: inputId === null ? null : inputChannel
+            }
+          }
+        }
+      }),
+      method: 'POST'
+    }).catch(err => {
+      toast.error('Channel map activation failed: ' + err.message)
       return Promise.reject(Error(err.message));
     });
   }

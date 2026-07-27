@@ -2878,6 +2878,11 @@ bool NmosManager::registration_worker() {
     // Process any scheduled IS-05 activations that have come due
     process_scheduled_activations();
 
+    // Same for IS-08 (see nmos_is08.cpp — a separate pending-activations map,
+    // same "check every wake of this loop" approach as above rather than a
+    // dedicated thread)
+    if (config_->get_is08_enabled()) is08_process_scheduled_activations();
+
     // Heartbeat when due
     if (running_ && clock::now() >= next_hb) {
       heartbeat();

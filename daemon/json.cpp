@@ -114,6 +114,7 @@ std::string config_to_json(const Config& config) {
      << "\"" << ",\n  \"ip_addr\": \"" << escape_json(config.get_ip_addr_str())
      << "\"" << ",\n  \"streamer_channels\": "
      << unsigned(config.get_streamer_channels())
+     << ",\n  \"alsa_channels\": " << unsigned(config.get_alsa_channels())
      << ",\n  \"streamer_files_num\": "
      << unsigned(config.get_streamer_files_num())
      << ",\n  \"streamer_file_duration\": "
@@ -329,6 +330,8 @@ Config json_to_config_(std::istream& js, Config& config) {
             remove_undesired_chars(val.get_value<std::string>()));
       } else if (key == "streamer_channels") {
         config.set_streamer_channels(val.get_value<uint8_t>());
+      } else if (key == "alsa_channels") {
+        config.set_alsa_channels(val.get_value<uint8_t>());
       } else if (key == "streamer_files_num") {
         config.set_streamer_files_num(val.get_value<uint8_t>());
       } else if (key == "streamer_file_duration") {

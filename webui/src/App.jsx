@@ -40,6 +40,7 @@ function App() {
         <Route exact path='/Sinks' component={() => <ConfigTabs key='Sinks' currentTab='Sinks' />} />
         <Route exact path='/Browser' component={() => <ConfigTabs key='Browser' currentTab='Browser' />} />
         <Route exact path='/Topology' component={() => <ConfigTabs key='Topology' currentTab='Topology' />} />
+        <Route exact path='/ChannelMap' component={() => <ConfigTabs key='ChannelMap' currentTab='Channel Map' />} />
         <Route component={() => <ConfigTabs key='Config' currentTab='Config' />} />
       </Switch>
     </div>
