@@ -7,7 +7,8 @@ struct RavennaPtpStatus {
     int  lock_state;     /* 0=UNLOCKED 1=LOCKING 2=LOCKED */
     uint64_t gmid[2];    /* grandmaster ID as two uint64 (see TPTPStatus.ui64GMID) */
     int32_t  network_jitter;
-    int32_t  clock_jitter; /* instantaneous clock offset proxy from RAVENNA (units: ns assumed) */
+    int32_t  clock_jitter;  /* peak jitter magnitude over the poll interval (ns); NOT a signed offset */
+    int64_t  ptp_offset_ns;  /* local RTX clock minus PTP master time, ns (negative = local behind master) */
 };
 
 /*

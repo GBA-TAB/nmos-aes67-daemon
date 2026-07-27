@@ -44,8 +44,9 @@ double ClockDiscipline::feed(int64_t offset_ns) {
         }
     }
 
-    /* PI */
-    double err = static_cast<double>(offset_ns);
+    /* PI. offset_ns is local-minus-master (negative = local clock behind master),
+     * so the correction is -offset: behind -> speed up (positive freq). */
+    double err = -static_cast<double>(offset_ns);
     integral_ += err * cfg_.ki;
     integral_  = std::clamp(integral_, -cfg_.max_freq_ppb, cfg_.max_freq_ppb);
     double freq = std::clamp(cfg_.kp * err + integral_,
@@ -55,9 +56,12 @@ double ClockDiscipline::feed(int64_t offset_ns) {
 }
 
 void ClockDiscipline::step(int64_t offset_ns) {
+    /* offset_ns is local-minus-master; add the negation to step onto master time. */
+    const int64_t correction_ns = -offset_ns;
+
     struct timespec delta{};
-    delta.tv_sec  = offset_ns / 1'000'000'000LL;
-    delta.tv_nsec = offset_ns % 1'000'000'000LL;
+    delta.tv_sec  = correction_ns / 1'000'000'000LL;
+    delta.tv_nsec = correction_ns % 1'000'000'000LL;
 
     struct timespec now{};
     clock_gettime(CLOCK_REALTIME, &now);

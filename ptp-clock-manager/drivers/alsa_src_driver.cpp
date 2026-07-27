@@ -5,6 +5,7 @@
 #ifdef WITH_ALSA_SRC
 #include <alsa/asoundlib.h>
 #include <soxr.h>
+#include <algorithm>
 #include <vector>
 
 /* Cast helpers — keep ALSA/soxr types out of the header */
@@ -117,9 +118,8 @@ void AlsaSrcDriver::stop() {
 #endif
 }
 
-int64_t AlsaSrcDriver::on_ptp_update(int64_t /*offset_ns*/, int64_t freq_ppb, bool locked) {
-    ratio_.store(locked ? 1.0 + static_cast<double>(freq_ppb) * 1e-9 : 1.0,
-                 std::memory_order_relaxed);
+int64_t AlsaSrcDriver::on_ptp_update(int64_t /*offset_ns*/, int64_t /*freq_ppb*/, bool locked) {
+    locked_.store(locked, std::memory_order_relaxed);
     return 0;
 }
 
@@ -127,11 +127,16 @@ int64_t AlsaSrcDriver::on_ptp_update(int64_t /*offset_ns*/, int64_t freq_ppb, bo
 void AlsaSrcDriver::run() {
     const unsigned CH      = cfg_.channels;
     const unsigned FRAMES  = cfg_.period_frames;
-    /* Headroom: max realistic AES67 correction << 1000 ppb → output barely > FRAMES */
+    /* Headroom: max realistic drift correction << 1000 ppb → output barely > FRAMES */
     const size_t   OUT_MAX = FRAMES + 64;
+    /* Target: middle of the sink's ALSA buffer (see open_pcm: buf = period*4) */
+    const double   TARGET_LEVEL_FRAMES = static_cast<double>(FRAMES) * 2.0;
 
     std::vector<int32_t> in_buf(FRAMES  * CH);
     std::vector<int32_t> out_buf(OUT_MAX * CH);
+
+    double drift_integral = 0.0;
+    bool   was_locked     = false;
 
     while (running_) {
         /* Capture one period */
@@ -142,6 +147,15 @@ void AlsaSrcDriver::run() {
                 std::fprintf(stderr, "AlsaSrcDriver: src recover: %s\n", snd_strerror(err));
             continue;
         }
+
+        bool locked = locked_.load(std::memory_order_relaxed);
+        if (!locked) {
+            drift_integral = 0.0;
+            ratio_.store(1.0, std::memory_order_relaxed);
+        } else if (!was_locked) {
+            drift_integral = 0.0;  /* fresh start on lock acquisition */
+        }
+        was_locked = locked;
 
         /* Update ratio; slew over one period for click-free transitions */
         double ratio = ratio_.load(std::memory_order_relaxed);
@@ -172,6 +186,20 @@ void AlsaSrcDriver::run() {
             }
             ptr       += w * static_cast<snd_pcm_sframes_t>(CH);
             remaining -= w;
+        }
+
+        /* Drift servo: trim the ratio from the sink's own buffer occupancy,
+         * independent of the system-clock freq_ppb (unrelated oscillator). */
+        if (locked) {
+            snd_pcm_sframes_t delay = 0;
+            if (snd_pcm_delay(pcm(snk_pcm_), &delay) == 0) {
+                double level_error = TARGET_LEVEL_FRAMES - static_cast<double>(delay);
+                drift_integral += level_error * cfg_.drift_ki;
+                drift_integral  = std::clamp(drift_integral, -cfg_.max_drift_ppb, cfg_.max_drift_ppb);
+                double drift_ppb = std::clamp(cfg_.drift_kp * level_error + drift_integral,
+                                              -cfg_.max_drift_ppb, cfg_.max_drift_ppb);
+                ratio_.store(1.0 - drift_ppb * 1e-9, std::memory_order_relaxed);
+            }
         }
     }
 }
