@@ -267,6 +267,10 @@ class NmosManager {
   };
   PtpSyncInfo get_ptp_clock_manager_sync() const;
   void ncp_sync_status(int& status, std::string& message) const;
+  // Checks both configured interfaces' physical link state (SMPTE 2022-7
+  // Red/Blue) — falls back to just the primary when no secondary interface
+  // is configured, so single-leg behavior is unchanged.
+  void ncp_link_status(int& status, std::string& message) const;
 
   // ---- IS-12 (NMOS Control Protocol) ----
   // Property value already encoded as a JSON literal ready to splice into a
@@ -500,6 +504,7 @@ class NmosManager {
   std::string         discovered_registry_address_;
   uint16_t            discovered_registry_port_{0};
   std::string         sec_interface_ip_str_;
+  std::string         sec_interface_mac_str_;
 };
 
 #endif

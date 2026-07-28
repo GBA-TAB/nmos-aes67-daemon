@@ -197,6 +197,15 @@ std::string sink_status_to_json(const SinkStreamStatus& status) {
      << ", \n    \"some_muted\": " << status.is_some_muted
      << ", \n    \"all_muted\": " << status.is_all_muted
      << ", \n    \"muted\": " << status.is_muted << "\n  },"
+     << "\n  \"leg2\":\n  {"
+     << "  \n    \"present\": " << status.leg2_present
+     << ", \n    \"rtp_seq_id_error\": " << status.leg2_is_rtp_seq_id_error
+     << ", \n    \"rtp_ssrc_error\": " << status.leg2_is_rtp_ssrc_error
+     << ", \n    \"rtp_payload_type_error\": "
+     << status.leg2_is_rtp_payload_type_error
+     << ", \n    \"rtp_sac_error\": " << status.leg2_is_rtp_sac_error
+     << ", \n    \"receiving_rtp_packet\": " << status.leg2_is_receiving_rtp_packet
+     << "\n  },"
      << "\n  \"sink_min_time\": " << status.min_time << "\n}\n";
   return ss.str();
 }

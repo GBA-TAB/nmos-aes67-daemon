@@ -112,6 +112,30 @@ void NmosManager::ncp_sync_status(int& status, std::string& message) const {
   message = ptp.status == "locked" ? "null" : ("\"PTP " + ptp.status + "\"");
 }
 
+void NmosManager::ncp_link_status(int& status, std::string& message) const {
+  bool link0_up = get_interface_link_up(config_->get_interface_name(0));
+  bool has_leg2 = !config_->get_interface_name(1).empty();
+
+  if (!has_leg2) {
+    status = link0_up ? kHealthHealthy : kHealthUnhealthy;
+    message = link0_up ? "null" : "\"Interface link down\"";
+    return;
+  }
+
+  bool link1_up = get_interface_link_up(config_->get_interface_name(1));
+  if (link0_up && link1_up) {
+    status = kHealthHealthy;
+    message = "null";
+  } else if (link0_up || link1_up) {
+    status = kHealthPartiallyHealthy;
+    message = link0_up ? "\"Secondary (blue) interface link down\""
+                       : "\"Primary (red) interface link down\"";
+  } else {
+    status = kHealthUnhealthy;
+    message = "\"Both interface links down\"";
+  }
+}
+
 // Updates the per-oid last-observed status + transition counters (see
 // NcMonitorCounters). Safe to call from multiple contexts (Get handling and
 // the once-a-second notify worker both call through the props functions
@@ -156,18 +180,32 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_receiver_monitor_props(
   std::string sync_source_id = "null";
 
   if (active) {
-    bool link_up = get_interface_link_up(config_->get_interface_name());
-    link_status = link_up ? kHealthHealthy : kHealthUnhealthy;
-    if (!link_up) link_msg = "\"Interface link down\"";
+    ncp_link_status(link_status, link_msg);
 
     SinkStreamStatus sink_status{};
     session_manager_->get_sink_status(sink_id, sink_status);
 
-    if (!sink_status.is_receiving_rtp_packet) {
+    bool leg0_ok = sink_status.is_receiving_rtp_packet;
+    bool leg0_errs = sink_status.is_rtp_seq_id_error || sink_status.is_rtp_ssrc_error ||
+                     sink_status.is_rtp_payload_type_error || sink_status.is_rtp_sac_error;
+
+    if (sink_status.leg2_present) {
+      bool leg1_ok = sink_status.leg2_is_receiving_rtp_packet;
+      if (leg0_ok && leg1_ok) {
+        connection_status = leg0_errs ? kHealthPartiallyHealthy : kHealthHealthy;
+        if (leg0_errs) connection_msg = "\"RTP stream errors detected on primary (red) leg\"";
+      } else if (leg0_ok || leg1_ok) {
+        connection_status = kHealthPartiallyHealthy;
+        connection_msg = leg0_ok ? "\"Receiving on primary (red) leg only\""
+                                 : "\"Receiving on secondary (blue) leg only\"";
+      } else {
+        connection_status = kHealthUnhealthy;
+        connection_msg = "\"Not receiving RTP packets on either leg\"";
+      }
+    } else if (!leg0_ok) {
       connection_status = kHealthUnhealthy;
       connection_msg = "\"Not receiving RTP packets\"";
-    } else if (sink_status.is_rtp_seq_id_error || sink_status.is_rtp_ssrc_error ||
-               sink_status.is_rtp_payload_type_error || sink_status.is_rtp_sac_error) {
+    } else if (leg0_errs) {
       connection_status = kHealthPartiallyHealthy;
       connection_msg = "\"RTP stream errors detected\"";
     } else {
@@ -253,17 +291,31 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_sender_monitor_props(
   std::string sync_source_id = "null";
 
   if (active) {
-    bool link_up = get_interface_link_up(config_->get_interface_name());
-    link_status = link_up ? kHealthHealthy : kHealthUnhealthy;
-    if (!link_up) link_msg = "\"Interface link down\"";
+    ncp_link_status(link_status, link_msg);
 
     SourceStreamStatus src_status{};
     session_manager_->get_source_status(source_id, src_status);
 
-    if (!src_status.is_transmitting) {
+    bool leg0_ok = src_status.is_transmitting;
+    bool leg0_underrun = src_status.is_underrun;
+
+    if (src_status.leg2_present) {
+      bool leg1_ok = src_status.leg2_is_transmitting;
+      if (leg0_ok && leg1_ok) {
+        transmission_status = leg0_underrun ? kHealthPartiallyHealthy : kHealthHealthy;
+        if (leg0_underrun) transmission_msg = "\"Buffer underrun detected on primary (red) leg\"";
+      } else if (leg0_ok || leg1_ok) {
+        transmission_status = kHealthPartiallyHealthy;
+        transmission_msg = leg0_ok ? "\"Transmitting on primary (red) leg only\""
+                                   : "\"Transmitting on secondary (blue) leg only\"";
+      } else {
+        transmission_status = kHealthUnhealthy;
+        transmission_msg = "\"Not transmitting RTP packets on either leg\"";
+      }
+    } else if (!leg0_ok) {
       transmission_status = kHealthUnhealthy;
       transmission_msg = "\"Not transmitting RTP packets\"";
-    } else if (src_status.is_underrun) {
+    } else if (leg0_underrun) {
       transmission_status = kHealthPartiallyHealthy;
       transmission_msg = "\"Buffer underrun detected\"";
     } else {

@@ -1146,6 +1146,22 @@ std::error_code SessionManager::get_sink_status(
     sink_status.min_time = status.sink_min_time;
   }
 
+  // SMPTE 2022-7 secondary (Blue) leg — only registered as a genuinely
+  // separate RTP stream when the source SDP had a=group:DUP, so handle[1]
+  // staying 0 (its default) is the correct "not dual-leg" signal, not an
+  // error.
+  if (info.handle[1] != 0) {
+    sink_status.leg2_present = true;
+    TRTP_stream_status status2;
+    if (!driver_->get_rtp_stream_status(info.handle[1], status2)) {
+      sink_status.leg2_is_rtp_seq_id_error = status2.u.flags & 0x01;
+      sink_status.leg2_is_rtp_ssrc_error = status2.u.flags & 0x02;
+      sink_status.leg2_is_rtp_payload_type_error = status2.u.flags & 0x04;
+      sink_status.leg2_is_rtp_sac_error = status2.u.flags & 0x08;
+      sink_status.leg2_is_receiving_rtp_packet = status2.u.flags & 0x10;
+    }
+  }
+
   return ret;
 }
 
@@ -1172,6 +1188,19 @@ std::error_code SessionManager::get_source_status(
   if (!ret) {
     source_status.is_transmitting = status.u.flags & 0x100;
     source_status.is_underrun = status.u.flags & 0x200;
+  }
+
+  // SMPTE 2022-7 secondary (Blue) leg — a Source transmits on it
+  // unconditionally whenever a secondary interface is configured (unlike a
+  // Sink, which depends on the remote SDP), so handle[1] != 0 here reflects
+  // that same "is dual-leg actually running" signal.
+  if (info.handle[1] != 0) {
+    source_status.leg2_present = true;
+    TRTP_stream_status status2;
+    if (!driver_->get_rtp_stream_status(info.handle[1], status2)) {
+      source_status.leg2_is_transmitting = status2.u.flags & 0x100;
+      source_status.leg2_is_underrun = status2.u.flags & 0x200;
+    }
   }
 
   return ret;

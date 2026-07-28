@@ -72,6 +72,17 @@ struct SinkStreamStatus {
   bool is_some_muted{false};
   bool is_all_muted{false};
   int min_time{0};
+
+  // SMPTE 2022-7 secondary (leg 1 / "Blue") status — present only when this
+  // Sink actually has a second RTP stream registered (StreamInfo::handle[1]
+  // != 0, i.e. the source SDP advertised a=group:DUP and a secondary
+  // interface is configured). Leg 0 above stays exactly as it always was.
+  bool leg2_present{false};
+  bool leg2_is_rtp_seq_id_error{false};
+  bool leg2_is_rtp_ssrc_error{false};
+  bool leg2_is_rtp_payload_type_error{false};
+  bool leg2_is_rtp_sac_error{false};
+  bool leg2_is_receiving_rtp_packet{false};
 };
 
 // TX-side equivalent of SinkStreamStatus, backed by the source_transmitting/
@@ -79,6 +90,11 @@ struct SinkStreamStatus {
 struct SourceStreamStatus {
   bool is_transmitting{false};
   bool is_underrun{false};
+
+  // SMPTE 2022-7 secondary (leg 1 / "Blue") status — see SinkStreamStatus.
+  bool leg2_present{false};
+  bool leg2_is_transmitting{false};
+  bool leg2_is_underrun{false};
 };
 
 struct PTPConfig {

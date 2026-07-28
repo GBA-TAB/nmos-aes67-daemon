@@ -436,6 +436,10 @@ bool NmosManager::init() {
     auto [unused_ip, ip_str] = get_interface_ip(config_->get_interface_name(1));
     sec_interface_ip_str_ = ip_str;
     BOOST_LOG_TRIVIAL(info) << "NmosManager:: secondary interface IP = " << ip_str;
+
+    auto [unused_mac, mac_str] = get_interface_mac(config_->get_interface_name(1));
+    sec_interface_mac_str_ = mac_str;
+    BOOST_LOG_TRIVIAL(info) << "NmosManager:: secondary interface MAC = " << mac_str;
   }
 
   BOOST_LOG_TRIVIAL(info) << "NmosManager:: starting async server thread";
@@ -544,11 +548,24 @@ std::string NmosManager::build_node_json() const {
      << "\n    \"gmid\": \"" << gmid << "\","
      << "\n    \"locked\": " << (ptp_locked ? "true" : "false")
      << "\n  }]"
-     << ",\n  \"interfaces\": [{"
-     << "\n    \"name\": \"" << config_->get_interface_name() << "\","
-     << "\n    \"port_id\": \"" << colon_to_dash_mac(config_->get_mac_addr_str()) << "\","
-     << "\n    \"chassis_id\": \"" << colon_to_dash_mac(config_->get_mac_addr_str()) << "\""
-     << "\n  }]"
+     << ",\n  \"interfaces\": [";
+  {
+    // One entry per actually-configured physical interface (SMPTE 2022-7
+    // Red/Blue when a secondary is configured) — config_->get_interface_name()
+    // with no index is the raw comma-joined string and was wrongly used here
+    // directly as a single interface's "name".
+    std::string mac0 = colon_to_dash_mac(config_->get_mac_addr_str());
+    ss << "{\"name\": \"" << config_->get_interface_name(0) << "\""
+       << ", \"port_id\": \"" << mac0 << "\""
+       << ", \"chassis_id\": \"" << mac0 << "\"}";
+    if (!config_->get_interface_name(1).empty()) {
+      std::string mac1 = colon_to_dash_mac(sec_interface_mac_str_);
+      ss << ", {\"name\": \"" << config_->get_interface_name(1) << "\""
+         << ", \"port_id\": \"" << mac1 << "\""
+         << ", \"chassis_id\": \"" << mac1 << "\"}";
+    }
+  }
+  ss << "]"
      << "\n}";
   return ss.str();
 }
