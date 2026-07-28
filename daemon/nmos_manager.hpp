@@ -367,23 +367,11 @@ class NmosManager {
   bool find_alsa_output_channel(const std::string& uuid, uint8_t& channel) const;
 
   std::string is08_channels_json(size_t channel_count) const;
+  // Derived live from each Source's/Sink's own map[] every call — see
+  // nmos_is08.cpp - so it's always in harmony with whatever the native
+  // Sources/Sinks tabs (or a direct PUT /api/source|sink/{id}) last set,
+  // with no separate bookkeeping that could go stale.
   std::string is08_map_active_json() const;
-
-  // Bookkeeping only — the actual audio routing is realized immediately by
-  // copying the ALSA channel number into the Source's map (see
-  // apply_is08_activation); this just remembers the logical input/channel
-  // that was last activated onto an output channel so GET /map/active has
-  // something meaningful to report back.
-  std::map<uint8_t /* source daemon id */,
-           std::map<int /* output channel */,
-                    std::pair<std::string /* input uuid */, int /* input channel */>>>
-      is08_active_map_;
-
-  // Same bookkeeping for raw-ALSA Outputs — single-channel, so keyed
-  // directly by ALSA channel number rather than an output-channel map.
-  std::map<uint8_t /* alsa channel */,
-           std::pair<std::string /* input uuid */, int /* input channel */>>
-      is08_active_alsa_out_map_;
 
   // A scheduled (activate_scheduled_relative/absolute) IS-08 activation
   // awaiting its deadline. Mirrors IS-05's PendingActivation mechanism
