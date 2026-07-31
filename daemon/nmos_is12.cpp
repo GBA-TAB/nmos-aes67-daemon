@@ -44,6 +44,26 @@ constexpr long kClassManagerOid = 3;
 constexpr long kReceiverMonitorOidBase = 100;
 constexpr long kSenderMonitorOidBase = 200;
 
+// NcLinkStatus (AllUp=1/SomeDown=2/AllDown=3) numerically coincides with the
+// generic Healthy/PartiallyHealthy/Unhealthy ordering shared above, so this
+// reuses the same kHealth* constants. Single-leg links can only ever be
+// fully up or fully down; dual-leg (ST 2022-7) links can be partially up,
+// which a single shared boolean can't represent — hence per-leg inputs here.
+std::pair<int, std::string> compute_link_status(bool leg0_up, bool dual_leg,
+                                                  bool leg1_up) {
+  if (!dual_leg) {
+    return leg0_up ? std::make_pair(kHealthHealthy, std::string("null"))
+                    : std::make_pair(kHealthUnhealthy,
+                                      std::string("\"Interface link down\""));
+  }
+  if (leg0_up && leg1_up) return {kHealthHealthy, "null"};
+  if (!leg0_up && !leg1_up)
+    return {kHealthUnhealthy, "\"Both interface links down\""};
+  return {kHealthPartiallyHealthy,
+          leg0_up ? "\"Secondary interface link down\""
+                   : "\"Primary interface link down\""};
+}
+
 std::string json_prop_descriptor(int level, int index, const std::string& name,
                                  const std::string& type_name, bool is_read_only,
                                  bool is_nullable, bool is_sequence) {
@@ -130,8 +150,9 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_receiver_monitor_props(
     return props;
   }
 
-  bool link_up = get_interface_link_up(config_->get_interface_name());
-  int link_status = link_up ? kHealthHealthy : kHealthUnhealthy;
+  bool leg0_up = get_interface_link_up(config_->get_interface_name(0));
+  bool leg1_up = is_dual_leg() && get_interface_link_up(config_->get_interface_name(1));
+  auto [link_status, link_msg] = compute_link_status(leg0_up, is_dual_leg(), leg1_up);
 
   SinkStreamStatus sink_status{};
   session_manager_->get_sink_status(sink_id, sink_status);
@@ -173,7 +194,7 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_receiver_monitor_props(
   props.push_back({3, 1, std::to_string(overall)});
   props.push_back({3, 2, "null"});
   props.push_back({4, 1, std::to_string(link_status)});
-  props.push_back({4, 2, link_up ? "null" : "\"Interface link down\""});
+  props.push_back({4, 2, link_msg});
   props.push_back({4, 3, std::to_string(connection_status)});
   props.push_back({4, 4, connection_msg});
   props.push_back({4, 5, std::to_string(sync_status)});
@@ -214,8 +235,9 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_sender_monitor_props(
     return props;
   }
 
-  bool link_up = get_interface_link_up(config_->get_interface_name());
-  int link_status = link_up ? kHealthHealthy : kHealthUnhealthy;
+  bool leg0_up = get_interface_link_up(config_->get_interface_name(0));
+  bool leg1_up = is_dual_leg() && get_interface_link_up(config_->get_interface_name(1));
+  auto [link_status, link_msg] = compute_link_status(leg0_up, is_dual_leg(), leg1_up);
 
   SourceStreamStatus src_status{};
   session_manager_->get_source_status(source_id, src_status);
@@ -246,7 +268,7 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_sender_monitor_props(
   props.push_back({3, 1, std::to_string(overall)});
   props.push_back({3, 2, "null"});
   props.push_back({4, 1, std::to_string(link_status)});
-  props.push_back({4, 2, link_up ? "null" : "\"Interface link down\""});
+  props.push_back({4, 2, link_msg});
   props.push_back({4, 3, std::to_string(transmission_status)});
   props.push_back({4, 4, transmission_msg});
   props.push_back({4, 5, std::to_string(sync_status)});
@@ -312,6 +334,8 @@ bool NmosManager::ncp_class_descriptor_json(const std::vector<int>& class_id,
     properties.push_back(json_prop_descriptor(4, 6, "externalSynchronizationStatusMessage", "NcString", true, true, false));
     properties.push_back(json_prop_descriptor(4, 7, "streamStatus", "NcStreamStatus", true, false, false));
     properties.push_back(json_prop_descriptor(4, 8, "streamStatusMessage", "NcString", true, true, false));
+    methods.push_back(json_method_descriptor(4, 1, "GetLostPacketCounters"));
+    methods.push_back(json_method_descriptor(4, 2, "GetLatePacketCounters"));
   } else if (class_id == std::vector<int>{1, 2, 2, 2}) {
     name = "NcSenderMonitor";
     properties.push_back(json_prop_descriptor(1, 7, "touchpoints", "NcTouchpoint", true, true, true));
@@ -325,6 +349,7 @@ bool NmosManager::ncp_class_descriptor_json(const std::vector<int>& class_id,
     properties.push_back(json_prop_descriptor(4, 6, "externalSynchronizationStatusMessage", "NcString", true, true, false));
     properties.push_back(json_prop_descriptor(4, 7, "essenceStatus", "NcEssenceStatus", true, false, false));
     properties.push_back(json_prop_descriptor(4, 8, "essenceStatusMessage", "NcString", true, true, false));
+    methods.push_back(json_method_descriptor(4, 1, "GetTransmissionErrorCounters"));
   } else {
     return false;
   }
@@ -440,6 +465,36 @@ void NmosManager::handle_is12_message(const std::string& msg,
         // NcObject.Set — every property this daemon exposes is read-only.
         status = 405;
         error_message = "PropertyReadOnly";
+      } else if (mlevel == 4 && (mindex == 1 || mindex == 2) &&
+                 oid >= kReceiverMonitorOidBase && oid < kReceiverMonitorOidBase + 64) {
+        // NcReceiverMonitor.GetLostPacketCounters (4,1) / GetLatePacketCounters
+        // (4,2). The driver only exposes boolean RTP error flags (see
+        // SinkStreamStatus), not per-packet loss/lateness counts, so there is
+        // no real data to report. Per BCP-008-01, devices without that
+        // capability "MUST implement the method but return an empty
+        // collection" — this is that conformant empty response.
+        std::shared_lock lock(resources_mutex_);
+        if (receivers_.count(static_cast<uint8_t>(oid - kReceiverMonitorOidBase))) {
+          status = 200;
+          error_message.clear();
+          value_json = "[]";
+        } else {
+          status = 404;
+          error_message = "Unknown oid";
+        }
+      } else if (mlevel == 4 && mindex == 1 &&
+                 oid >= kSenderMonitorOidBase && oid < kSenderMonitorOidBase + 64) {
+        // NcSenderMonitor.GetTransmissionErrorCounters — same rationale as
+        // the receiver-side counters above.
+        std::shared_lock lock(resources_mutex_);
+        if (senders_.count(static_cast<uint8_t>(oid - kSenderMonitorOidBase))) {
+          status = 200;
+          error_message.clear();
+          value_json = "[]";
+        } else {
+          status = 404;
+          error_message = "Unknown oid";
+        }
       }
 
       if (!first) resp << ", ";

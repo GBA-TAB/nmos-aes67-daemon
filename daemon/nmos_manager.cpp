@@ -544,11 +544,31 @@ std::string NmosManager::build_node_json() const {
      << "\n    \"gmid\": \"" << gmid << "\","
      << "\n    \"locked\": " << (ptp_locked ? "true" : "false")
      << "\n  }]"
-     << ",\n  \"interfaces\": [{"
-     << "\n    \"name\": \"" << config_->get_interface_name() << "\","
-     << "\n    \"port_id\": \"" << colon_to_dash_mac(config_->get_mac_addr_str()) << "\","
-     << "\n    \"chassis_id\": \"" << colon_to_dash_mac(config_->get_mac_addr_str()) << "\""
-     << "\n  }]"
+     << ",\n  \"interfaces\": [";
+  {
+    // One entry per configured leg, matching what interface_bindings on
+    // Sender/Receiver actually reference (config_->get_interface_name(idx),
+    // the correctly-split per-leg name) — not the raw, comma-joined
+    // interface_name_ the no-arg overload returns. Each leg's own MAC is
+    // looked up directly (same call session_manager.cpp already makes for
+    // the secondary leg's RTP stream) since config_ only caches the primary
+    // interface's MAC in mac_addr_/mac_str_.
+    const uint8_t leg_count = is_dual_leg() ? 2 : 1;
+    for (uint8_t idx = 0; idx < leg_count; ++idx) {
+      std::string name = config_->get_interface_name(idx);
+      std::string mac_str =
+          idx == 0 ? config_->get_mac_addr_str()
+                   : get_interface_mac(name).second;
+      std::string dash_mac = colon_to_dash_mac(mac_str);
+      if (idx != 0) ss << ",";
+      ss << "{"
+         << "\n    \"name\": \"" << name << "\","
+         << "\n    \"port_id\": \"" << dash_mac << "\","
+         << "\n    \"chassis_id\": \"" << dash_mac << "\""
+         << "\n  }";
+    }
+  }
+  ss << "]"
      << "\n}";
   return ss.str();
 }
