@@ -181,6 +181,13 @@ class SessionManager {
   void get_ptp_config(PTPConfig& config) const;
   void get_ptp_status(PTPStatus& status) const;
 
+  // Total ALSA channel counts the driver exposes — "inputs" are capture
+  // channels (what a Sink writes RX'd network audio into), "outputs" are
+  // playback channels (what a Source reads TX audio from). Used by IS-08 to
+  // size each Sink's ALSA-side Output / each Source's ALSA-side Input.
+  std::error_code get_alsa_input_count(int32_t& count) const;
+  std::error_code get_alsa_output_count(int32_t& count) const;
+
   bool load_status();
   bool save_status() const;
 

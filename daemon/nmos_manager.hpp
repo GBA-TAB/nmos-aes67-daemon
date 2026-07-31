@@ -308,33 +308,44 @@ class NmosManager {
   std::future<bool>                       is12_notify_res_;
 
   // ---- IS-08 (Audio Channel Mapping) ----
+  //
+  // Each Sink/Source has exactly two Channel Mapping resources, matching the
+  // real ALSA-mediated audio path in this daemon rather than a network-to-
+  // network shortcut:
+  //   Sink:   Input  = its stream (RX) side   — channels = sink.map.size()
+  //           Output = its ALSA side          — channels = get_number_of_inputs()
+  //             (a Sink writes RX'd audio into ALSA *capture* channels —
+  //             "inputs" in the driver's own vocabulary, see driver_manager.hpp)
+  //   Source: Input  = its ALSA side          — channels = get_number_of_outputs()
+  //             (a Source reads TX audio from ALSA *playback* channels)
+  //           Output = its stream (TX) side   — channels = source.map.size()
+  // A crosspoint activation directly edits that Sink's/Source's own `map[]`
+  // (map[stream_channel] = alsa_channel) — there is no cross-Sink-to-Source
+  // resource at all. Repatching a Sink's incoming audio out through some
+  // Source (a "network repeater") is still possible, just indirect: activate
+  // the Sink's Output onto some ALSA channel X, then separately activate that
+  // Source's Input from the same ALSA channel X — exactly mirroring how the
+  // physical/ALSA path actually works underneath.
   void setup_is08_api();
 
-  // Inputs/Outputs are Channel Mapping API resources, not IS-04 resources —
-  // deliberately distinct ids from receiver_id/sender_id (own "cm_input"/
-  // "cm_output" make_resource_uuid namespace) even though there's a 1:1
-  // relationship, one Input per Sink and one Output per Source.
-  std::string is08_input_id(uint8_t sink_id) const {
-    return make_resource_uuid("cm_input", sink_id);
+  enum class Is08Kind { SinkStream, SourceAlsa, SinkAlsa, SourceStream };
+  struct Is08Ref {
+    Is08Kind kind;
+    uint8_t id;  // daemon sink id (SinkStream/SinkAlsa) or source id (SourceAlsa/SourceStream)
+  };
+
+  std::string is08_resource_id(Is08Kind kind, uint8_t id) const {
+    const char* ns = kind == Is08Kind::SinkStream    ? "cm_sink_stream"
+                     : kind == Is08Kind::SinkAlsa     ? "cm_sink_alsa"
+                     : kind == Is08Kind::SourceAlsa    ? "cm_source_alsa"
+                                                        : "cm_source_stream";
+    return make_resource_uuid(ns, id);
   }
-  std::string is08_output_id(uint8_t source_id) const {
-    return make_resource_uuid("cm_output", source_id);
-  }
-  bool find_cm_input_sink_id(const std::string& uuid, uint8_t& sink_id) const;
-  bool find_cm_output_source_id(const std::string& uuid, uint8_t& source_id) const;
+  bool find_cm_input(const std::string& uuid, Is08Ref& ref) const;
+  bool find_cm_output(const std::string& uuid, Is08Ref& ref) const;
 
   std::string is08_channels_json(size_t channel_count) const;
   std::string is08_map_active_json() const;
-
-  // Bookkeeping only — the actual audio routing is realized immediately by
-  // copying the ALSA channel number into the Source's map (see
-  // apply_is08_activation); this just remembers the logical input/channel
-  // that was last activated onto an output channel so GET /map/active has
-  // something meaningful to report back.
-  std::map<uint8_t /* source daemon id */,
-           std::map<int /* output channel */,
-                    std::pair<std::string /* input uuid */, int /* input channel */>>>
-      is08_active_map_;
 
   // ---- Registration ----
   bool register_resource(const std::string& type, const std::string& data_json);

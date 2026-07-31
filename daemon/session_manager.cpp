@@ -1212,6 +1212,14 @@ void SessionManager::get_ptp_status(PTPStatus& status) const {
   status = ptp_status_;
 }
 
+std::error_code SessionManager::get_alsa_input_count(int32_t& count) const {
+  return driver_->get_number_of_inputs(count);
+}
+
+std::error_code SessionManager::get_alsa_output_count(int32_t& count) const {
+  return driver_->get_number_of_outputs(count);
+}
+
 size_t SessionManager::process_sap() {
   size_t sdp_len_sum = 0;
   // set to contain sources currently announced

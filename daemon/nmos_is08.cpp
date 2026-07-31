@@ -1,26 +1,21 @@
 //
 //  nmos_is08.cpp
 //
-//  IS-08 (Audio Channel Mapping) REST API: one Input per Sink (Receiver),
-//  one Output per Source (Sender). Reuses the existing nmos_get/nmos_post
-//  route table (same port as IS-04/IS-05, no new server infra needed here
-//  unlike IS-12).
-//
-//  Deliberately reads SessionManager's own source/sink lists (get_sources/
-//  get_sinks) rather than NmosManager's senders_/receivers_ IS-04 tracking
-//  maps: an activation calls session_manager_->add_source() to apply the
-//  ALSA channel remap, which internally tears down and recreates the RTP
-//  stream and fires SourceRemoved/SourceAdded observer events. Those events
-//  are processed asynchronously (queued on events_mutex_/pending_events_),
-//  so senders_ briefly does not contain the id being updated — reading from
-//  it here raced with that window during testing (a request right after
-//  activation would see the map as empty). SessionManager's own state has no
-//  such window: it's updated synchronously inside add_source() before it
-//  returns. The Source/Receiver IS-04 uuids needed for Output.SourceId and
-//  Input.Parent are computed directly via make_resource_uuid — the same
-//  deterministic function NmosManager itself uses to populate senders_/
-//  receivers_ in the first place — so no dependency on that map is needed
-//  here at all.
+//  IS-08 (Audio Channel Mapping) REST API. Each Sink/Source exposes exactly
+//  two Channel Mapping resources, matching the real ALSA-mediated audio path
+//  in this daemon (see the extended comment on the IS-08 section of
+//  nmos_manager.hpp for the full rationale):
+//    Sink:   Input  = stream (RX) side, Output = ALSA side
+//    Source: Input  = ALSA side,        Output = stream (TX) side
+//  A crosspoint activation directly edits that Sink's/Source's own `map[]`
+//  (map[stream_channel] = alsa_channel) — there is no cross-Sink-to-Source
+//  resource. Deliberately reads SessionManager's own source/sink lists
+//  (get_sources/get_sinks), not NmosManager's senders_/receivers_ IS-04
+//  tracking maps: an activation calls session_manager_->add_sink()/
+//  add_source(), which internally tears down and recreates the RTP stream
+//  and fires SinkAdded/SourceAdded observer events processed asynchronously,
+//  so senders_/receivers_ briefly lack the id being updated right after an
+//  activation. SessionManager's own state has no such window.
 //
 //  Methods defined here are members of NmosManager (declared in
 //  nmos_manager.hpp) — split into this file purely to keep nmos_manager.cpp
@@ -66,20 +61,32 @@ void cm_bad_request(NmosRes& res, const std::string& msg) {
 }
 }  // namespace
 
-bool NmosManager::find_cm_input_sink_id(const std::string& uuid, uint8_t& sink_id) const {
+bool NmosManager::find_cm_input(const std::string& uuid, Is08Ref& ref) const {
   for (const auto& sink : session_manager_->get_sinks()) {
-    if (is08_input_id(sink.id) == uuid) {
-      sink_id = sink.id;
+    if (is08_resource_id(Is08Kind::SinkStream, sink.id) == uuid) {
+      ref = {Is08Kind::SinkStream, sink.id};
+      return true;
+    }
+  }
+  for (const auto& src : session_manager_->get_sources()) {
+    if (is08_resource_id(Is08Kind::SourceAlsa, src.id) == uuid) {
+      ref = {Is08Kind::SourceAlsa, src.id};
       return true;
     }
   }
   return false;
 }
 
-bool NmosManager::find_cm_output_source_id(const std::string& uuid, uint8_t& source_id) const {
+bool NmosManager::find_cm_output(const std::string& uuid, Is08Ref& ref) const {
+  for (const auto& sink : session_manager_->get_sinks()) {
+    if (is08_resource_id(Is08Kind::SinkAlsa, sink.id) == uuid) {
+      ref = {Is08Kind::SinkAlsa, sink.id};
+      return true;
+    }
+  }
   for (const auto& src : session_manager_->get_sources()) {
-    if (is08_output_id(src.id) == uuid) {
-      source_id = src.id;
+    if (is08_resource_id(Is08Kind::SourceStream, src.id) == uuid) {
+      ref = {Is08Kind::SourceStream, src.id};
       return true;
     }
   }
@@ -107,31 +114,59 @@ std::string NmosManager::is08_map_active_json() const {
   ss << "{\"map\": {";
   bool first_output = true;
 
-  for (const auto& src : session_manager_->get_sources()) {
+  // Sink ALSA-outputs: invert sink.map[] (stream_channel -> alsa_channel)
+  // into alsa_channel -> stream_channel, since that's the only place this
+  // daemon actually stores the association.
+  for (const auto& sink0 : session_manager_->get_sinks()) {
+    StreamSink sink;
+    if (session_manager_->get_sink(sink0.id, sink)) continue;
+    int32_t alsa_count = 0;
+    session_manager_->get_alsa_input_count(alsa_count);
+    if (alsa_count <= 0) continue;
+
     if (!first_output) ss << ", ";
     first_output = false;
-    ss << "\"" << is08_output_id(src.id) << "\": {";
-
-    std::shared_lock lock(resources_mutex_);
-    auto active_it = is08_active_map_.find(src.id);
-    bool first_channel = true;
-    for (size_t ch = 0; ch < src.map.size(); ++ch) {
-      if (!first_channel) ss << ", ";
-      first_channel = false;
-      ss << "\"" << ch << "\": ";
-      bool found = false;
-      if (active_it != is08_active_map_.end()) {
-        auto chan_it = active_it->second.find(static_cast<int>(ch));
-        if (chan_it != active_it->second.end()) {
-          ss << "{\"input\": \"" << chan_it->second.first
-             << "\", \"channel_index\": " << chan_it->second.second << "}";
-          found = true;
+    ss << "\"" << is08_resource_id(Is08Kind::SinkAlsa, sink.id) << "\": {";
+    std::string stream_input_id = is08_resource_id(Is08Kind::SinkStream, sink.id);
+    for (int32_t alsa_ch = 0; alsa_ch < alsa_count; ++alsa_ch) {
+      if (alsa_ch) ss << ", ";
+      ss << "\"" << alsa_ch << "\": ";
+      int found_stream_ch = -1;
+      for (size_t sch = 0; sch < sink.map.size(); ++sch) {
+        if (sink.map[sch] == alsa_ch) {
+          found_stream_ch = static_cast<int>(sch);
+          break;
         }
       }
-      if (!found) ss << "{\"input\": null, \"channel_index\": null}";
+      if (found_stream_ch >= 0) {
+        ss << "{\"input\": \"" << stream_input_id
+           << "\", \"channel_index\": " << found_stream_ch << "}";
+      } else {
+        ss << "{\"input\": null, \"channel_index\": null}";
+      }
     }
     ss << "}";
   }
+
+  // Source stream-outputs: direct lookup, source.map[stream_ch] is always
+  // some ALSA channel (no "unmapped" sentinel exists on this daemon's fixed
+  // N-channel routing).
+  for (const auto& src0 : session_manager_->get_sources()) {
+    StreamSource src;
+    if (session_manager_->get_source(src0.id, src)) continue;
+
+    if (!first_output) ss << ", ";
+    first_output = false;
+    ss << "\"" << is08_resource_id(Is08Kind::SourceStream, src.id) << "\": {";
+    std::string alsa_input_id = is08_resource_id(Is08Kind::SourceAlsa, src.id);
+    for (size_t ch = 0; ch < src.map.size(); ++ch) {
+      if (ch) ss << ", ";
+      ss << "\"" << ch << "\": {\"input\": \"" << alsa_input_id
+         << "\", \"channel_index\": " << static_cast<int>(src.map[ch]) << "}";
+    }
+    ss << "}";
+  }
+
   ss << "}}";
   return ss.str();
 }
@@ -147,7 +182,7 @@ void NmosManager::setup_is08_api() {
     cm_ok(res, "[\"active/\", \"activations/\"]");
   });
 
-  // ---- Inputs (one per Sink) ----
+  // ---- Inputs: Sink stream-side + Source ALSA-side ----
 
   nmos_get("/x-nmos/channelmapping/v1.0/inputs/", [this](const NmosReq&, NmosRes& res) {
     std::ostringstream ss;
@@ -155,7 +190,12 @@ void NmosManager::setup_is08_api() {
     bool first = true;
     for (const auto& sink : session_manager_->get_sinks()) {
       if (!first) ss << ", ";
-      ss << "\"" << is08_input_id(sink.id) << "/\"";
+      ss << "\"" << is08_resource_id(Is08Kind::SinkStream, sink.id) << "/\"";
+      first = false;
+    }
+    for (const auto& src : session_manager_->get_sources()) {
+      if (!first) ss << ", ";
+      ss << "\"" << is08_resource_id(Is08Kind::SourceAlsa, src.id) << "/\"";
       first = false;
     }
     ss << "]";
@@ -164,46 +204,69 @@ void NmosManager::setup_is08_api() {
 
   nmos_get(R"(/x-nmos/channelmapping/v1\.0/inputs/([^/]+)/caps/?)",
           [this](const NmosReq& req, NmosRes& res) {
-            uint8_t id;
-            if (!find_cm_input_sink_id(req.matches[1], id)) { cm_not_found(res); return; }
+            Is08Ref ref;
+            if (!find_cm_input(req.matches[1], ref)) { cm_not_found(res); return; }
             cm_ok(res, "{\"reordering\": false, \"block_size\": 1}");
           });
 
   nmos_get(R"(/x-nmos/channelmapping/v1\.0/inputs/([^/]+)/parent/?)",
           [this](const NmosReq& req, NmosRes& res) {
-            uint8_t id;
-            if (!find_cm_input_sink_id(req.matches[1], id)) { cm_not_found(res); return; }
-            cm_ok(res, "{\"id\": \"" + make_resource_uuid("receiver", id) +
-                          "\", \"type\": \"receiver\"}");
+            Is08Ref ref;
+            if (!find_cm_input(req.matches[1], ref)) { cm_not_found(res); return; }
+            if (ref.kind == Is08Kind::SinkStream) {
+              cm_ok(res, "{\"id\": \"" + make_resource_uuid("receiver", ref.id) +
+                            "\", \"type\": \"receiver\"}");
+            } else {
+              // Source's ALSA-side Input has no IS-04 parent — it's a local
+              // hardware channel, not derived from any network resource.
+              cm_ok(res, "{\"id\": null, \"type\": null}");
+            }
           });
 
   nmos_get(R"(/x-nmos/channelmapping/v1\.0/inputs/([^/]+)/channels/?)",
           [this](const NmosReq& req, NmosRes& res) {
-            uint8_t id;
-            if (!find_cm_input_sink_id(req.matches[1], id)) { cm_not_found(res); return; }
-            StreamSink sink;
-            if (session_manager_->get_sink(id, sink)) { cm_not_found(res); return; }
-            cm_ok(res, is08_channels_json(sink.map.size()));
+            Is08Ref ref;
+            if (!find_cm_input(req.matches[1], ref)) { cm_not_found(res); return; }
+            if (ref.kind == Is08Kind::SinkStream) {
+              StreamSink sink;
+              if (session_manager_->get_sink(ref.id, sink)) { cm_not_found(res); return; }
+              cm_ok(res, is08_channels_json(sink.map.size()));
+            } else {
+              int32_t count = 0;
+              session_manager_->get_alsa_output_count(count);
+              cm_ok(res, is08_channels_json(count > 0 ? static_cast<size_t>(count) : 0));
+            }
           });
 
   nmos_get(R"(/x-nmos/channelmapping/v1\.0/inputs/([^/]+)/properties/?)",
           [this](const NmosReq& req, NmosRes& res) {
-            uint8_t id;
-            if (!find_cm_input_sink_id(req.matches[1], id)) { cm_not_found(res); return; }
-            StreamSink sink;
-            if (session_manager_->get_sink(id, sink)) { cm_not_found(res); return; }
-            cm_ok(res, "{\"name\": \"" + sink.name + "\", \"description\": \"\"}");
+            Is08Ref ref;
+            if (!find_cm_input(req.matches[1], ref)) { cm_not_found(res); return; }
+            if (ref.kind == Is08Kind::SinkStream) {
+              StreamSink sink;
+              if (session_manager_->get_sink(ref.id, sink)) { cm_not_found(res); return; }
+              cm_ok(res, "{\"name\": \"" + sink.name + "\", \"description\": \"\"}");
+            } else {
+              StreamSource src;
+              if (session_manager_->get_source(ref.id, src)) { cm_not_found(res); return; }
+              cm_ok(res, "{\"name\": \"" + src.name + " (ALSA)\", \"description\": \"\"}");
+            }
           });
 
-  // ---- Outputs (one per Source) ----
+  // ---- Outputs: Sink ALSA-side + Source stream-side ----
 
   nmos_get("/x-nmos/channelmapping/v1.0/outputs/", [this](const NmosReq&, NmosRes& res) {
     std::ostringstream ss;
     ss << "[";
     bool first = true;
+    for (const auto& sink : session_manager_->get_sinks()) {
+      if (!first) ss << ", ";
+      ss << "\"" << is08_resource_id(Is08Kind::SinkAlsa, sink.id) << "/\"";
+      first = false;
+    }
     for (const auto& src : session_manager_->get_sources()) {
       if (!first) ss << ", ";
-      ss << "\"" << is08_output_id(src.id) << "/\"";
+      ss << "\"" << is08_resource_id(Is08Kind::SourceStream, src.id) << "/\"";
       first = false;
     }
     ss << "]";
@@ -212,39 +275,58 @@ void NmosManager::setup_is08_api() {
 
   nmos_get(R"(/x-nmos/channelmapping/v1\.0/outputs/([^/]+)/caps/?)",
           [this](const NmosReq& req, NmosRes& res) {
-            uint8_t id;
-            if (!find_cm_output_source_id(req.matches[1], id)) { cm_not_found(res); return; }
-            std::ostringstream ss;
-            ss << "{\"routable_inputs\": [null";
-            for (const auto& sink : session_manager_->get_sinks())
-              ss << ", \"" << is08_input_id(sink.id) << "\"";
-            ss << "]}";
-            cm_ok(res, ss.str());
+            Is08Ref ref;
+            if (!find_cm_output(req.matches[1], ref)) { cm_not_found(res); return; }
+            // Scoped to the one valid pairing — a Sink's/Source's ALSA<->stream
+            // mapping only ever makes sense against its own other side, never
+            // another device's.
+            std::string only_input = ref.kind == Is08Kind::SinkAlsa
+                ? is08_resource_id(Is08Kind::SinkStream, ref.id)
+                : is08_resource_id(Is08Kind::SourceAlsa, ref.id);
+            cm_ok(res, "{\"routable_inputs\": [null, \"" + only_input + "\"]}");
           });
 
   nmos_get(R"(/x-nmos/channelmapping/v1\.0/outputs/([^/]+)/sourceid/?)",
           [this](const NmosReq& req, NmosRes& res) {
-            uint8_t id;
-            if (!find_cm_output_source_id(req.matches[1], id)) { cm_not_found(res); return; }
-            cm_ok(res, "\"" + make_resource_uuid("source", id) + "\"");
+            Is08Ref ref;
+            if (!find_cm_output(req.matches[1], ref)) { cm_not_found(res); return; }
+            if (ref.kind == Is08Kind::SourceStream) {
+              cm_ok(res, "\"" + make_resource_uuid("source", ref.id) + "\"");
+            } else {
+              // Sink's ALSA-side Output isn't transmitted anywhere — no IS-04
+              // Source is associated with it.
+              cm_ok(res, "null");
+            }
           });
 
   nmos_get(R"(/x-nmos/channelmapping/v1\.0/outputs/([^/]+)/channels/?)",
           [this](const NmosReq& req, NmosRes& res) {
-            uint8_t id;
-            if (!find_cm_output_source_id(req.matches[1], id)) { cm_not_found(res); return; }
-            StreamSource src;
-            if (session_manager_->get_source(id, src)) { cm_not_found(res); return; }
-            cm_ok(res, is08_channels_json(src.map.size()));
+            Is08Ref ref;
+            if (!find_cm_output(req.matches[1], ref)) { cm_not_found(res); return; }
+            if (ref.kind == Is08Kind::SourceStream) {
+              StreamSource src;
+              if (session_manager_->get_source(ref.id, src)) { cm_not_found(res); return; }
+              cm_ok(res, is08_channels_json(src.map.size()));
+            } else {
+              int32_t count = 0;
+              session_manager_->get_alsa_input_count(count);
+              cm_ok(res, is08_channels_json(count > 0 ? static_cast<size_t>(count) : 0));
+            }
           });
 
   nmos_get(R"(/x-nmos/channelmapping/v1\.0/outputs/([^/]+)/properties/?)",
           [this](const NmosReq& req, NmosRes& res) {
-            uint8_t id;
-            if (!find_cm_output_source_id(req.matches[1], id)) { cm_not_found(res); return; }
-            StreamSource src;
-            if (session_manager_->get_source(id, src)) { cm_not_found(res); return; }
-            cm_ok(res, "{\"name\": \"" + src.name + "\", \"description\": \"\"}");
+            Is08Ref ref;
+            if (!find_cm_output(req.matches[1], ref)) { cm_not_found(res); return; }
+            if (ref.kind == Is08Kind::SourceStream) {
+              StreamSource src;
+              if (session_manager_->get_source(ref.id, src)) { cm_not_found(res); return; }
+              cm_ok(res, "{\"name\": \"" + src.name + "\", \"description\": \"\"}");
+            } else {
+              StreamSink sink;
+              if (session_manager_->get_sink(ref.id, sink)) { cm_not_found(res); return; }
+              cm_ok(res, "{\"name\": \"" + sink.name + " (ALSA)\", \"description\": \"\"}");
+            }
           });
 
   // ---- Map ----
@@ -280,13 +362,13 @@ void NmosManager::setup_is08_api() {
              }
 
              for (const auto& [output_uuid, channels] : *map_child) {
-               uint8_t source_id;
-               if (!find_cm_output_source_id(output_uuid, source_id)) continue;
+               Is08Ref out_ref;
+               if (!find_cm_output(output_uuid, out_ref)) continue;
 
                for (const auto& [channel_str, entry] : channels) {
-                 int output_channel;
+                 int outer_channel;
                  try {
-                   output_channel = std::stoi(channel_str);
+                   outer_channel = std::stoi(channel_str);
                  } catch (...) {
                    continue;
                  }
@@ -294,45 +376,45 @@ void NmosManager::setup_is08_api() {
                  // boost::property_tree's JSON parser has no null type — a
                  // JSON `null` comes back as the literal string "null" (same
                  // quirk patch_sender_staged/patch_receiver_staged already
-                 // work around for receiver_id/sender_id above).
+                 // work around elsewhere in nmos_manager.cpp).
                  auto input_uuid = entry.get_optional<std::string>("input");
                  bool has_input = input_uuid && *input_uuid != "null" && !input_uuid->empty();
+                 if (!has_input) {
+                   // No physical "unmapped" sentinel exists on this daemon's
+                   // fixed N-channel ALSA routing — clearing is a no-op.
+                   continue;
+                 }
                  int input_channel = entry.get_optional<int>("channel_index").value_or(0);
 
-                 StreamSource src;
-                 if (session_manager_->get_source(source_id, src)) continue;
-                 if (output_channel < 0 ||
-                     static_cast<size_t>(output_channel) >= src.map.size())
-                   continue;
+                 Is08Ref in_ref;
+                 if (!find_cm_input(*input_uuid, in_ref)) continue;
 
-                 if (has_input) {
-                   uint8_t sink_id;
-                   if (!find_cm_input_sink_id(*input_uuid, sink_id)) continue;
+                 if (out_ref.kind == Is08Kind::SinkAlsa) {
+                   // Only this Sink's own stream-side Input may feed its
+                   // ALSA-side Output.
+                   if (in_ref.kind != Is08Kind::SinkStream || in_ref.id != out_ref.id) continue;
+
                    StreamSink sink;
-                   if (session_manager_->get_sink(sink_id, sink)) continue;
+                   if (session_manager_->get_sink(out_ref.id, sink)) continue;
                    if (input_channel < 0 ||
                        static_cast<size_t>(input_channel) >= sink.map.size())
                      continue;
 
-                   // The one genuinely novel design point: a Sink's captured
-                   // channel X and a Source's playback channel X are the same
-                   // physical ALSA channel, so activating this crosspoint is
-                   // just copying the ALSA channel number across — this
-                   // reuses the existing source-map-mutation path (the same
-                   // one PUT /api/source/{id} already drives).
-                   src.map[output_channel] = sink.map[input_channel];
-                   session_manager_->add_source(src);
-
-                   std::unique_lock lock(resources_mutex_);
-                   is08_active_map_[source_id][output_channel] = {*input_uuid, input_channel};
+                   sink.map[input_channel] = static_cast<uint8_t>(outer_channel);
+                   session_manager_->add_sink(sink);
                  } else {
-                   // No physical "unmapped" sentinel exists on this daemon's
-                   // fixed N-channel ALSA routing — clearing only updates
-                   // the reported active map, the prior physical routing
-                   // stays in place.
-                   std::unique_lock lock(resources_mutex_);
-                   auto it = is08_active_map_.find(source_id);
-                   if (it != is08_active_map_.end()) it->second.erase(output_channel);
+                   // Is08Kind::SourceStream — only this Source's own ALSA-
+                   // side Input may feed its stream-side Output.
+                   if (in_ref.kind != Is08Kind::SourceAlsa || in_ref.id != out_ref.id) continue;
+
+                   StreamSource src;
+                   if (session_manager_->get_source(out_ref.id, src)) continue;
+                   if (outer_channel < 0 ||
+                       static_cast<size_t>(outer_channel) >= src.map.size())
+                     continue;
+
+                   src.map[outer_channel] = static_cast<uint8_t>(input_channel);
+                   session_manager_->add_source(src);
                  }
                }
              }

@@ -186,11 +186,15 @@ std::error_code DriverManager::get_sample_rate(uint32_t& sample_rate) {
 }
 
 std::error_code DriverManager::get_number_of_inputs(int32_t& inputs) {
-  inputs = 0;
+  // Fake a plausible 8-channel ALSA capture device so IS-08's Sink-side
+  // Output (see nmos_is08.cpp) has something to report under FAKE_DRIVER.
+  inputs = 8;
   return std::error_code{};
 }
 
 std::error_code DriverManager::get_number_of_outputs(int32_t& outputs) {
-  outputs = 0;
+  // Fake a plausible 8-channel ALSA playback device so IS-08's Source-side
+  // Input (see nmos_is08.cpp) has something to report under FAKE_DRIVER.
+  outputs = 8;
   return std::error_code{};
 }
