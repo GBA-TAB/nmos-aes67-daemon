@@ -34,6 +34,7 @@ std::string config_to_json(const Config& config);
 std::string source_to_json(const StreamSource& source);
 std::string sink_to_json(const StreamSink& sink);
 std::string sink_status_to_json(const SinkStreamStatus& status);
+std::string source_status_to_json(const SourceStreamStatus& status);
 std::string ptp_config_to_json(const PTPConfig& config);
 std::string ptp_status_to_json(const PTPStatus& status);
 std::string sources_to_json(const std::list<StreamSource>& sources);

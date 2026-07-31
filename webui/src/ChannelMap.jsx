@@ -1,13 +1,20 @@
 //
 //  ChannelMap.jsx
 //
-//  IS-08 (Audio Channel Mapping) grid, laid out by physical signal flow: one
-//  row per ALSA channel number, since that's the daemon's real pivot point -
-//  a Sink's map[] entry and a Source's map[] entry are independent facts
-//  that just happen to reference the same ALSA channel number. Left to
-//  right: Stream Rx (what currently plays out on this channel) -> this
-//  channel's identity as a capture point -> this channel's identity as a
-//  playback point -> Stream Tx (what currently captures from this channel).
+//  IS-08 (Audio Channel Mapping) grid, with the same 5 columns (Stream Rx,
+//  Leg, Capture, Playback, Stream Tx) presented two ways:
+//
+//  - ALSA view: one row per physical ALSA channel number, the daemon's real
+//    pivot point - a Sink's map[] entry and a Source's map[] entry are
+//    independent facts that just happen to reference the same ALSA channel
+//    number. Both "Stream Rx" and "Stream Tx" are dropdowns here (pick which
+//    stream channel uses this ALSA channel); "Capture"/"Playback" are just
+//    that row's fixed ALSA identity.
+//  - Stream view: one row per real Rx/Tx audio channel instead - the mirror
+//    image. "Stream Rx"/"Stream Tx" are now the row's fixed identity, and
+//    "Capture"/"Playback" become the dropdown (pick which ALSA channel this
+//    stream channel uses). Same underlying data, same activation calls,
+//    just which side is "the row" and which is "the dropdown" is flipped.
 //
 //  Drives the real /x-nmos/channelmapping/v1.0/ API directly
 //  (RestAPI.doFetchRaw), not a daemon-proprietary shortcut. Each change
@@ -46,10 +53,31 @@ function legBadge(sinkStatus) {
   return <span className='topo-badge topo-wait'>no signal</span>;
 }
 
+// Same idea, Tx direction (source_status_to_json's shape) - for Stream-view
+// rows keyed by a Sender's own Tx channel rather than a Sink's Rx channel.
+function txLegBadge(sourceStatus) {
+  if (!sourceStatus) return null;
+  const primary = !!(sourceStatus.source_flags && sourceStatus.source_flags.transmitting);
+  const leg2 = sourceStatus.leg2 || {};
+  if (!leg2.present) {
+    return primary
+      ? <span className='topo-badge topo-active'>red ●</span>
+      : <span className='topo-badge topo-wait'>red ○</span>;
+  }
+  if (primary && leg2.transmitting)
+    return <span className='topo-badge topo-active'>red+blue ●</span>;
+  if (primary)
+    return <span className='topo-badge topo-muted'>red only</span>;
+  if (leg2.transmitting)
+    return <span className='topo-badge topo-muted'>blue only</span>;
+  return <span className='topo-badge topo-wait'>no signal</span>;
+}
+
 class ChannelMap extends Component {
   constructor(props) {
     super(props);
     this.state = {
+      view: 'alsa',  // 'alsa' (row per ALSA channel) or 'stream' (row per real Rx/Tx channel)
       channels: [],       // sorted list of physical ALSA channel numbers
       captureUuid: {},    // channel number -> "ALSA Capture N" input uuid
       playbackUuid: {},   // channel number -> "ALSA Playback N" output uuid
@@ -60,14 +88,22 @@ class ChannelMap extends Component {
       // Flattened list of every real Stream Tx channel, shared by every row's
       // capture-side dropdown: {value: "<output uuid>::<channel>", label}.
       txOptions: [],
+      // Same list as the Stream view's "Capture" dropdown offers: every raw
+      // ALSA Capture channel plus every Sink-repeater option (inputOptions).
+      captureOptions: [],
       playbackSelection: {},  // channel number -> currently selected inputOptions value ('' if none)
       captureSelection: {},   // channel number -> currently selected txOptions value ('' if none)
+      // Stream view row lists - one entry per real Rx/Tx audio channel.
+      rxChannels: [],  // [{value, label, sinkId, alsaChannel}]
+      txChannels: [],  // [{value, label, sourceId, alsaChannel}]
       sinkStatuses: {},   // sink id -> /api/sink/status/{id} response
+      sourceStatuses: {}, // source id -> /api/source/status/{id} response
       isLoading: false,
     };
     this.fetchAll = this.fetchAll.bind(this);
     this.onChangePlayback = this.onChangePlayback.bind(this);
     this.onChangeCapture = this.onChangeCapture.bind(this);
+    this.onChangeTxInput = this.onChangeTxInput.bind(this);
   }
 
   fetchAll() {
@@ -121,6 +157,7 @@ class ChannelMap extends Component {
         const inputSinkIds = {};
         const inputOptions = {};
         const captureUuid = {};
+        const rxChannels = [];
         // sink id -> [value for channel 0, value for channel 1, ...] - lets
         // a raw sink.map[] scan below turn "(sinkId, channel k)" straight
         // into the dropdown value for that exact real audio channel.
@@ -157,10 +194,20 @@ class ChannelMap extends Component {
             inputOptions[id] = [{value: id + '::0', label}];
             if (sinkId !== undefined) sinkChannelValue[sinkId] = [id + '::0'];
           }
+
+          // Stream-view row: one per real Rx channel, regardless of whether
+          // it's currently selected anywhere in the ALSA view.
+          if (sinkId !== undefined) {
+            const map = sinkMaps[sinkId] || [];
+            inputOptions[id].forEach((opt, k) => {
+              rxChannels.push({value: opt.value, label: opt.label, sinkId, alsaChannel: map[k]});
+            });
+          }
         });
 
         const playbackUuid = {};
         const txOptions = [];
+        const txChannels = [];
         // source id -> [value for channel 0, value for channel 1, ...] -
         // same idea as sinkChannelValue, for a raw source.map[] scan.
         const sourceChannelValue = {};
@@ -175,17 +222,30 @@ class ChannelMap extends Component {
           }
           // Everything else is a Sender's Tx channel group - flatten into
           // one selectable entry per real channel, shared across every row.
-          const values = o.channelLabels.map((chLabel, i) => {
-            const value = o.id + '::' + i;
-            txOptions.push({value, label: o.label + ' · ' + chLabel});
-            return value;
-          });
           const sourceName = o.label.startsWith(streamTxPrefix) ? o.label.slice(streamTxPrefix.length) : o.label;
           const sourceId = sourcesByName[sourceName];
+          const map = sourceId !== undefined ? (sourceMaps[sourceId] || []) : [];
+          const values = o.channelLabels.map((chLabel, i) => {
+            const value = o.id + '::' + i;
+            const label = o.label + ' · ' + chLabel;
+            txOptions.push({value, label});
+            if (sourceId !== undefined) {
+              txChannels.push({value, label, sourceId, alsaChannel: map[i]});
+            }
+            return value;
+          });
           if (sourceId !== undefined) sourceChannelValue[sourceId] = values;
         });
 
         const channels = Object.keys(playbackUuid).map(Number).sort((a, b) => a - b);
+        // Every option the Stream view's "Capture" dropdown can offer for a
+        // Tx-channel row: a raw ALSA Capture channel, or (repeater) any real
+        // Sink channel - the same choice the ALSA view's "Stream Tx" column
+        // already exposes, just anchored to a fixed output row instead.
+        const captureOptions = [
+          ...Object.values(inputOptions).flat(),
+          ...channels.map(n => ({value: captureUuid[n] + '::0', label: 'ALSA Capture ' + n})),
+        ];
 
         // Column 1: which Sink channel's real map[] entry actually points at
         // this ALSA channel - the one, unambiguous way audio lands on a
@@ -214,20 +274,24 @@ class ChannelMap extends Component {
           });
         });
 
-        // Only fetch status for sinks currently selected somewhere in the
-        // active map — not the whole sink list every poll.
-        const activeSinkIds = new Set();
-        Object.values(playbackSelection).forEach(value => {
-          if (!value) return;
-          const sinkId = inputSinkIds[value.slice(0, value.lastIndexOf('::'))];
-          if (sinkId !== undefined) activeSinkIds.add(sinkId);
-        });
+        // Every real Sink/Source is a row in the Stream view (regardless of
+        // whether it's currently selected in the ALSA view), so just fetch
+        // status for all of them - there are only ever a handful.
+        const sinkIds = Object.keys(sinkMaps).map(Number);
+        const sourceIds = Object.keys(sourceMaps).map(Number);
 
-        Promise.all([...activeSinkIds].map(id =>
-          RestAPI.getSinkStatus(id).then(r => r.json()).then(s => [id, s]).catch(() => [id, null])
-        )).then(pairs => {
+        Promise.all([
+          Promise.all(sinkIds.map(id =>
+            RestAPI.getSinkStatus(id).then(r => r.json()).then(s => [id, s]).catch(() => [id, null])
+          )),
+          Promise.all(sourceIds.map(id =>
+            RestAPI.getSourceStatus(id).then(r => r.json()).then(s => [id, s]).catch(() => [id, null])
+          )),
+        ]).then(([sinkPairs, sourcePairs]) => {
           const sinkStatuses = {};
-          pairs.forEach(([id, s]) => { sinkStatuses[id] = s; });
+          sinkPairs.forEach(([id, s]) => { sinkStatuses[id] = s; });
+          const sourceStatuses = {};
+          sourcePairs.forEach(([id, s]) => { sourceStatuses[id] = s; });
           this.setState({
             channels,
             captureUuid,
@@ -235,9 +299,13 @@ class ChannelMap extends Component {
             inputSinkIds,
             inputOptions,
             txOptions,
+            captureOptions,
+            rxChannels,
+            txChannels,
             playbackSelection,
             captureSelection,
             sinkStatuses,
+            sourceStatuses,
             isLoading: false,
           });
         });
@@ -278,6 +346,97 @@ class ChannelMap extends Component {
       .then(this.fetchAll);
   }
 
+  // Stream view's "Capture" dropdown for a Tx-channel row: the row (output)
+  // is fixed, the input (ALSA Capture or Sink-repeater) is what's chosen -
+  // the mirror image of onChangeCapture, whose row is the ALSA channel and
+  // whose choice is which Tx channel to feed.
+  onChangeTxInput(outputId, outputChannel, value) {
+    if (value === '') return;  // same no-clear constraint as onChangeCapture
+    const sep = value.lastIndexOf('::');
+    const inputId = value.slice(0, sep);
+    const inputChannel = Number(value.slice(sep + 2));
+    RestAPI.setChannelMapActivation(outputId, outputChannel, inputId, inputChannel).then(this.fetchAll);
+  }
+
+  renderAlsaRows() {
+    return this.state.channels.map(ch => {
+      const playbackValue = this.state.playbackSelection[ch] || '';
+      const captureValue = this.state.captureSelection[ch] || '';
+      const inputUuid = playbackValue ? playbackValue.slice(0, playbackValue.lastIndexOf('::')) : null;
+      const sinkId = inputUuid !== null ? this.state.inputSinkIds[inputUuid] : undefined;
+      const sinkStatus = sinkId !== undefined ? this.state.sinkStatuses[sinkId] : null;
+      return (
+        <tr key={ch} className='tr-stream'>
+          <td>
+            <select value={playbackValue} onChange={e => this.onChangePlayback(ch, e.target.value)}>
+              <option value=''>(none)</option>
+              {Object.values(this.state.inputOptions).flatMap(opts =>
+                opts.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)
+              )}
+            </select>
+          </td>
+          <td>{legBadge(sinkStatus)}</td>
+          <td>ALSA Capture {ch}</td>
+          <td>ALSA Playback {ch}</td>
+          <td>
+            <select value={captureValue} onChange={e => this.onChangeCapture(ch, e.target.value)}>
+              <option value=''>(none)</option>
+              {this.state.txOptions.map(opt => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+          </td>
+        </tr>
+      );
+    });
+  }
+
+  renderStreamRows() {
+    const rxRows = this.state.rxChannels.map(rx => (
+      <tr key={'rx:' + rx.value} className='tr-stream'>
+        <td>{rx.label}</td>
+        <td>{legBadge(this.state.sinkStatuses[rx.sinkId])}</td>
+        <td>—</td>
+        <td>
+          <select value={rx.alsaChannel}
+            onChange={e => this.onChangePlayback(Number(e.target.value), rx.value)}>
+            {this.state.channels.map(ch => (
+              <option key={ch} value={ch}>ALSA Playback {ch}</option>
+            ))}
+          </select>
+        </td>
+        <td>—</td>
+      </tr>
+    ));
+    const txRows = this.state.txChannels.map(tx => {
+      // Prefer showing a Sink-repeater match when one exists - it's the same
+      // stickiness onChangeCapture relies on in the ALSA view, just read the
+      // other way around here (already computed in playbackSelection).
+      const currentValue = this.state.playbackSelection[tx.alsaChannel] ||
+        (this.state.captureUuid[tx.alsaChannel] + '::0');
+      return (
+        <tr key={'tx:' + tx.value} className='tr-stream'>
+          <td>—</td>
+          <td>{txLegBadge(this.state.sourceStatuses[tx.sourceId])}</td>
+          <td>
+            <select value={currentValue}
+              onChange={e => {
+                const sep = tx.value.lastIndexOf('::');
+                this.onChangeTxInput(tx.value.slice(0, sep), tx.value.slice(sep + 2), e.target.value);
+              }}>
+              {this.state.captureOptions.map(opt => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+          </td>
+          <td>—</td>
+          <td>{tx.label}</td>
+        </tr>
+      );
+    });
+    return [...rxRows, ...txRows];
+  }
+
   render() {
     if (this.state.isLoading && this.state.channels.length === 0)
       return <Loader/>;
@@ -285,40 +444,18 @@ class ChannelMap extends Component {
     return (
       <div id='channelmap'>
         <h3>Channel Map</h3>
+        <div style={{marginBottom: '8px'}}>
+          <button disabled={this.state.view === 'alsa'}
+            onClick={() => this.setState({view: 'alsa'})}>ALSA view</button>
+          {' '}
+          <button disabled={this.state.view === 'stream'}
+            onClick={() => this.setState({view: 'stream'})}>Stream view</button>
+        </div>
         <table className='table-stream'><tbody>
           <tr className='tr-stream'>
             <th>Stream Rx</th><th>Leg</th><th>Capture</th><th>Playback</th><th>Stream Tx</th>
           </tr>
-          {this.state.channels.map(ch => {
-            const playbackValue = this.state.playbackSelection[ch] || '';
-            const captureValue = this.state.captureSelection[ch] || '';
-            const inputUuid = playbackValue ? playbackValue.slice(0, playbackValue.lastIndexOf('::')) : null;
-            const sinkId = inputUuid !== null ? this.state.inputSinkIds[inputUuid] : undefined;
-            const sinkStatus = sinkId !== undefined ? this.state.sinkStatuses[sinkId] : null;
-            return (
-              <tr key={ch} className='tr-stream'>
-                <td>
-                  <select value={playbackValue} onChange={e => this.onChangePlayback(ch, e.target.value)}>
-                    <option value=''>(none)</option>
-                    {Object.values(this.state.inputOptions).flatMap(opts =>
-                      opts.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)
-                    )}
-                  </select>
-                </td>
-                <td>{legBadge(sinkStatus)}</td>
-                <td>ALSA Capture {ch}</td>
-                <td>ALSA Playback {ch}</td>
-                <td>
-                  <select value={captureValue} onChange={e => this.onChangeCapture(ch, e.target.value)}>
-                    <option value=''>(none)</option>
-                    {this.state.txOptions.map(opt => (
-                      <option key={opt.value} value={opt.value}>{opt.label}</option>
-                    ))}
-                  </select>
-                </td>
-              </tr>
-            );
-          })}
+          {this.state.view === 'alsa' ? this.renderAlsaRows() : this.renderStreamRows()}
         </tbody></table>
         <span className='pointer-area' onClick={this.fetchAll}>
           <img width='30' height='30' src='/reload.png' alt=''/>

@@ -246,6 +246,15 @@ export default class RestAPI {
     });
   }
 
+  static getSourceStatus(id) {
+    return this.doFetch(source + status + '/' + id, {
+      method: 'GET'
+    }).catch(err => {
+      toast.error('Get Source status failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
   static addSink(id, name, io, delay, use_sdp, source, sdp, ignore_refclk_gmid, map, is_edit) {
     return this.doFetch(sink + '/' + id, {
       body: JSON.stringify({

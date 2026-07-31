@@ -210,6 +210,20 @@ std::string sink_status_to_json(const SinkStreamStatus& status) {
   return ss.str();
 }
 
+std::string source_status_to_json(const SourceStreamStatus& status) {
+  std::stringstream ss;
+  ss << "{" << std::boolalpha
+     << "\n  \"source_flags\":\n  {"
+     << "  \n    \"transmitting\": " << status.is_transmitting
+     << ", \n    \"underrun\": " << status.is_underrun << "\n  },"
+     << "\n  \"leg2\":\n  {"
+     << "  \n    \"present\": " << status.leg2_present
+     << ", \n    \"transmitting\": " << status.leg2_is_transmitting
+     << ", \n    \"underrun\": " << status.leg2_is_underrun << "\n  }"
+     << "\n}\n";
+  return ss.str();
+}
+
 std::string ptp_config_to_json(const PTPConfig& ptp_config) {
   std::stringstream ss;
   ss << "{" << " \"domain\": " << unsigned(ptp_config.domain)
@@ -219,9 +233,15 @@ std::string ptp_config_to_json(const PTPConfig& ptp_config) {
 
 std::string ptp_status_to_json(const PTPStatus& status) {
   std::stringstream ss;
-  ss << "{" << " \"status\": \"" << escape_json(status.status) << "\""
+  ss << "{" << std::boolalpha << " \"status\": \"" << escape_json(status.status) << "\""
      << ", \"gmid\": \"" << escape_json(status.gmid) << "\""
-     << ", \"jitter\": " << status.jitter << " }\n";
+     << ", \"jitter\": " << status.jitter
+     << ", \"active_leg\": " << status.active_leg
+     << ", \"leg0_status\": \"" << escape_json(status.leg0_status) << "\""
+     << ", \"leg1_status\": \"" << escape_json(status.leg1_status) << "\""
+     << ", \"leg0_gmid\": \"" << escape_json(status.leg0_gmid) << "\""
+     << ", \"leg1_gmid\": \"" << escape_json(status.leg1_gmid) << "\""
+     << ", \"legs_aligned\": " << status.legs_aligned << " }\n";
   return ss.str();
 }
 

@@ -2903,6 +2903,13 @@ bool NmosManager::registration_worker() {
     // Heartbeat when due
     if (running_ && clock::now() >= next_hb) {
       heartbeat();
+      // A heartbeat carries no body, so without this the registry's copy of
+      // the Node resource (clock lock state, GMID, active leg...) would stay
+      // frozen at whatever it looked like the moment full_registration()
+      // last ran, even though GET /x-nmos/node/v1.3/self (queried directly
+      // against this daemon) keeps reporting the real, current state.
+      node_json_ = build_node_json();
+      register_resource("node", node_json_);
       next_hb = clock::now() + std::chrono::seconds(5);
     }
   }

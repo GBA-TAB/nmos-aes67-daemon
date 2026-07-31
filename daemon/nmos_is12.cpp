@@ -106,10 +106,31 @@ void NmosManager::ncp_sync_status(int& status, std::string& message) const {
 
   PTPStatus ptp;
   session_manager_->get_ptp_status(ptp);
+  bool dual_leg = !config_->get_interface_name(1).empty();
+
+  // Both legs individually locked but to different grandmasters means
+  // seamless 2022-7 switching can't be trusted even though the daemon is
+  // "locked" overall - surface that as PartiallyHealthy rather than hiding
+  // it behind a plain "locked".
+  if (dual_leg && ptp.status == "locked" && !ptp.legs_aligned) {
+    status = kHealthPartiallyHealthy;
+    message = "\"Red and Blue legs are locked to different grandmasters (red: " +
+              ptp.leg0_gmid + ", blue: " + ptp.leg1_gmid + ")\"";
+    return;
+  }
+
   status = ptp.status == "locked"   ? kHealthHealthy
            : ptp.status == "locking" ? kHealthPartiallyHealthy
                                      : kHealthUnhealthy;
-  message = ptp.status == "locked" ? "null" : ("\"PTP " + ptp.status + "\"");
+  // The driver already fails the clock over between legs on its own
+  // (Select_PTP_NIC() in manager.c) - report which one, when dual-leg is
+  // actually configured, rather than just "locked".
+  if (ptp.status == "locked" && dual_leg) {
+    message = std::string("\"Locked via ") +
+              (ptp.active_leg == 0 ? "primary (red)" : "secondary (blue)") + " leg\"";
+  } else {
+    message = ptp.status == "locked" ? "null" : ("\"PTP " + ptp.status + "\"");
+  }
 }
 
 void NmosManager::ncp_link_status(int& status, std::string& message) const {

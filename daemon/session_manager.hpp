@@ -106,6 +106,20 @@ struct PTPStatus {
   std::string status;
   std::string gmid;
   int32_t jitter{0};
+  // Which physical leg (0 = primary/Red, 1 = secondary/Blue) the driver is
+  // currently disciplining the global clock from - the kernel module already
+  // fails over between legs on its own (Select_PTP_NIC() in manager.c); this
+  // just surfaces that choice, previously invisible to userspace.
+  int active_leg{0};
+  // Real, independent per-leg PTP status - each leg runs its own receiver
+  // (self->m_PTP[0]/[1] in manager.c), so these can genuinely differ: one
+  // leg locked while the other is down, or - the case worth flagging -
+  // both locked but to two different grandmasters (leg_aligned false).
+  std::string leg0_status;  // "locked"/"locking"/"unlocked"
+  std::string leg1_status;
+  std::string leg0_gmid;
+  std::string leg1_gmid;
+  bool legs_aligned{true};  // false only when both locked and gmid differs
 };
 
 struct StreamInfo {

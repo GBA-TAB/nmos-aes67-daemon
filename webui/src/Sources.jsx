@@ -27,6 +27,26 @@ import SourceEdit from './SourceEdit';
 import SourceRemove from './SourceRemove';
 import SourceInfo from './SourceInfo';
 
+// SMPTE 2022-7 leg badge for a Source's transmit status - mirrors the one
+// ChannelMap.jsx uses for Sinks, just for the opposite (Tx) direction.
+function txLegBadge(status) {
+  if (!status) return null;
+  const primary = !!(status.source_flags && status.source_flags.transmitting);
+  const leg2 = status.leg2 || {};
+  if (!leg2.present) {
+    return primary
+      ? <span className='topo-badge topo-active'>red ●</span>
+      : <span className='topo-badge topo-wait'>red ○</span>;
+  }
+  if (primary && leg2.transmitting)
+    return <span className='topo-badge topo-active'>red+blue ●</span>;
+  if (primary)
+    return <span className='topo-badge topo-muted'>red only</span>;
+  if (leg2.transmitting)
+    return <span className='topo-badge topo-muted'>blue only</span>;
+  return <span className='topo-badge topo-wait'>no signal</span>;
+}
+
 class SourceEntry extends Component {
   static propTypes = {
     id: PropTypes.number.isRequired,
@@ -42,7 +62,8 @@ class SourceEntry extends Component {
     this.state = {
       address: 'n/a',
       port: 'n/a',
-      sdp: ''
+      sdp: '',
+      status: null
     };
   }
 
@@ -69,6 +90,10 @@ class SourceEntry extends Component {
           this.setState({ address: address[0].substr(9), port: port[0].substr(8) });
         }
       }.bind(this));
+    RestAPI.getSourceStatus(this.props.id)
+      .then(response => response.json())
+      .then(status => this.setState({ status }))
+      .catch(() => this.setState({ status: null }));
   }
 
   render() {
@@ -79,6 +104,7 @@ class SourceEntry extends Component {
         <td> <label>{this.state.address}</label> </td>
         <td> <label>{this.state.port}</label> </td>
         <td align='center'> <label>{this.props.channels}</label> </td>
+        <td align='center'> {txLegBadge(this.state.status)} </td>
         <td> <span className='pointer-area' onClick={this.handleInfoClick}> <img width='20' height='20' src='/info.png' alt=''/> </span> </td>
         <td> <span className='pointer-area' onClick={this.handleEditClick}> <img width='20' height='20' src='/edit.png' alt=''/> </span> </td>
         <td> <span className='pointer-area' onClick={this.handleTrashClick}> <img width='20' height='20' src='/trash.png' alt=''/> </span> </td>
@@ -113,6 +139,7 @@ class SourceList extends Component {
               <th>Address</th>
               <th>Port</th>
               <th>Channels</th>
+              <th>Leg</th>
             </tr>
           : <tr>
              <th>No sources configured</th>

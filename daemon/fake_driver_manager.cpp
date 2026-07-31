@@ -106,6 +106,11 @@ std::error_code DriverManager::get_ptp_status(TPTPStatus& status) {
   status.ui64GMID[0] = 0xABABABABABABABAB;
   status.ui64GMID[1] = 0x0;
   status.i32ClockJitter = 0;
+  status.ui8ActivePTPNic = 0;
+  status.nLegLockStatus[0] = PTPLS_UNLOCKED;
+  status.nLegLockStatus[1] = PTPLS_UNLOCKED;
+  status.ui64LegGMID[0] = 0xABABABABABABABAB;
+  status.ui64LegGMID[1] = 0x0;
   BOOST_LOG_TRIVIAL(debug) << "fake_driver_manager:: PTP Status "
                            << ptp_status_str[status.nPTPLockStatus] << " GMID "
                            << status.ui64GMID[0] << " Jitter "

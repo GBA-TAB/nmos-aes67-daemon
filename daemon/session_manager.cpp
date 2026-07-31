@@ -1433,13 +1433,38 @@ bool SessionManager::worker() {
             << "session_manager:: failed to retrieve PTP clock info";
         // return false;
       } else {
-        char ptp_clock_id[24];
-        const uint8_t* pui64GMID =
-            reinterpret_cast<uint8_t*>(&ptp_status.ui64GMID);
-        snprintf(ptp_clock_id, sizeof(ptp_clock_id),
-                 "%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X", pui64GMID[0],
-                 pui64GMID[1], pui64GMID[2], pui64GMID[3], pui64GMID[4],
-                 pui64GMID[5], pui64GMID[6], pui64GMID[7]);
+        auto format_gmid = [](uint64_t gmid) {
+          char buf[24];
+          const uint8_t* p = reinterpret_cast<uint8_t*>(&gmid);
+          // IS-04's clock_ptp schema requires lowercase hex
+          // ("^[0-9a-f]{2}-..."); uppercase (the original bug here) makes
+          // the registry reject the whole node registration with a 400,
+          // and once the node fails everything else cascades.
+          snprintf(buf, sizeof(buf),
+                   "%02x-%02x-%02x-%02x-%02x-%02x-%02x-%02x", p[0], p[1],
+                   p[2], p[3], p[4], p[5], p[6], p[7]);
+          return std::string(buf);
+        };
+        auto leg_status_str = [](EPTPLockStatus s) {
+          switch (s) {
+            case PTPLS_LOCKED:
+              return "locked";
+            case PTPLS_LOCKING:
+              return "locking";
+            default:
+              return "unlocked";
+          }
+        };
+        std::string ptp_clock_id = format_gmid(ptp_status.ui64GMID[0]);
+        std::string leg0_gmid = format_gmid(ptp_status.ui64LegGMID[0]);
+        std::string leg1_gmid = format_gmid(ptp_status.ui64LegGMID[1]);
+        std::string leg0_status = leg_status_str(ptp_status.nLegLockStatus[0]);
+        std::string leg1_status = leg_status_str(ptp_status.nLegLockStatus[1]);
+        // Both legs locked but to different grandmasters is the real 2022-7
+        // failure mode worth flagging - seamless switching only works if
+        // both are actually the same clock reference.
+        bool legs_aligned = !(leg0_status == "locked" && leg1_status == "locked" &&
+                               leg0_gmid != leg1_gmid);
 
         bool ptp_changed_gmid = false;
         std::string ptp_status_changed_to;
@@ -1451,6 +1476,12 @@ bool SessionManager::worker() {
           ptp_changed_gmid = true;
         }
         ptp_status_.jitter = ptp_status.i32ClockJitter;
+        ptp_status_.active_leg = ptp_status.ui8ActivePTPNic;
+        ptp_status_.leg0_status = leg0_status;
+        ptp_status_.leg1_status = leg1_status;
+        ptp_status_.leg0_gmid = leg0_gmid;
+        ptp_status_.leg1_gmid = leg1_gmid;
+        ptp_status_.legs_aligned = legs_aligned;
         std::string new_ptp_status;
         switch (ptp_status.nPTPLockStatus) {
           case PTPLS_UNLOCKED:

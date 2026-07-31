@@ -250,6 +250,26 @@ bool HttpServer::init() {
         }
       });
 
+  svr_.Get(
+      "/api/source/status/([0-9]+)", [this](const Request& req, Response& res) {
+        uint32_t id;
+        try {
+          id = std::stoi(req.matches[1]);
+        } catch (...) {
+          set_error(400, "failed to convert id", res);
+          return;
+        }
+        SourceStreamStatus status;
+        auto ret = session_manager_->get_source_status(id, status);
+        if (ret) {
+          set_error(ret, "failed to get source " + std::to_string(id) + " status",
+                    res);
+        } else {
+          set_headers(res, "application/json");
+          res.body = source_status_to_json(status);
+        }
+      });
+
   /* add a source */
   svr_.Put("/api/source/([0-9]+)", [this](const Request& req, Response& res) {
     try {
