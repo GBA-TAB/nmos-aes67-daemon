@@ -53,7 +53,7 @@ static void shm_publish(PtpClockShm* shm, const RavennaPtpStatus& s,
 
     shm->lock_state     = static_cast<uint8_t>(s.lock_state);
     memcpy(shm->gmid,    &s.gmid, 8);
-    shm->offset_ns      = s.clock_jitter;
+    shm->offset_ns      = s.ptp_offset_ns;
     shm->freq_ppb       = freq_ppb;
     shm->network_jitter = s.network_jitter;
     shm->clock_jitter   = s.clock_jitter;
@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
             if (!locked) applied_freq_ppb = 0;
 
             for (auto& d : drivers) {
-                int64_t r = d->on_ptp_update(status->clock_jitter, applied_freq_ppb, locked);
+                int64_t r = d->on_ptp_update(status->ptp_offset_ns, applied_freq_ppb, locked);
                 if (r != 0) applied_freq_ppb = r;
             }
 

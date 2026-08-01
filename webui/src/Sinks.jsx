@@ -26,6 +26,26 @@ import Loader from './Loader';
 import SinkEdit from './SinkEdit';
 import SinkRemove from './SinkRemove';
 
+// SMPTE 2022-7 leg badge for a Sink's receive status - same convention as
+// ChannelMap.jsx's legBadge/Sources.jsx's txLegBadge, for the Rx direction.
+function rxLegBadge(status) {
+  if (!status) return null;
+  const primary = !!(status.sink_flags && status.sink_flags.receiving_rtp_packet);
+  const leg2 = status.leg2 || {};
+  if (!leg2.present) {
+    return primary
+      ? <span className='topo-badge topo-active'>red ●</span>
+      : <span className='topo-badge topo-wait'>red ○</span>;
+  }
+  if (primary && leg2.receiving_rtp_packet)
+    return <span className='topo-badge topo-active'>red+blue ●</span>;
+  if (primary)
+    return <span className='topo-badge topo-muted'>red only</span>;
+  if (leg2.receiving_rtp_packet)
+    return <span className='topo-badge topo-muted'>blue only</span>;
+  return <span className='topo-badge topo-wait'>no signal</span>;
+}
+
 class SinkEntry extends Component {
   static propTypes = {
     id: PropTypes.number.isRequired,
@@ -40,7 +60,8 @@ class SinkEntry extends Component {
     this.state = {
       min_time: 'n/a',
       flags: 'n/a',
-      errors: 'n/a'
+      errors: 'n/a',
+      status: null
     };
   }
 
@@ -77,7 +98,8 @@ class SinkEntry extends Component {
         this.setState({
           min_time: status.sink_min_time + ' ms',
           flags: flags ? flags : 'idle',
-          errors: errors ? errors : 'none'
+          errors: errors ? errors : 'none',
+          status
         });
       }.bind(this));
   }
@@ -91,6 +113,7 @@ class SinkEntry extends Component {
         <td align='center'> <label>{this.state.flags}</label> </td>
         <td align='center'> <label>{this.state.errors}</label> </td>
         <td align='center'> <label>{this.state.min_time}</label> </td>
+        <td align='center'> {rxLegBadge(this.state.status)} </td>
         <td> <span className='pointer-area' onClick={this.handleEditClick}> <img width='20' height='20' src='/edit.png' alt=''/> </span> </td>
         <td> <span className='pointer-area' onClick={this.handleTrashClick}> <img width='20' height='20' src='/trash.png' alt=''/> </span> </td>
       </tr>
@@ -125,6 +148,7 @@ class SinkList extends Component {
               <th>Status</th>
               <th>Errors</th>
               <th>Min. arrival time</th>
+              <th>Leg</th>
             </tr>
           : <tr>
              <th>No sinks configured</th>

@@ -46,6 +46,12 @@ class Config {
   };
   uint8_t get_streamer_channels() const { return streamer_channels_; };
   bool get_streamer_enabled() const;
+  // Total physical ALSA channel count (capture and playback share the same
+  // 0..N-1 numbering, matching Source.map/Sink.map's existing convention) —
+  // used by IS-08 to enumerate raw ALSA channels as routable Inputs/Outputs
+  // independent of any configured Source/Sink. Not otherwise consulted by
+  // session_manager (there's no other channel-count enforcement anywhere).
+  uint8_t get_alsa_channels() const { return alsa_channels_; };
   int get_log_severity() const { return log_severity_; };
   uint32_t get_playout_delay() const { return playout_delay_; };
   uint32_t get_tic_frame_size_at_1fs() const { return tic_frame_size_at_1fs_; };
@@ -108,6 +114,7 @@ class Config {
   void set_streamer_channels(uint8_t streamer_channels) {
     streamer_channels_ = streamer_channels;
   };
+  void set_alsa_channels(uint8_t alsa_channels) { alsa_channels_ = alsa_channels; };
   void set_streamer_files_num(uint8_t streamer_files_num) {
     streamer_files_num_ = streamer_files_num;
   };
@@ -197,6 +204,7 @@ class Config {
            lhs.get_rtsp_port() != rhs.get_rtsp_port() ||
            lhs.get_http_base_dir() != rhs.get_http_base_dir() ||
            lhs.get_streamer_channels() != rhs.get_streamer_channels() ||
+           lhs.get_alsa_channels() != rhs.get_alsa_channels() ||
            lhs.get_streamer_files_num() != rhs.get_streamer_files_num() ||
            lhs.get_streamer_file_duration() !=
                rhs.get_streamer_file_duration() ||
@@ -244,6 +252,7 @@ class Config {
   uint16_t rtsp_port_{8854};
   std::string http_base_dir_{"../webui/dist"};
   uint8_t streamer_channels_{8};
+  uint8_t alsa_channels_{64};
   uint8_t streamer_files_num_{8};
   uint16_t streamer_file_duration_{1};
   uint8_t streamer_player_buffer_files_num_{1};

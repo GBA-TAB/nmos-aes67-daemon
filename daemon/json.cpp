@@ -114,6 +114,7 @@ std::string config_to_json(const Config& config) {
      << "\"" << ",\n  \"ip_addr\": \"" << escape_json(config.get_ip_addr_str())
      << "\"" << ",\n  \"streamer_channels\": "
      << unsigned(config.get_streamer_channels())
+     << ",\n  \"alsa_channels\": " << unsigned(config.get_alsa_channels())
      << ",\n  \"streamer_files_num\": "
      << unsigned(config.get_streamer_files_num())
      << ",\n  \"streamer_file_duration\": "
@@ -196,7 +197,30 @@ std::string sink_status_to_json(const SinkStreamStatus& status) {
      << ", \n    \"some_muted\": " << status.is_some_muted
      << ", \n    \"all_muted\": " << status.is_all_muted
      << ", \n    \"muted\": " << status.is_muted << "\n  },"
+     << "\n  \"leg2\":\n  {"
+     << "  \n    \"present\": " << status.leg2_present
+     << ", \n    \"rtp_seq_id_error\": " << status.leg2_is_rtp_seq_id_error
+     << ", \n    \"rtp_ssrc_error\": " << status.leg2_is_rtp_ssrc_error
+     << ", \n    \"rtp_payload_type_error\": "
+     << status.leg2_is_rtp_payload_type_error
+     << ", \n    \"rtp_sac_error\": " << status.leg2_is_rtp_sac_error
+     << ", \n    \"receiving_rtp_packet\": " << status.leg2_is_receiving_rtp_packet
+     << "\n  },"
      << "\n  \"sink_min_time\": " << status.min_time << "\n}\n";
+  return ss.str();
+}
+
+std::string source_status_to_json(const SourceStreamStatus& status) {
+  std::stringstream ss;
+  ss << "{" << std::boolalpha
+     << "\n  \"source_flags\":\n  {"
+     << "  \n    \"transmitting\": " << status.is_transmitting
+     << ", \n    \"underrun\": " << status.is_underrun << "\n  },"
+     << "\n  \"leg2\":\n  {"
+     << "  \n    \"present\": " << status.leg2_present
+     << ", \n    \"transmitting\": " << status.leg2_is_transmitting
+     << ", \n    \"underrun\": " << status.leg2_is_underrun << "\n  }"
+     << "\n}\n";
   return ss.str();
 }
 
@@ -209,9 +233,15 @@ std::string ptp_config_to_json(const PTPConfig& ptp_config) {
 
 std::string ptp_status_to_json(const PTPStatus& status) {
   std::stringstream ss;
-  ss << "{" << " \"status\": \"" << escape_json(status.status) << "\""
+  ss << "{" << std::boolalpha << " \"status\": \"" << escape_json(status.status) << "\""
      << ", \"gmid\": \"" << escape_json(status.gmid) << "\""
-     << ", \"jitter\": " << status.jitter << " }\n";
+     << ", \"jitter\": " << status.jitter
+     << ", \"active_leg\": " << status.active_leg
+     << ", \"leg0_status\": \"" << escape_json(status.leg0_status) << "\""
+     << ", \"leg1_status\": \"" << escape_json(status.leg1_status) << "\""
+     << ", \"leg0_gmid\": \"" << escape_json(status.leg0_gmid) << "\""
+     << ", \"leg1_gmid\": \"" << escape_json(status.leg1_gmid) << "\""
+     << ", \"legs_aligned\": " << status.legs_aligned << " }\n";
   return ss.str();
 }
 
@@ -329,6 +359,8 @@ Config json_to_config_(std::istream& js, Config& config) {
             remove_undesired_chars(val.get_value<std::string>()));
       } else if (key == "streamer_channels") {
         config.set_streamer_channels(val.get_value<uint8_t>());
+      } else if (key == "alsa_channels") {
+        config.set_alsa_channels(val.get_value<uint8_t>());
       } else if (key == "streamer_files_num") {
         config.set_streamer_files_num(val.get_value<uint8_t>());
       } else if (key == "streamer_file_duration") {

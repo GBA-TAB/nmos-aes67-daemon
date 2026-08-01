@@ -87,7 +87,7 @@ bool HttpServer::init() {
 
   svr_.set_mount_point("/", config_->get_http_base_dir().c_str());
 
-  svr_.Get("(/|/Config|/PTP|/Sources|/Sinks|/Browser|/Topology)",
+  svr_.Get("(/|/Config|/PTP|/Sources|/Sinks|/Browser|/Topology|/ChannelMap)",
            [&](const Request& req, Response& res) {
              std::ifstream file(config_->get_http_base_dir() + "/index.html");
              std::stringstream buffer;
@@ -247,6 +247,26 @@ bool HttpServer::init() {
         } else {
           set_headers(res, "application/json");
           res.body = sink_status_to_json(status);
+        }
+      });
+
+  svr_.Get(
+      "/api/source/status/([0-9]+)", [this](const Request& req, Response& res) {
+        uint32_t id;
+        try {
+          id = std::stoi(req.matches[1]);
+        } catch (...) {
+          set_error(400, "failed to convert id", res);
+          return;
+        }
+        SourceStreamStatus status;
+        auto ret = session_manager_->get_source_status(id, status);
+        if (ret) {
+          set_error(ret, "failed to get source " + std::to_string(id) + " status",
+                    res);
+        } else {
+          set_headers(res, "application/json");
+          res.body = source_status_to_json(status);
         }
       });
 

@@ -33,6 +33,7 @@ const sdp = '/sdp';
 const sink = '/sink';
 const status = '/status';
 const browseSources = '/browse/sources/all';
+const channelMapping = '/x-nmos/channelmapping/v1.0';
 
 const defaultParams = {
   credentials: 'same-origin',
@@ -40,6 +41,14 @@ const defaultParams = {
   headers: new Headers({
     'X-USER-ID': 'test'
   })
+};
+
+// Cross-origin (different port than the page), so no custom headers here:
+// a non-simple header would force a CORS preflight, and the NMOS server's
+// Access-Control-Allow-Headers doesn't list X-USER-ID (which nothing
+// server-side reads anyway).
+const rawParams = {
+  redirect: 'error'
 };
 
 export default class RestAPI {
@@ -68,6 +77,51 @@ export default class RestAPI {
           return Promise.reject(Error(err.message));
         }
       );
+  }
+
+  // The NMOS node API (IS-08/IS-12) is served on its own port
+  // (config.nmos_node_port), separate from the webui/API port this page was
+  // loaded from - so it can't be reached at same-origin like /api/* can.
+  static getNmosBaseUrl() {
+    if (this._nmosBaseUrl) {
+      return Promise.resolve(this._nmosBaseUrl);
+    }
+    return fetch(this.getBaseUrl() + API + config, defaultParams)
+      .then(response => response.json())
+      .then(cfg => {
+        this._nmosBaseUrl = location.protocol + '//' + location.hostname + ':' + cfg.nmos_node_port;
+        return this._nmosBaseUrl;
+      });
+  }
+
+  // Like doFetch, but against the daemon's real NMOS API paths directly
+  // (e.g. IS-08 Channel Mapping) instead of the /api proxy layer.
+  static doFetchRaw(url, params = {}) {
+    if (params.method === undefined) {
+      params.method = 'GET';
+    }
+
+    return this.getNmosBaseUrl().then(base =>
+      fetch(base + url, Object.assign({}, rawParams, params))
+        .then(
+          response => {
+            if (response.ok) {
+              return response;
+            }
+            // Surface the daemon's own {"error": "..."} reason instead of a
+            // bare status code - IS-08 4xx responses always carry one.
+            return response.json().then(
+              body => Promise.reject(Error(body.error || ('HTTP ' + response.status))),
+              () => Promise.reject(Error('HTTP ' + response.status))
+            );
+          }
+        ).catch(
+          err => {
+            console.log(base + url + ' failed: ' + err.message);
+            return Promise.reject(Error(err.message));
+          }
+        )
+    );
   }
 
   static getVersion() {
@@ -192,6 +246,15 @@ export default class RestAPI {
     });
   }
 
+  static getSourceStatus(id) {
+    return this.doFetch(source + status + '/' + id, {
+      method: 'GET'
+    }).catch(err => {
+      toast.error('Get Source status failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
   static addSink(id, name, io, delay, use_sdp, source, sdp, ignore_refclk_gmid, map, is_edit) {
     return this.doFetch(sink + '/' + id, {
       body: JSON.stringify({
@@ -251,6 +314,91 @@ export default class RestAPI {
   static getRemoteSources() {
     return this.doFetch(browseSources).catch(err => {
       toast.error('Browse sources get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  // ---- IS-08 (Audio Channel Mapping) ----
+
+  static getChannelMapInputs() {
+    return this.doFetchRaw(channelMapping + '/inputs/').catch(err => {
+      toast.error('Channel map inputs get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapInputParent(id) {
+    return this.doFetchRaw(channelMapping + '/inputs/' + id + '/parent/').catch(err => {
+      toast.error('Channel map input parent get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapInputProperties(id) {
+    return this.doFetchRaw(channelMapping + '/inputs/' + id + '/properties/').catch(err => {
+      toast.error('Channel map input properties get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapInputChannels(id) {
+    return this.doFetchRaw(channelMapping + '/inputs/' + id + '/channels/').catch(err => {
+      toast.error('Channel map input channels get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapOutputs() {
+    return this.doFetchRaw(channelMapping + '/outputs/').catch(err => {
+      toast.error('Channel map outputs get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapOutputCaps(id) {
+    return this.doFetchRaw(channelMapping + '/outputs/' + id + '/caps/').catch(err => {
+      toast.error('Channel map output caps get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapOutputChannels(id) {
+    return this.doFetchRaw(channelMapping + '/outputs/' + id + '/channels/').catch(err => {
+      toast.error('Channel map output channels get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapOutputProperties(id) {
+    return this.doFetchRaw(channelMapping + '/outputs/' + id + '/properties/').catch(err => {
+      toast.error('Channel map output properties get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapActive() {
+    return this.doFetchRaw(channelMapping + '/map/active/').catch(err => {
+      toast.error('Channel map active get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static setChannelMapActivation(outputId, outputChannel, inputId, inputChannel) {
+    return this.doFetchRaw(channelMapping + '/map/activations/', {
+      body: JSON.stringify({
+        activation: { mode: 'activate_immediate' },
+        action: {
+          [outputId]: {
+            [outputChannel]: {
+              input: inputId,
+              channel_index: inputId === null ? null : inputChannel
+            }
+          }
+        }
+      }),
+      method: 'POST'
+    }).catch(err => {
+      toast.error('Channel map activation failed: ' + err.message)
       return Promise.reject(Error(err.message));
     });
   }

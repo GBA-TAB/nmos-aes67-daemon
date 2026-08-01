@@ -120,5 +120,6 @@ std::optional<RavennaPtpStatus> RavennaPtp::get_status() {
     out.gmid[1]         = ptp->ui64GMID[1];
     out.network_jitter  = ptp->i32NetworkJitter;
     out.clock_jitter    = ptp->i32ClockJitter;
+    out.ptp_offset_ns   = ptp->i64PTPOffset;
     return out;
 }

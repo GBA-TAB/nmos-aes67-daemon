@@ -72,6 +72,8 @@ std::shared_ptr<Config> Config::parse(const std::string& filename,
     config.sample_rate_ = 48000;
   if (config.streamer_channels_ < 2 || config.streamer_channels_ > 16)
     config.streamer_channels_ = 8;
+  if (config.alsa_channels_ < 1 || config.alsa_channels_ > 64)
+    config.alsa_channels_ = 64;
   if (config.streamer_file_duration_ < 1 || config.streamer_file_duration_ > 4)
     config.streamer_file_duration_ = 1;
   if (config.streamer_files_num_ < 4 || config.streamer_files_num_ > 16)

@@ -40,28 +40,21 @@ constexpr int kHealthPartiallyHealthy = 2;
 constexpr int kHealthUnhealthy = 3;
 
 constexpr long kRootBlockOid = 1;
+constexpr long kDeviceManagerOid = 2;
 constexpr long kClassManagerOid = 3;
 constexpr long kReceiverMonitorOidBase = 100;
 constexpr long kSenderMonitorOidBase = 200;
 
-// NcLinkStatus (AllUp=1/SomeDown=2/AllDown=3) numerically coincides with the
-// generic Healthy/PartiallyHealthy/Unhealthy ordering shared above, so this
-// reuses the same kHealth* constants. Single-leg links can only ever be
-// fully up or fully down; dual-leg (ST 2022-7) links can be partially up,
-// which a single shared boolean can't represent — hence per-leg inputs here.
-std::pair<int, std::string> compute_link_status(bool leg0_up, bool dual_leg,
-                                                  bool leg1_up) {
-  if (!dual_leg) {
-    return leg0_up ? std::make_pair(kHealthHealthy, std::string("null"))
-                    : std::make_pair(kHealthUnhealthy,
-                                      std::string("\"Interface link down\""));
-  }
-  if (leg0_up && leg1_up) return {kHealthHealthy, "null"};
-  if (!leg0_up && !leg1_up)
-    return {kHealthUnhealthy, "\"Both interface links down\""};
-  return {kHealthPartiallyHealthy,
-          leg0_up ? "\"Secondary interface link down\""
-                   : "\"Primary interface link down\""};
+// IS-04 interface IDs use dash-separated MAC (e.g. "aa-bb-cc-dd-ee-ff").
+// PTPStatus.gmid is colon-separated; convert here. (Local copy of
+// nmos_manager.cpp's file-static helper of the same name — this file follows
+// the same "no cross-file helper sharing beyond NmosManager methods"
+// convention already used for json_prop_descriptor/json_method_descriptor.)
+std::string colon_to_dash_mac(const std::string& mac) {
+  std::string out = mac;
+  for (char& c : out)
+    if (c == ':') c = '-';
+  return out;
 }
 
 std::string json_prop_descriptor(int level, int index, const std::string& name,
@@ -113,10 +106,75 @@ void NmosManager::ncp_sync_status(int& status, std::string& message) const {
 
   PTPStatus ptp;
   session_manager_->get_ptp_status(ptp);
+  bool dual_leg = !config_->get_interface_name(1).empty();
+
+  // Both legs individually locked but to different grandmasters means
+  // seamless 2022-7 switching can't be trusted even though the daemon is
+  // "locked" overall - surface that as PartiallyHealthy rather than hiding
+  // it behind a plain "locked".
+  if (dual_leg && ptp.status == "locked" && !ptp.legs_aligned) {
+    status = kHealthPartiallyHealthy;
+    message = "\"Red and Blue legs are locked to different grandmasters (red: " +
+              ptp.leg0_gmid + ", blue: " + ptp.leg1_gmid + ")\"";
+    return;
+  }
+
   status = ptp.status == "locked"   ? kHealthHealthy
            : ptp.status == "locking" ? kHealthPartiallyHealthy
                                      : kHealthUnhealthy;
-  message = ptp.status == "locked" ? "null" : ("\"PTP " + ptp.status + "\"");
+  // The driver already fails the clock over between legs on its own
+  // (Select_PTP_NIC() in manager.c) - report which one, when dual-leg is
+  // actually configured, rather than just "locked".
+  if (ptp.status == "locked" && dual_leg) {
+    message = std::string("\"Locked via ") +
+              (ptp.active_leg == 0 ? "primary (red)" : "secondary (blue)") + " leg\"";
+  } else {
+    message = ptp.status == "locked" ? "null" : ("\"PTP " + ptp.status + "\"");
+  }
+}
+
+void NmosManager::ncp_link_status(int& status, std::string& message) const {
+  bool link0_up = get_interface_link_up(config_->get_interface_name(0));
+  bool has_leg2 = !config_->get_interface_name(1).empty();
+
+  if (!has_leg2) {
+    status = link0_up ? kHealthHealthy : kHealthUnhealthy;
+    message = link0_up ? "null" : "\"Interface link down\"";
+    return;
+  }
+
+  bool link1_up = get_interface_link_up(config_->get_interface_name(1));
+  if (link0_up && link1_up) {
+    status = kHealthHealthy;
+    message = "null";
+  } else if (link0_up || link1_up) {
+    status = kHealthPartiallyHealthy;
+    message = link0_up ? "\"Secondary (blue) interface link down\""
+                       : "\"Primary (red) interface link down\"";
+  } else {
+    status = kHealthUnhealthy;
+    message = "\"Both interface links down\"";
+  }
+}
+
+// Updates the per-oid last-observed status + transition counters (see
+// NcMonitorCounters). Safe to call from multiple contexts (Get handling and
+// the once-a-second notify worker both call through the props functions
+// below) since a transition is only ever counted once: the counter only
+// increments when the newly observed value differs from what was already
+// stored, and immediately updates that stored value.
+void NmosManager::update_monitor_counters(long oid, int link, int secondary, int sync,
+                                          int tertiary) const {
+  std::lock_guard<std::mutex> lk(monitor_counters_mutex_);
+  auto& c = monitor_counters_[oid];
+  if (c.link_status != -1 && c.link_status != link) c.link_transitions++;
+  if (c.secondary_status != -1 && c.secondary_status != secondary) c.secondary_transitions++;
+  if (c.sync_status != -1 && c.sync_status != sync) c.sync_transitions++;
+  if (c.tertiary_status != -1 && c.tertiary_status != tertiary) c.tertiary_transitions++;
+  c.link_status = link;
+  c.secondary_status = secondary;
+  c.sync_status = sync;
+  c.tertiary_status = tertiary;
 }
 
 std::vector<NmosManager::NcPropEntry> NmosManager::ncp_receiver_monitor_props(
@@ -133,74 +191,100 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_receiver_monitor_props(
     receiver_id = it->second.receiver_id;
   }
 
+  long oid = kReceiverMonitorOidBase + sink_id;
   props.push_back(
       {1, 7, "[{\"resourceType\": \"receiver\", \"id\": \"" + receiver_id + "\"}]"});
 
-  if (!active) {
-    props.push_back({3, 1, std::to_string(kHealthInactive)});
-    props.push_back({3, 2, "null"});
-    props.push_back({4, 1, std::to_string(kHealthInactive)});
-    props.push_back({4, 2, "null"});
-    props.push_back({4, 3, std::to_string(kHealthInactive)});
-    props.push_back({4, 4, "null"});
-    props.push_back({4, 5, std::to_string(kHealthInactive)});
-    props.push_back({4, 6, "null"});
-    props.push_back({4, 7, std::to_string(kHealthInactive)});
-    props.push_back({4, 8, "null"});
-    return props;
+  int link_status = kHealthInactive, connection_status = kHealthInactive,
+      sync_status = kHealthInactive, stream_status = kHealthInactive;
+  std::string link_msg = "null", connection_msg = "null", sync_msg = "null", stream_msg = "null";
+  std::string sync_source_id = "null";
+
+  if (active) {
+    ncp_link_status(link_status, link_msg);
+
+    SinkStreamStatus sink_status{};
+    session_manager_->get_sink_status(sink_id, sink_status);
+
+    bool leg0_ok = sink_status.is_receiving_rtp_packet;
+    bool leg0_errs = sink_status.is_rtp_seq_id_error || sink_status.is_rtp_ssrc_error ||
+                     sink_status.is_rtp_payload_type_error || sink_status.is_rtp_sac_error;
+
+    if (sink_status.leg2_present) {
+      bool leg1_ok = sink_status.leg2_is_receiving_rtp_packet;
+      if (leg0_ok && leg1_ok) {
+        connection_status = leg0_errs ? kHealthPartiallyHealthy : kHealthHealthy;
+        if (leg0_errs) connection_msg = "\"RTP stream errors detected on primary (red) leg\"";
+      } else if (leg0_ok || leg1_ok) {
+        connection_status = kHealthPartiallyHealthy;
+        connection_msg = leg0_ok ? "\"Receiving on primary (red) leg only\""
+                                 : "\"Receiving on secondary (blue) leg only\"";
+      } else {
+        connection_status = kHealthUnhealthy;
+        connection_msg = "\"Not receiving RTP packets on either leg\"";
+      }
+    } else if (!leg0_ok) {
+      connection_status = kHealthUnhealthy;
+      connection_msg = "\"Not receiving RTP packets\"";
+    } else if (leg0_errs) {
+      connection_status = kHealthPartiallyHealthy;
+      connection_msg = "\"RTP stream errors detected\"";
+    } else {
+      connection_status = kHealthHealthy;
+    }
+
+    ncp_sync_status(sync_status, sync_msg);
+
+    PtpSyncInfo pcm = get_ptp_clock_manager_sync();
+    if (pcm.available && pcm.locked) {
+      sync_source_id = "\"" + pcm.gmid_dash + "\"";
+    } else {
+      PTPStatus ptp;
+      session_manager_->get_ptp_status(ptp);
+      if (ptp.status == "locked") sync_source_id = "\"" + colon_to_dash_mac(ptp.gmid) + "\"";
+    }
+
+    // No direct "is this stream still valid" query is exposed by
+    // SessionManager outside its own worker loop, so streamStatus proxies
+    // the sink's mute state (also carried in SinkStreamStatus) as the best
+    // available signal.
+    if (sink_status.is_all_muted) {
+      stream_status = kHealthUnhealthy;
+      stream_msg = "\"All channels muted\"";
+    } else if (sink_status.is_some_muted) {
+      stream_status = kHealthPartiallyHealthy;
+      stream_msg = "\"Some channels muted\"";
+    } else {
+      stream_status = kHealthHealthy;
+    }
   }
 
-  bool leg0_up = get_interface_link_up(config_->get_interface_name(0));
-  bool leg1_up = is_dual_leg() && get_interface_link_up(config_->get_interface_name(1));
-  auto [link_status, link_msg] = compute_link_status(leg0_up, is_dual_leg(), leg1_up);
-
-  SinkStreamStatus sink_status{};
-  session_manager_->get_sink_status(sink_id, sink_status);
-
-  int connection_status;
-  std::string connection_msg = "null";
-  if (!sink_status.is_receiving_rtp_packet) {
-    connection_status = kHealthUnhealthy;
-    connection_msg = "\"Not receiving RTP packets\"";
-  } else if (sink_status.is_rtp_seq_id_error || sink_status.is_rtp_ssrc_error ||
-             sink_status.is_rtp_payload_type_error || sink_status.is_rtp_sac_error) {
-    connection_status = kHealthPartiallyHealthy;
-    connection_msg = "\"RTP stream errors detected\"";
-  } else {
-    connection_status = kHealthHealthy;
+  update_monitor_counters(oid, link_status, connection_status, sync_status, stream_status);
+  NcMonitorCounters counters;
+  {
+    std::lock_guard<std::mutex> lk(monitor_counters_mutex_);
+    counters = monitor_counters_[oid];
   }
 
-  int sync_status;
-  std::string sync_msg;
-  ncp_sync_status(sync_status, sync_msg);
-
-  // No direct "is this stream still valid" query is exposed by SessionManager
-  // outside its own worker loop, so streamStatus proxies the sink's mute
-  // state (also carried in SinkStreamStatus) as the best available signal.
-  int stream_status;
-  std::string stream_msg = "null";
-  if (sink_status.is_all_muted) {
-    stream_status = kHealthUnhealthy;
-    stream_msg = "\"All channels muted\"";
-  } else if (sink_status.is_some_muted) {
-    stream_status = kHealthPartiallyHealthy;
-    stream_msg = "\"Some channels muted\"";
-  } else {
-    stream_status = kHealthHealthy;
-  }
-
-  int overall = std::max({link_status, connection_status, sync_status, stream_status});
+  int overall = active ? std::max({link_status, connection_status, sync_status, stream_status})
+                       : kHealthInactive;
 
   props.push_back({3, 1, std::to_string(overall)});
   props.push_back({3, 2, "null"});
   props.push_back({4, 1, std::to_string(link_status)});
   props.push_back({4, 2, link_msg});
-  props.push_back({4, 3, std::to_string(connection_status)});
-  props.push_back({4, 4, connection_msg});
-  props.push_back({4, 5, std::to_string(sync_status)});
-  props.push_back({4, 6, sync_msg});
-  props.push_back({4, 7, std::to_string(stream_status)});
-  props.push_back({4, 8, stream_msg});
+  props.push_back({4, 3, std::to_string(counters.link_transitions)});
+  props.push_back({4, 4, std::to_string(connection_status)});
+  props.push_back({4, 5, connection_msg});
+  props.push_back({4, 6, std::to_string(counters.secondary_transitions)});
+  props.push_back({4, 7, std::to_string(sync_status)});
+  props.push_back({4, 8, sync_msg});
+  props.push_back({4, 9, std::to_string(counters.sync_transitions)});
+  props.push_back({4, 10, sync_source_id});
+  props.push_back({4, 11, std::to_string(stream_status)});
+  props.push_back({4, 12, stream_msg});
+  props.push_back({4, 13, std::to_string(counters.tertiary_transitions)});
+  props.push_back({4, 14, counters.auto_reset ? "true" : "false"});
   return props;
 }
 
@@ -218,64 +302,119 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_sender_monitor_props(
     sender_id = it->second.sender_id;
   }
 
+  long oid = kSenderMonitorOidBase + source_id;
   props.push_back(
       {1, 7, "[{\"resourceType\": \"sender\", \"id\": \"" + sender_id + "\"}]"});
 
-  if (!active) {
-    props.push_back({3, 1, std::to_string(kHealthInactive)});
-    props.push_back({3, 2, "null"});
-    props.push_back({4, 1, std::to_string(kHealthInactive)});
-    props.push_back({4, 2, "null"});
-    props.push_back({4, 3, std::to_string(kHealthInactive)});
-    props.push_back({4, 4, "null"});
-    props.push_back({4, 5, std::to_string(kHealthInactive)});
-    props.push_back({4, 6, "null"});
-    props.push_back({4, 7, std::to_string(kHealthInactive)});
-    props.push_back({4, 8, "null"});
-    return props;
+  int link_status = kHealthInactive, transmission_status = kHealthInactive,
+      sync_status = kHealthInactive, essence_status = kHealthInactive;
+  std::string link_msg = "null", transmission_msg = "null", sync_msg = "null";
+  std::string sync_source_id = "null";
+
+  if (active) {
+    ncp_link_status(link_status, link_msg);
+
+    SourceStreamStatus src_status{};
+    session_manager_->get_source_status(source_id, src_status);
+
+    bool leg0_ok = src_status.is_transmitting;
+    bool leg0_underrun = src_status.is_underrun;
+
+    if (src_status.leg2_present) {
+      bool leg1_ok = src_status.leg2_is_transmitting;
+      if (leg0_ok && leg1_ok) {
+        transmission_status = leg0_underrun ? kHealthPartiallyHealthy : kHealthHealthy;
+        if (leg0_underrun) transmission_msg = "\"Buffer underrun detected on primary (red) leg\"";
+      } else if (leg0_ok || leg1_ok) {
+        transmission_status = kHealthPartiallyHealthy;
+        transmission_msg = leg0_ok ? "\"Transmitting on primary (red) leg only\""
+                                   : "\"Transmitting on secondary (blue) leg only\"";
+      } else {
+        transmission_status = kHealthUnhealthy;
+        transmission_msg = "\"Not transmitting RTP packets on either leg\"";
+      }
+    } else if (!leg0_ok) {
+      transmission_status = kHealthUnhealthy;
+      transmission_msg = "\"Not transmitting RTP packets\"";
+    } else if (leg0_underrun) {
+      transmission_status = kHealthPartiallyHealthy;
+      transmission_msg = "\"Buffer underrun detected\"";
+    } else {
+      transmission_status = kHealthHealthy;
+    }
+
+    ncp_sync_status(sync_status, sync_msg);
+
+    PtpSyncInfo pcm = get_ptp_clock_manager_sync();
+    if (pcm.available && pcm.locked) {
+      sync_source_id = "\"" + pcm.gmid_dash + "\"";
+    } else {
+      PTPStatus ptp;
+      session_manager_->get_ptp_status(ptp);
+      if (ptp.status == "locked") sync_source_id = "\"" + colon_to_dash_mac(ptp.gmid) + "\"";
+    }
+
+    // No bitstream/essence-level inspection is available in this daemon —
+    // essenceStatus proxies the transmitting bit rather than any real
+    // content/format validation.
+    essence_status = src_status.is_transmitting ? kHealthHealthy : kHealthUnhealthy;
   }
 
-  bool leg0_up = get_interface_link_up(config_->get_interface_name(0));
-  bool leg1_up = is_dual_leg() && get_interface_link_up(config_->get_interface_name(1));
-  auto [link_status, link_msg] = compute_link_status(leg0_up, is_dual_leg(), leg1_up);
-
-  SourceStreamStatus src_status{};
-  session_manager_->get_source_status(source_id, src_status);
-
-  int transmission_status;
-  std::string transmission_msg = "null";
-  if (!src_status.is_transmitting) {
-    transmission_status = kHealthUnhealthy;
-    transmission_msg = "\"Not transmitting RTP packets\"";
-  } else if (src_status.is_underrun) {
-    transmission_status = kHealthPartiallyHealthy;
-    transmission_msg = "\"Buffer underrun detected\"";
-  } else {
-    transmission_status = kHealthHealthy;
+  update_monitor_counters(oid, link_status, transmission_status, sync_status, essence_status);
+  NcMonitorCounters counters;
+  {
+    std::lock_guard<std::mutex> lk(monitor_counters_mutex_);
+    counters = monitor_counters_[oid];
   }
 
-  int sync_status;
-  std::string sync_msg;
-  ncp_sync_status(sync_status, sync_msg);
-
-  // No bitstream/essence-level inspection is available in this daemon —
-  // essenceStatus proxies the transmitting bit rather than any real
-  // content/format validation.
-  int essence_status = src_status.is_transmitting ? kHealthHealthy : kHealthUnhealthy;
-
-  int overall = std::max({link_status, transmission_status, sync_status, essence_status});
+  int overall = active
+                    ? std::max({link_status, transmission_status, sync_status, essence_status})
+                    : kHealthInactive;
 
   props.push_back({3, 1, std::to_string(overall)});
   props.push_back({3, 2, "null"});
   props.push_back({4, 1, std::to_string(link_status)});
   props.push_back({4, 2, link_msg});
-  props.push_back({4, 3, std::to_string(transmission_status)});
-  props.push_back({4, 4, transmission_msg});
-  props.push_back({4, 5, std::to_string(sync_status)});
-  props.push_back({4, 6, sync_msg});
-  props.push_back({4, 7, std::to_string(essence_status)});
-  props.push_back({4, 8, "null"});
+  props.push_back({4, 3, std::to_string(counters.link_transitions)});
+  props.push_back({4, 4, std::to_string(transmission_status)});
+  props.push_back({4, 5, transmission_msg});
+  props.push_back({4, 6, std::to_string(counters.secondary_transitions)});
+  props.push_back({4, 7, std::to_string(sync_status)});
+  props.push_back({4, 8, sync_msg});
+  props.push_back({4, 9, std::to_string(counters.sync_transitions)});
+  props.push_back({4, 10, sync_source_id});
+  props.push_back({4, 11, std::to_string(essence_status)});
+  props.push_back({4, 12, "null"});
+  props.push_back({4, 13, std::to_string(counters.tertiary_transitions)});
+  props.push_back({4, 14, counters.auto_reset ? "true" : "false"});
   return props;
+}
+
+// NcDeviceManager (classId [1,3,1]) is a mandatory root singleton per
+// MS-05-02, but this daemon has no real manufacturer/product/serial-number
+// concept — these are static placeholder values, present so a generic
+// controller's discovery walk finds a well-formed, spec-complete object
+// rather than a missing/erroring one.
+std::vector<NmosManager::NcPropEntry> NmosManager::ncp_device_manager_props() const {
+  std::ostringstream manufacturer, product;
+  manufacturer << "{\"name\": \"aes67-linux-daemon\", \"organizationId\": null, "
+                  "\"website\": \"https://github.com/bondagit/aes67-linux-daemon\"}";
+  product << "{\"name\": \"" << config_->get_nmos_label() << "\", \"key\": \"aes67-linux-daemon\""
+          << ", \"revisionLevel\": \"1.0\", \"brandName\": \"aes67-linux-daemon\""
+          << ", \"uuid\": \"" << node_id_ << "\", \"description\": \"AES67 Linux Daemon\"}";
+
+  return {
+      {3, 1, "\"v1.0.0\""},
+      {3, 2, manufacturer.str()},
+      {3, 3, product.str()},
+      {3, 4, "\"" + node_id_ + "\""},
+      {3, 5, "null"},
+      {3, 6, "null"},
+      {3, 7, "null"},
+      {3, 8, "{\"generic\": 1, \"deviceSpecificDetails\": null}"},
+      {3, 9, "0"},
+      {3, 10, "null"},
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -285,20 +424,24 @@ std::vector<NmosManager::NcPropEntry> NmosManager::ncp_sender_monitor_props(
 std::string NmosManager::ncp_member_descriptors_json() const {
   std::ostringstream ss;
   ss << "[";
-  bool first = true;
+  // DeviceManager and ClassManager are mandatory members of the root block
+  // per MS-05-02 — list them so a controller's GetMemberDescriptors walk
+  // finds them, rather than relying on well-known oids alone.
+  ss << "{\"oid\": " << kDeviceManagerOid << ", \"role\": \"DeviceManager\""
+     << ", \"classId\": [1, 3, 1]}";
+  ss << ", {\"oid\": " << kClassManagerOid << ", \"role\": \"ClassManager\""
+     << ", \"classId\": [1, 3, 2]}";
   {
     std::shared_lock lock(resources_mutex_);
     for (const auto& [id, rr] : receivers_) {
-      if (!first) ss << ", ";
-      ss << "{\"oid\": " << (kReceiverMonitorOidBase + id) << ", \"role\": \"ReceiverMonitor"
+      (void)rr;
+      ss << ", {\"oid\": " << (kReceiverMonitorOidBase + id) << ", \"role\": \"ReceiverMonitor"
          << +id << "\", \"classId\": [1, 2, 2, 1]}";
-      first = false;
     }
     for (const auto& [id, sr] : senders_) {
-      if (!first) ss << ", ";
-      ss << "{\"oid\": " << (kSenderMonitorOidBase + id) << ", \"role\": \"SenderMonitor" << +id
+      (void)sr;
+      ss << ", {\"oid\": " << (kSenderMonitorOidBase + id) << ", \"role\": \"SenderMonitor" << +id
          << "\", \"classId\": [1, 2, 2, 2]}";
-      first = false;
     }
   }
   ss << "]";
@@ -321,21 +464,41 @@ bool NmosManager::ncp_class_descriptor_json(const std::vector<int>& class_id,
     name = "NcStatusMonitor";
     properties.push_back(json_prop_descriptor(3, 1, "overallStatus", "NcOverallStatus", true, false, false));
     properties.push_back(json_prop_descriptor(3, 2, "overallStatusMessage", "NcString", true, true, false));
+  } else if (class_id == std::vector<int>{1, 3, 1}) {
+    name = "NcDeviceManager";
+    properties.push_back(json_prop_descriptor(3, 1, "ncVersion", "NcString", true, false, false));
+    properties.push_back(json_prop_descriptor(3, 2, "manufacturer", "NcManufacturer", true, false, false));
+    properties.push_back(json_prop_descriptor(3, 3, "product", "NcProduct", true, false, false));
+    properties.push_back(json_prop_descriptor(3, 4, "serialNumber", "NcString", true, false, false));
+    properties.push_back(json_prop_descriptor(3, 5, "userInventoryCode", "NcString", true, true, false));
+    properties.push_back(json_prop_descriptor(3, 6, "deviceName", "NcString", true, true, false));
+    properties.push_back(json_prop_descriptor(3, 7, "deviceRole", "NcString", true, true, false));
+    properties.push_back(json_prop_descriptor(3, 8, "operationalState", "NcDeviceOperationalState", true, false, false));
+    properties.push_back(json_prop_descriptor(3, 9, "resetCause", "NcResetCause", true, false, false));
+    properties.push_back(json_prop_descriptor(3, 10, "message", "NcString", true, true, false));
   } else if (class_id == std::vector<int>{1, 2, 2, 1}) {
+    // Property numbering matches BCP-008-01's registered NcReceiverMonitor
+    // layout exactly (verified against AMWA's own nmos-device-control-mock
+    // reference implementation) so a controller that hardcodes the standard
+    // ids for this well-known classId reads the right fields.
     name = "NcReceiverMonitor";
     properties.push_back(json_prop_descriptor(1, 7, "touchpoints", "NcTouchpoint", true, true, true));
     properties.push_back(json_prop_descriptor(3, 1, "overallStatus", "NcOverallStatus", true, false, false));
     properties.push_back(json_prop_descriptor(3, 2, "overallStatusMessage", "NcString", true, true, false));
     properties.push_back(json_prop_descriptor(4, 1, "linkStatus", "NcLinkStatus", true, false, false));
     properties.push_back(json_prop_descriptor(4, 2, "linkStatusMessage", "NcString", true, true, false));
-    properties.push_back(json_prop_descriptor(4, 3, "connectionStatus", "NcConnectionStatus", true, false, false));
-    properties.push_back(json_prop_descriptor(4, 4, "connectionStatusMessage", "NcString", true, true, false));
-    properties.push_back(json_prop_descriptor(4, 5, "externalSynchronizationStatus", "NcSynchronizationStatus", true, false, false));
-    properties.push_back(json_prop_descriptor(4, 6, "externalSynchronizationStatusMessage", "NcString", true, true, false));
-    properties.push_back(json_prop_descriptor(4, 7, "streamStatus", "NcStreamStatus", true, false, false));
-    properties.push_back(json_prop_descriptor(4, 8, "streamStatusMessage", "NcString", true, true, false));
-    methods.push_back(json_method_descriptor(4, 1, "GetLostPacketCounters"));
-    methods.push_back(json_method_descriptor(4, 2, "GetLatePacketCounters"));
+    properties.push_back(json_prop_descriptor(4, 3, "linkStatusTransitionCounter", "NcUint32", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 4, "connectionStatus", "NcConnectionStatus", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 5, "connectionStatusMessage", "NcString", true, true, false));
+    properties.push_back(json_prop_descriptor(4, 6, "connectionStatusTransitionCounter", "NcUint32", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 7, "externalSynchronizationStatus", "NcSynchronizationStatus", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 8, "externalSynchronizationStatusMessage", "NcString", true, true, false));
+    properties.push_back(json_prop_descriptor(4, 9, "externalSynchronizationStatusTransitionCounter", "NcUint32", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 10, "synchronizationSourceId", "NcString", true, true, false));
+    properties.push_back(json_prop_descriptor(4, 11, "streamStatus", "NcStreamStatus", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 12, "streamStatusMessage", "NcString", true, true, false));
+    properties.push_back(json_prop_descriptor(4, 13, "streamStatusTransitionCounter", "NcUint32", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 14, "autoResetCountersAndMessages", "NcBoolean", false, false, false));
   } else if (class_id == std::vector<int>{1, 2, 2, 2}) {
     name = "NcSenderMonitor";
     properties.push_back(json_prop_descriptor(1, 7, "touchpoints", "NcTouchpoint", true, true, true));
@@ -343,13 +506,18 @@ bool NmosManager::ncp_class_descriptor_json(const std::vector<int>& class_id,
     properties.push_back(json_prop_descriptor(3, 2, "overallStatusMessage", "NcString", true, true, false));
     properties.push_back(json_prop_descriptor(4, 1, "linkStatus", "NcLinkStatus", true, false, false));
     properties.push_back(json_prop_descriptor(4, 2, "linkStatusMessage", "NcString", true, true, false));
-    properties.push_back(json_prop_descriptor(4, 3, "transmissionStatus", "NcTransmissionStatus", true, false, false));
-    properties.push_back(json_prop_descriptor(4, 4, "transmissionStatusMessage", "NcString", true, true, false));
-    properties.push_back(json_prop_descriptor(4, 5, "externalSynchronizationStatus", "NcSynchronizationStatus", true, false, false));
-    properties.push_back(json_prop_descriptor(4, 6, "externalSynchronizationStatusMessage", "NcString", true, true, false));
-    properties.push_back(json_prop_descriptor(4, 7, "essenceStatus", "NcEssenceStatus", true, false, false));
-    properties.push_back(json_prop_descriptor(4, 8, "essenceStatusMessage", "NcString", true, true, false));
-    methods.push_back(json_method_descriptor(4, 1, "GetTransmissionErrorCounters"));
+    properties.push_back(json_prop_descriptor(4, 3, "linkStatusTransitionCounter", "NcUint32", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 4, "transmissionStatus", "NcTransmissionStatus", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 5, "transmissionStatusMessage", "NcString", true, true, false));
+    properties.push_back(json_prop_descriptor(4, 6, "transmissionStatusTransitionCounter", "NcUint32", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 7, "externalSynchronizationStatus", "NcSynchronizationStatus", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 8, "externalSynchronizationStatusMessage", "NcString", true, true, false));
+    properties.push_back(json_prop_descriptor(4, 9, "externalSynchronizationStatusTransitionCounter", "NcUint32", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 10, "synchronizationSourceId", "NcString", true, true, false));
+    properties.push_back(json_prop_descriptor(4, 11, "essenceStatus", "NcEssenceStatus", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 12, "essenceStatusMessage", "NcString", true, true, false));
+    properties.push_back(json_prop_descriptor(4, 13, "essenceStatusTransitionCounter", "NcUint32", true, false, false));
+    properties.push_back(json_prop_descriptor(4, 14, "autoResetCountersAndMessages", "NcBoolean", false, false, false));
   } else {
     return false;
   }
@@ -444,7 +612,9 @@ void NmosManager::handle_is12_message(const std::string& msg,
         int pindex = args ? args->get<int>("id.index", 0) : 0;
 
         std::vector<NcPropEntry> props;
-        if (oid >= kReceiverMonitorOidBase && oid < kReceiverMonitorOidBase + 64) {
+        if (oid == kDeviceManagerOid) {
+          props = ncp_device_manager_props();
+        } else if (oid >= kReceiverMonitorOidBase && oid < kReceiverMonitorOidBase + 64) {
           props = ncp_receiver_monitor_props(static_cast<uint8_t>(oid - kReceiverMonitorOidBase));
         } else if (oid >= kSenderMonitorOidBase && oid < kSenderMonitorOidBase + 64) {
           props = ncp_sender_monitor_props(static_cast<uint8_t>(oid - kSenderMonitorOidBase));
@@ -462,38 +632,24 @@ void NmosManager::handle_is12_message(const std::string& msg,
           error_message = props.empty() ? "Unknown oid" : "PropertyNotImplemented";
         }
       } else if (mlevel == 1 && mindex == 2) {
-        // NcObject.Set — every property this daemon exposes is read-only.
-        status = 405;
-        error_message = "PropertyReadOnly";
-      } else if (mlevel == 4 && (mindex == 1 || mindex == 2) &&
-                 oid >= kReceiverMonitorOidBase && oid < kReceiverMonitorOidBase + 64) {
-        // NcReceiverMonitor.GetLostPacketCounters (4,1) / GetLatePacketCounters
-        // (4,2). The driver only exposes boolean RTP error flags (see
-        // SinkStreamStatus), not per-packet loss/lateness counts, so there is
-        // no real data to report. Per BCP-008-01, devices without that
-        // capability "MUST implement the method but return an empty
-        // collection" — this is that conformant empty response.
-        std::shared_lock lock(resources_mutex_);
-        if (receivers_.count(static_cast<uint8_t>(oid - kReceiverMonitorOidBase))) {
+        // NcObject.Set — every property this daemon exposes is read-only
+        // except autoResetCountersAndMessages (4p14) on a monitor oid.
+        int plevel = args ? args->get<int>("id.level", 0) : 0;
+        int pindex = args ? args->get<int>("id.index", 0) : 0;
+        bool is_monitor_oid = (oid >= kReceiverMonitorOidBase && oid < kReceiverMonitorOidBase + 64) ||
+                              (oid >= kSenderMonitorOidBase && oid < kSenderMonitorOidBase + 64);
+
+        if (is_monitor_oid && plevel == 4 && pindex == 14) {
+          bool value = args ? args->get<bool>("value", true) : true;
+          {
+            std::lock_guard<std::mutex> lk(monitor_counters_mutex_);
+            monitor_counters_[oid].auto_reset = value;
+          }
           status = 200;
           error_message.clear();
-          value_json = "[]";
         } else {
-          status = 404;
-          error_message = "Unknown oid";
-        }
-      } else if (mlevel == 4 && mindex == 1 &&
-                 oid >= kSenderMonitorOidBase && oid < kSenderMonitorOidBase + 64) {
-        // NcSenderMonitor.GetTransmissionErrorCounters — same rationale as
-        // the receiver-side counters above.
-        std::shared_lock lock(resources_mutex_);
-        if (senders_.count(static_cast<uint8_t>(oid - kSenderMonitorOidBase))) {
-          status = 200;
-          error_message.clear();
-          value_json = "[]";
-        } else {
-          status = 404;
-          error_message = "Unknown oid";
+          status = 405;
+          error_message = "PropertyReadOnly";
         }
       }
 

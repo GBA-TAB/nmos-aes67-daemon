@@ -436,6 +436,10 @@ bool NmosManager::init() {
     auto [unused_ip, ip_str] = get_interface_ip(config_->get_interface_name(1));
     sec_interface_ip_str_ = ip_str;
     BOOST_LOG_TRIVIAL(info) << "NmosManager:: secondary interface IP = " << ip_str;
+
+    auto [unused_mac, mac_str] = get_interface_mac(config_->get_interface_name(1));
+    sec_interface_mac_str_ = mac_str;
+    BOOST_LOG_TRIVIAL(info) << "NmosManager:: secondary interface MAC = " << mac_str;
   }
 
   BOOST_LOG_TRIVIAL(info) << "NmosManager:: starting async server thread";
@@ -546,26 +550,19 @@ std::string NmosManager::build_node_json() const {
      << "\n  }]"
      << ",\n  \"interfaces\": [";
   {
-    // One entry per configured leg, matching what interface_bindings on
-    // Sender/Receiver actually reference (config_->get_interface_name(idx),
-    // the correctly-split per-leg name) — not the raw, comma-joined
-    // interface_name_ the no-arg overload returns. Each leg's own MAC is
-    // looked up directly (same call session_manager.cpp already makes for
-    // the secondary leg's RTP stream) since config_ only caches the primary
-    // interface's MAC in mac_addr_/mac_str_.
-    const uint8_t leg_count = is_dual_leg() ? 2 : 1;
-    for (uint8_t idx = 0; idx < leg_count; ++idx) {
-      std::string name = config_->get_interface_name(idx);
-      std::string mac_str =
-          idx == 0 ? config_->get_mac_addr_str()
-                   : get_interface_mac(name).second;
-      std::string dash_mac = colon_to_dash_mac(mac_str);
-      if (idx != 0) ss << ",";
-      ss << "{"
-         << "\n    \"name\": \"" << name << "\","
-         << "\n    \"port_id\": \"" << dash_mac << "\","
-         << "\n    \"chassis_id\": \"" << dash_mac << "\""
-         << "\n  }";
+    // One entry per actually-configured physical interface (SMPTE 2022-7
+    // Red/Blue when a secondary is configured) — config_->get_interface_name()
+    // with no index is the raw comma-joined string and was wrongly used here
+    // directly as a single interface's "name".
+    std::string mac0 = colon_to_dash_mac(config_->get_mac_addr_str());
+    ss << "{\"name\": \"" << config_->get_interface_name(0) << "\""
+       << ", \"port_id\": \"" << mac0 << "\""
+       << ", \"chassis_id\": \"" << mac0 << "\"}";
+    if (!config_->get_interface_name(1).empty()) {
+      std::string mac1 = colon_to_dash_mac(sec_interface_mac_str_);
+      ss << ", {\"name\": \"" << config_->get_interface_name(1) << "\""
+         << ", \"port_id\": \"" << mac1 << "\""
+         << ", \"chassis_id\": \"" << mac1 << "\"}";
     }
   }
   ss << "]"
@@ -2898,9 +2895,21 @@ bool NmosManager::registration_worker() {
     // Process any scheduled IS-05 activations that have come due
     process_scheduled_activations();
 
+    // Same for IS-08 (see nmos_is08.cpp — a separate pending-activations map,
+    // same "check every wake of this loop" approach as above rather than a
+    // dedicated thread)
+    if (config_->get_is08_enabled()) is08_process_scheduled_activations();
+
     // Heartbeat when due
     if (running_ && clock::now() >= next_hb) {
       heartbeat();
+      // A heartbeat carries no body, so without this the registry's copy of
+      // the Node resource (clock lock state, GMID, active leg...) would stay
+      // frozen at whatever it looked like the moment full_registration()
+      // last ran, even though GET /x-nmos/node/v1.3/self (queried directly
+      // against this daemon) keeps reporting the real, current state.
+      node_json_ = build_node_json();
+      register_resource("node", node_json_);
       next_hb = clock::now() + std::chrono::seconds(5);
     }
   }

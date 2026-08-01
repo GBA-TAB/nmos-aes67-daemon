@@ -112,6 +112,12 @@ class PTPStatus extends Component {
     gmid: PropTypes.string.isRequired,
     jitter: PropTypes.number.isRequired,
     jitterHistory: PropTypes.array.isRequired,
+    activeLeg: PropTypes.number.isRequired,
+    leg0Status: PropTypes.string.isRequired,
+    leg1Status: PropTypes.string.isRequired,
+    leg0Gmid: PropTypes.string.isRequired,
+    leg1Gmid: PropTypes.string.isRequired,
+    legsAligned: PropTypes.bool.isRequired,
   };
 
   constructor(props) {
@@ -207,6 +213,7 @@ class PTPStatus extends Component {
     const locked  = this.props.status === 'locked';
     const locking = this.props.status === 'locking';
     const stColor = locked ? '#16a34a' : locking ? '#b45309' : '#b91c1c';
+    const legColor = s => s === 'locked' ? '#16a34a' : s === 'locking' ? '#b45309' : '#b91c1c';
     return (
      <div>
       <h3>Status</h3>
@@ -230,7 +237,32 @@ class PTPStatus extends Component {
           <th align="left"> <label>Jitter (ns)</label> </th>
           <th align="left"> <input value={this.props.jitter} disabled/> </th>
         </tr>
+        <tr>
+          <th align="left"> <label>Active leg</label> </th>
+          <th align="left">
+            <input value={this.props.activeLeg === 0 ? 'Red (primary)' : 'Blue (secondary)'} disabled/>
+          </th>
+        </tr>
+        <tr>
+          <th align="left"> <label>Red leg</label> </th>
+          <th align="left">
+            <input value={this.props.leg0Status} disabled style={{color: legColor(this.props.leg0Status), fontWeight: 600, width: '6em'}}/>
+            <input value={this.props.leg0Gmid} disabled style={{fontFamily: 'monospace', width: '16em', marginLeft: '6px'}}/>
+          </th>
+        </tr>
+        <tr>
+          <th align="left"> <label>Blue leg</label> </th>
+          <th align="left">
+            <input value={this.props.leg1Status} disabled style={{color: legColor(this.props.leg1Status), fontWeight: 600, width: '6em'}}/>
+            <input value={this.props.leg1Gmid} disabled style={{fontFamily: 'monospace', width: '16em', marginLeft: '6px'}}/>
+          </th>
+        </tr>
       </tbody></table>
+      {!this.props.legsAligned && (
+        <p style={{color: '#b91c1c', fontWeight: 600, marginTop: '8px'}}>
+          ⚠ Red and Blue are locked to different grandmasters - seamless 2022-7 switching cannot be trusted until they match.
+        </p>
+      )}
       {this.props.jitterHistory.length > 0 && (
         <div style={{marginTop: '8px'}}>
           <small style={{color: '#888'}}>Jitter history · {this.props.jitterHistory.length} samples</small>
@@ -254,6 +286,12 @@ class PTP extends Component {
       status: '',
       gmid: '',
       jitter: 0,
+      activeLeg: 0,
+      leg0Status: 'unlocked',
+      leg1Status: 'unlocked',
+      leg0Gmid: '',
+      leg1Gmid: '',
+      legsAligned: true,
       jitterHistory: [],
       isConfigLoading: false,
       isStatusLoading: false,
@@ -271,6 +309,12 @@ class PTP extends Component {
             status: data.status,
             gmid: data.gmid,
             jitter,
+            activeLeg: parseInt(data.active_leg, 10) || 0,
+            leg0Status: data.leg0_status,
+            leg1Status: data.leg1_status,
+            leg0Gmid: data.leg0_gmid,
+            leg1Gmid: data.leg1_gmid,
+            legsAligned: data.legs_aligned,
             jitterHistory: [...prev.jitterHistory.slice(-59), jitter],
             isStatusLoading: false
           }));
@@ -309,7 +353,11 @@ class PTP extends Component {
         <br/>
         { (this.state.isStatusLoading && this.state.jitterHistory.length === 0) ? <Loader/> :
            <PTPStatus status={this.state.status} gmid={this.state.gmid}
-             jitter={this.state.jitter} jitterHistory={this.state.jitterHistory}/> }
+             jitter={this.state.jitter} jitterHistory={this.state.jitterHistory}
+             activeLeg={this.state.activeLeg}
+             leg0Status={this.state.leg0Status} leg1Status={this.state.leg1Status}
+             leg0Gmid={this.state.leg0Gmid} leg1Gmid={this.state.leg1Gmid}
+             legsAligned={this.state.legsAligned}/> }
       </div>
     )
   }
