@@ -499,6 +499,8 @@ bool NmosManager::ncp_class_descriptor_json(const std::vector<int>& class_id,
     properties.push_back(json_prop_descriptor(4, 12, "streamStatusMessage", "NcString", true, true, false));
     properties.push_back(json_prop_descriptor(4, 13, "streamStatusTransitionCounter", "NcUint32", true, false, false));
     properties.push_back(json_prop_descriptor(4, 14, "autoResetCountersAndMessages", "NcBoolean", false, false, false));
+    methods.push_back(json_method_descriptor(4, 1, "GetLostPacketCounters"));
+    methods.push_back(json_method_descriptor(4, 2, "GetLatePacketCounters"));
   } else if (class_id == std::vector<int>{1, 2, 2, 2}) {
     name = "NcSenderMonitor";
     properties.push_back(json_prop_descriptor(1, 7, "touchpoints", "NcTouchpoint", true, true, true));
@@ -518,6 +520,7 @@ bool NmosManager::ncp_class_descriptor_json(const std::vector<int>& class_id,
     properties.push_back(json_prop_descriptor(4, 12, "essenceStatusMessage", "NcString", true, true, false));
     properties.push_back(json_prop_descriptor(4, 13, "essenceStatusTransitionCounter", "NcUint32", true, false, false));
     properties.push_back(json_prop_descriptor(4, 14, "autoResetCountersAndMessages", "NcBoolean", false, false, false));
+    methods.push_back(json_method_descriptor(4, 1, "GetTransmissionErrorCounters"));
   } else {
     return false;
   }
@@ -650,6 +653,36 @@ void NmosManager::handle_is12_message(const std::string& msg,
         } else {
           status = 405;
           error_message = "PropertyReadOnly";
+        }
+      } else if (mlevel == 4 && (mindex == 1 || mindex == 2) &&
+                 oid >= kReceiverMonitorOidBase && oid < kReceiverMonitorOidBase + 64) {
+        // NcReceiverMonitor.GetLostPacketCounters (4,1) / GetLatePacketCounters
+        // (4,2). The driver only exposes boolean RTP error flags (see
+        // SinkStreamStatus), not per-packet loss/lateness counts, so there is
+        // no real data to report. Per BCP-008-01, devices without that
+        // capability "MUST implement the method but return an empty
+        // collection" — this is that conformant empty response.
+        std::shared_lock lock(resources_mutex_);
+        if (receivers_.count(static_cast<uint8_t>(oid - kReceiverMonitorOidBase))) {
+          status = 200;
+          error_message.clear();
+          value_json = "[]";
+        } else {
+          status = 404;
+          error_message = "Unknown oid";
+        }
+      } else if (mlevel == 4 && mindex == 1 &&
+                 oid >= kSenderMonitorOidBase && oid < kSenderMonitorOidBase + 64) {
+        // NcSenderMonitor.GetTransmissionErrorCounters — same rationale as
+        // the receiver-side counters above.
+        std::shared_lock lock(resources_mutex_);
+        if (senders_.count(static_cast<uint8_t>(oid - kSenderMonitorOidBase))) {
+          status = 200;
+          error_message.clear();
+          value_json = "[]";
+        } else {
+          status = 404;
+          error_message = "Unknown oid";
         }
       }
 
