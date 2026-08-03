@@ -51,6 +51,7 @@ class SinkEntry extends Component {
     id: PropTypes.number.isRequired,
     name: PropTypes.string.isRequired,
     channels: PropTypes.number.isRequired,
+    subscription: PropTypes.string.isRequired,
     onEditClick: PropTypes.func.isRequired,
     onTrashClick: PropTypes.func.isRequired
   };
@@ -114,6 +115,7 @@ class SinkEntry extends Component {
         <td align='center'> <label>{this.state.errors}</label> </td>
         <td align='center'> <label>{this.state.min_time}</label> </td>
         <td align='center'> {rxLegBadge(this.state.status)} </td>
+        <td> <label>{this.props.subscription}</label> </td>
         <td> <span className='pointer-area' onClick={this.handleEditClick}> <img width='20' height='20' src='/edit.png' alt=''/> </span> </td>
         <td> <span className='pointer-area' onClick={this.handleTrashClick}> <img width='20' height='20' src='/trash.png' alt=''/> </span> </td>
       </tr>
@@ -149,6 +151,7 @@ class SinkList extends Component {
               <th>Errors</th>
               <th>Min. arrival time</th>
               <th>Leg</th>
+              <th>NMOS Subscription</th>
             </tr>
           : <tr>
              <th>No sinks configured</th>
@@ -172,6 +175,7 @@ class Sinks extends Component {
     this.state = {
       sinks: [],
       sink: {},
+      subscriptions: {},  // daemon sink id -> friendly IS-05 subscription string
       isLoading: false,
       isEdit: false,
       editIsOpen: false,
@@ -195,6 +199,31 @@ class Sinks extends Component {
       .then(
         data => this.setState( { sinks: data.sinks, isLoading: false }))
       .catch(err => this.setState( { isLoading: false } ));
+
+    // IS-05 subscription state lives on the IS-04 Receiver, not /api/sinks -
+    // correlate back to a daemon sink id via the vendor tag build_receiver_json
+    // sets (see nmos_manager.cpp), then resolve sender_id to a friendly name
+    // when it's one of this daemon's own Senders.
+    Promise.all([
+      RestAPI.getNmosReceivers().then(r => r.json()).catch(() => []),
+      RestAPI.getNmosSenders().then(r => r.json()).catch(() => []),
+    ]).then(([receivers, senders]) => {
+      const senderLabels = {};
+      senders.forEach(s => { senderLabels[s.id] = s.label; });
+      const subscriptions = {};
+      receivers.forEach(r => {
+        const tag = r.tags && r.tags['aes67-daemon:sink-id'];
+        if (!tag || !tag.length) return;
+        const sinkId = Number(tag[0]);
+        const senderId = r.subscription && r.subscription.sender_id;
+        if (r.subscription && r.subscription.active && senderId) {
+          subscriptions[sinkId] = senderLabels[senderId] || ('sender ' + senderId);
+        } else {
+          subscriptions[sinkId] = 'static SDP (not IS-05 subscribed)';
+        }
+      });
+      this.setState({subscriptions});
+    }).catch(() => {});
   }
 
   componentDidMount() {
@@ -260,6 +289,7 @@ class Sinks extends Component {
         id={sink.id}
         channels={sink.map.length}
         name={sink.name}
+        subscription={this.state.subscriptions[sink.id] || 'n/a'}
         onEditClick={this.onEditClick}
         onTrashClick={this.onTrashClick}
       />

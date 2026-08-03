@@ -113,43 +113,69 @@ class ChannelMap extends Component {
     const outputsP = RestAPI.getChannelMapOutputs().then(r => r.json()).catch(() => []);
     const sinksP = RestAPI.getSinks().then(r => r.json()).catch(() => ({sinks: []}));
     const sourcesP = RestAPI.getSources().then(r => r.json()).catch(() => ({sources: []}));
+    // Vendor-tagged NMOS Receivers/Sources (see build_receiver_json/
+    // build_source_json) - the stable correlation this fetch needs. Matching
+    // on the "Stream Rx: <name>"/"Stream Tx: <name>" label text instead (as
+    // this used to) races against renames: a Sink/Source name change made
+    // just before switching to this tab isn't guaranteed to have propagated
+    // to the IS-08 Input/Output's label by the time this fetch runs, so the
+    // string match silently misses and that row drops off the grid.
+    const receiversP = RestAPI.getNmosReceivers().then(r => r.json()).catch(() => []);
+    const nmosSourcesP = RestAPI.getNmosSources().then(r => r.json()).catch(() => []);
 
-    Promise.all([inputsP, outputsP, sinksP, sourcesP]).then(
-        ([inputEntries, outputEntries, sinksData, sourcesData]) => {
+    Promise.all([inputsP, outputsP, sinksP, sourcesP, receiversP, nmosSourcesP]).then(
+        ([inputEntries, outputEntries, sinksData, sourcesData, receiversData, nmosSourcesData]) => {
       const inputIds = inputEntries.map(stripId);
       const outputIds = outputEntries.map(stripId);
-      const sinksByName = {};
       const sinkStreamNames = {};  // sink id -> connected stream's real SDP session name
       const sinkMaps = {};         // sink id -> its real, raw map[] (ALSA playback channel per Rx channel)
       (sinksData.sinks || []).forEach(s => {
-        sinksByName[s.name] = s.id;
         sinkMaps[s.id] = s.map;
         const m = (s.sdp || '').match(/(?:^|\r?\n)s=([^\r\n]+)/);
         if (m) sinkStreamNames[s.id] = m[1];
       });
-      const sourcesByName = {};
       const sourceMaps = {};       // source id -> its real, raw map[] (ALSA capture channel per Tx channel)
-      (sourcesData.sources || []).forEach(s => {
-        sourcesByName[s.name] = s.id;
-        sourceMaps[s.id] = s.map;
+      (sourcesData.sources || []).forEach(s => { sourceMaps[s.id] = s.map; });
+
+      // Receiver NMOS id -> daemon sink id, via the aes67-daemon:sink-id tag.
+      const receiverSinkId = {};
+      receiversData.forEach(r => {
+        const tag = r.tags && r.tags['aes67-daemon:sink-id'];
+        if (tag && tag.length) receiverSinkId[r.id] = Number(tag[0]);
+      });
+      // Source NMOS id -> daemon source id, via aes67-daemon:source-id.
+      const nmosSourceToSourceId = {};
+      nmosSourcesData.forEach(s => {
+        const tag = s.tags && s.tags['aes67-daemon:source-id'];
+        if (tag && tag.length) nmosSourceToSourceId[s.id] = Number(tag[0]);
       });
 
       const inputInfoP = Promise.all(inputIds.map(id =>
         Promise.all([
           RestAPI.getChannelMapInputProperties(id).then(r => r.json()).catch(() => ({name: id})),
           RestAPI.getChannelMapInputChannels(id).then(r => r.json()).catch(() => [{}]),
-        ]).then(([props, channels]) => ({id, label: props.name, channelLabels: channels.map(c => c.label)}))
+          // Input.parent - IS-08's own stable pointer to the backing Receiver.
+          RestAPI.getChannelMapInputParent(id).then(r => r.json()).catch(() => ({id: null, type: null})),
+        ]).then(([props, channels, parent]) => ({
+          id,
+          label: props.name,
+          channelLabels: channels.map(c => c.label),
+          sinkId: parent.type === 'receiver' ? receiverSinkId[parent.id] : undefined,
+        }))
       ));
 
       const outputInfoP = Promise.all(outputIds.map(id =>
         Promise.all([
           RestAPI.getChannelMapOutputProperties(id).then(r => r.json()).catch(() => ({name: id})),
           RestAPI.getChannelMapOutputChannels(id).then(r => r.json()).catch(() => [{}]),
-        ]).then(([props, channels]) => ({
+          // Output.source_id - IS-08's own stable pointer to the backing Source.
+          RestAPI.getChannelMapOutputSourceId(id).then(r => r.json()).catch(() => null),
+        ]).then(([props, channels, sourceNmosId]) => ({
           id,
           label: props.name,
           channelCount: channels.length || 1,
           channelLabels: channels.map(c => c.label),
+          sourceId: sourceNmosId ? nmosSourceToSourceId[sourceNmosId] : undefined,
         }))
       ));
 
@@ -162,10 +188,9 @@ class ChannelMap extends Component {
         // a raw sink.map[] scan below turn "(sinkId, channel k)" straight
         // into the dropdown value for that exact real audio channel.
         const sinkChannelValue = {};
-        const streamRxPrefix = 'Stream Rx: ';
         const captureRe = /^ALSA Capture (\d+)$/;
 
-        inputInfos.forEach(({id, label, channelLabels}) => {
+        inputInfos.forEach(({id, label, channelLabels, sinkId}) => {
           const captureMatch = label.match(captureRe);
           if (captureMatch) {
             // Recorded only as a capture-source identity for column 4 - an
@@ -175,8 +200,6 @@ class ChannelMap extends Component {
             return;
           }
 
-          const sinkName = label.startsWith(streamRxPrefix) ? label.slice(streamRxPrefix.length) : label;
-          const sinkId = sinksByName[sinkName];
           if (sinkId !== undefined) inputSinkIds[id] = sinkId;
 
           if (sinkId !== undefined && channelLabels.length > 1) {
@@ -212,7 +235,6 @@ class ChannelMap extends Component {
         // same idea as sinkChannelValue, for a raw source.map[] scan.
         const sourceChannelValue = {};
         const playbackRe = /^ALSA Playback (\d+)$/;
-        const streamTxPrefix = 'Stream Tx: ';
 
         outputInfos.forEach(o => {
           const playbackMatch = o.label.match(playbackRe);
@@ -222,8 +244,7 @@ class ChannelMap extends Component {
           }
           // Everything else is a Sender's Tx channel group - flatten into
           // one selectable entry per real channel, shared across every row.
-          const sourceName = o.label.startsWith(streamTxPrefix) ? o.label.slice(streamTxPrefix.length) : o.label;
-          const sourceId = sourcesByName[sourceName];
+          const sourceId = o.sourceId;
           const map = sourceId !== undefined ? (sourceMaps[sourceId] || []) : [];
           const values = o.channelLabels.map((chLabel, i) => {
             const value = o.id + '::' + i;

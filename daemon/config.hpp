@@ -83,7 +83,14 @@ class Config {
   bool get_nmos_enabled() const { return nmos_enabled_; }
   const std::string& get_nmos_registry_address() const { return nmos_registry_address_; }
   uint16_t get_nmos_registry_port() const { return nmos_registry_port_; }
+  uint16_t get_nmos_registry_query_port() const { return nmos_registry_query_port_; }
   uint16_t get_nmos_node_port() const { return nmos_node_port_; }
+  // Local interface (e.g. "eno2") to bind outbound registry/control-plane
+  // HTTP requests to - empty means let the OS routing table pick, same as
+  // before this option existed. Independent of interface_name_ (the
+  // AES67 media leg(s)); a deployment can route NMOS control traffic over
+  // a different NIC (e.g. a management interface) than RTP.
+  const std::string& get_nmos_control_interface() const { return nmos_control_interface_; }
   const std::string& get_nmos_label() const { return nmos_label_; }
   bool get_nmos_registry_auto_discover() const { return nmos_registry_auto_discover_; }
   bool get_nmos_mdns_enabled() const { return nmos_mdns_enabled_; }
@@ -191,7 +198,9 @@ class Config {
   void set_nmos_enabled(bool v) { nmos_enabled_ = v; }
   void set_nmos_registry_address(std::string_view v) { nmos_registry_address_ = v; }
   void set_nmos_registry_port(uint16_t v) { nmos_registry_port_ = v; }
+  void set_nmos_registry_query_port(uint16_t v) { nmos_registry_query_port_ = v; }
   void set_nmos_node_port(uint16_t v) { nmos_node_port_ = v; }
+  void set_nmos_control_interface(std::string_view v) { nmos_control_interface_ = v; }
   void set_nmos_label(std::string_view v) { nmos_label_ = v; }
   void set_nmos_registry_auto_discover(bool v) { nmos_registry_auto_discover_ = v; }
   void set_nmos_mdns_enabled(bool v) { nmos_mdns_enabled_ = v; }
@@ -284,7 +293,12 @@ class Config {
   bool nmos_enabled_{false};
   std::string nmos_registry_address_;
   uint16_t nmos_registry_port_{8010};
+  // Some registries (e.g. nmos-cpp-registry) serve the Registration and
+  // Query APIs on different ports. Defaults to the same value as
+  // nmos_registry_port_ so single-port registries keep working unconfigured.
+  uint16_t nmos_registry_query_port_{8010};
   uint16_t nmos_node_port_{3212};
+  std::string nmos_control_interface_;
   std::string nmos_label_{"AES67 Daemon"};
   bool nmos_registry_auto_discover_{true};
   bool nmos_mdns_enabled_{true};

@@ -223,6 +223,20 @@ uint16_t NmosManager::effective_registry_port() const {
   return config_->get_nmos_registry_port();
 }
 
+uint16_t NmosManager::effective_registry_query_port() const {
+  if (config_->get_nmos_registry_auto_discover()) {
+    // Autodiscovery only browses _nmos-register._tcp today, so the best we
+    // can do here is assume the discovered registry's Registration port also
+    // serves Query - true for combined-port registries, wrong for split ones
+    // like nmos-cpp-registry. Configure nmos_registry_query_port explicitly
+    // and disable autodiscovery if that's not the case.
+    std::lock_guard<std::mutex> lock(registry_disc_mutex_);
+    if (!discovered_registry_address_.empty())
+      return discovered_registry_port_;
+  }
+  return config_->get_nmos_registry_query_port();
+}
+
 #ifdef _USE_AVAHI_
 void NmosManager::registry_client_callback(AvahiClient* client,
                                             AvahiClientState state,
@@ -632,7 +646,11 @@ std::string NmosManager::build_source_json(const StreamSource& src,
      << ",\n  \"version\": \"" << make_version() << "\""
      << ",\n  \"label\": \"" << make_nmos_label(src.map) << "\""
      << ",\n  \"description\": \"\""
-     << ",\n  \"tags\": {}"
+     // Vendor tag (mirrors the Receiver's aes67-daemon:sink-id, see
+     // build_receiver_json) - lets the webui correlate this Source back to
+     // its daemon Source id via IS-08's Output.source_id, without matching
+     // on the mutable "Stream Tx: <name>" label string.
+     << ",\n  \"tags\": {\"aes67-daemon:source-id\": [\"" << +src.id << "\"]}"
      << ",\n  \"device_id\": \"" << device_id_ << "\""
      << ",\n  \"parents\": []"
      << ",\n  \"clock_name\": \"clk0\""
@@ -718,7 +736,11 @@ std::string NmosManager::build_receiver_json(const StreamSink& sink,
      << ",\n  \"version\": \"" << make_version() << "\""
      << ",\n  \"label\": \"" << make_nmos_label(sink.map) << "\""
      << ",\n  \"description\": \"\""
-     << ",\n  \"tags\": {}"
+     // Vendor tag (IS-04 explicitly allows arbitrary tags) carrying this
+     // daemon's own numeric Sink id - lets the webui correlate a Receiver
+     // back to the Sink it's reporting on without needing to replicate
+     // make_resource_uuid()'s hash or rely on array-position guessing.
+     << ",\n  \"tags\": {\"aes67-daemon:sink-id\": [\"" << +sink.id << "\"]}"
      << ",\n  \"device_id\": \"" << device_id_ << "\""
      << ",\n  \"transport\": \"urn:x-nmos:transport:rtp.mcast\""
      << ",\n  \"interface_bindings\": [\"" << config_->get_interface_name(0) << "\"";
@@ -1486,11 +1508,13 @@ void NmosManager::fetch_remote_sender_sdp(const std::string& sender_uuid,
 
   // Step 1: query registry query API for sender
   const std::string reg_host = effective_registry_address();
-  const uint16_t    reg_port = effective_registry_port();
+  const uint16_t    reg_port = effective_registry_query_port();
   std::string manifest_href;
 
   {
     httplib::Client cli(reg_host.c_str(), reg_port);
+    if (!config_->get_nmos_control_interface().empty())
+      cli.set_interface(config_->get_nmos_control_interface());
     cli.set_connection_timeout(3);
     cli.set_read_timeout(3);
     const std::string path = "/x-nmos/query/v1.3/senders/" + sender_uuid;
@@ -1540,6 +1564,8 @@ void NmosManager::fetch_remote_sender_sdp(const std::string& sender_uuid,
 
   auto [mh_host, mh_port, mh_path] = trim_http(manifest_href);
   httplib::Client mcli(mh_host.c_str(), mh_port);
+  if (!config_->get_nmos_control_interface().empty())
+    mcli.set_interface(config_->get_nmos_control_interface());
   mcli.set_connection_timeout(3);
   mcli.set_read_timeout(3);
   auto mres = mcli.Get(mh_path.c_str());
@@ -1618,8 +1644,24 @@ void NmosManager::apply_receiver_activation(uint8_t daemon_id) {
       // Remote sender: query registry for manifest_href, then fetch SDP
       fetch_remote_sender_sdp(sender_id, sdp);
     }
-    if (!sdp.empty())
+    if (!sdp.empty()) {
       tp = build_receiver_tp_from_sdp(sdp);
+    } else {
+      // Connecting to a sender always requires its SDP - if we couldn't get
+      // one (registry unreachable, sender unpublished, wrong query port,
+      // etc), bail out here, before touching active state. Otherwise IS-05
+      // /active and the registered IS-04 subscription would both report a
+      // successful connection while the real driver-level stream (multicast
+      // join / source-filter) is never actually programmed - the receiver
+      // looks "connected" everywhere except for the one thing that matters,
+      // whether audio actually arrives. Leaving active state untouched keeps
+      // whatever was genuinely connected before this activation attempt.
+      BOOST_LOG_TRIVIAL(error)
+          << "NmosManager:: receiver " << +daemon_id
+          << " activation failed: could not resolve SDP for sender "
+          << sender_id;
+      return;
+    }
   }
 
   // Reject non-audio SDPs before touching active state or calling add_sink.
@@ -2557,6 +2599,8 @@ bool NmosManager::register_resource(const std::string& type,
                                      const std::string& data_json) {
   httplib::Client cli(effective_registry_address(),
                       effective_registry_port());
+  if (!config_->get_nmos_control_interface().empty())
+    cli.set_interface(config_->get_nmos_control_interface());
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(10, 0);
 
@@ -2580,6 +2624,8 @@ bool NmosManager::unregister_resource(const std::string& type,
                                        const std::string& id) {
   httplib::Client cli(effective_registry_address(),
                       effective_registry_port());
+  if (!config_->get_nmos_control_interface().empty())
+    cli.set_interface(config_->get_nmos_control_interface());
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(10, 0);
 
@@ -2601,6 +2647,8 @@ bool NmosManager::unregister_resource(const std::string& type,
 bool NmosManager::heartbeat() {
   httplib::Client cli(effective_registry_address(),
                       effective_registry_port());
+  if (!config_->get_nmos_control_interface().empty())
+    cli.set_interface(config_->get_nmos_control_interface());
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(10, 0);
 
@@ -2723,10 +2771,20 @@ bool NmosManager::register_sink_local(uint8_t id) {
   rr.active_master_enable = connected;
   rr.active_tp            = tps;
   // Restore IS-05 active sender preserved through a remove+add cycle
+  // (apply_receiver_activation pre-populates this before calling add_sink).
+  // Otherwise this sink update came from somewhere that isn't a real IS-05
+  // subscription (direct PUT /api/sink/{id}, daemon.conf load, status.json
+  // restore) - receivers_[id] above returns the *existing* entry unchanged
+  // if one is already there, so without this else branch a stale
+  // active_sender_id from a real subscription made before that direct
+  // change would keep being reported even though it no longer reflects
+  // what this sink is actually configured with.
   auto pres = preserved_active_sender_ids_.find(id);
   if (pres != preserved_active_sender_ids_.end()) {
     rr.active_sender_id  = pres->second;
     preserved_active_sender_ids_.erase(pres);
+  } else {
+    rr.active_sender_id.clear();
   }
   rebuild_device_json_locked();
   return true;

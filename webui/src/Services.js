@@ -34,6 +34,7 @@ const sink = '/sink';
 const status = '/status';
 const browseSources = '/browse/sources/all';
 const channelMapping = '/x-nmos/channelmapping/v1.0';
+const nodeApi = '/x-nmos/node/v1.3';
 
 const defaultParams = {
   credentials: 'same-origin',
@@ -124,6 +125,27 @@ export default class RestAPI {
     );
   }
 
+  static getNmosReceivers() {
+    return this.doFetchRaw(nodeApi + '/receivers/').catch(err => {
+      toast.error('NMOS receivers get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getNmosSenders() {
+    return this.doFetchRaw(nodeApi + '/senders/').catch(err => {
+      toast.error('NMOS senders get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getNmosSources() {
+    return this.doFetchRaw(nodeApi + '/sources/').catch(err => {
+      toast.error('NMOS sources get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
   static getVersion() {
     return this.doFetch(version).catch(err => {
       toast.error('Config get failed: ' + err.message);
@@ -138,7 +160,7 @@ export default class RestAPI {
     });
   }
 
-  static setConfig(log_severity, syslog_proto, syslog_server, rtp_mcast_base, rtp_mcast_base_sec, rtp_port, rtp_port_sec, rtsp_port, playout_delay, tic_frame_size_at_1fs, sample_rate, max_tic_frame_size, sap_mcast_addr, sap_interval, mdns_enabled, custom_node_id, auto_sinks_update, streamer_enabled, streamer_channels, streamer_files_num, streamer_file_duration, streamer_player_buffer_files_num, nmos_enabled, nmos_registry_autodiscovery, nmos_registry_address, nmos_registry_port, nmos_node_port, nmos_mdns_enabled) {
+  static setConfig(log_severity, syslog_proto, syslog_server, rtp_mcast_base, rtp_mcast_base_sec, rtp_port, rtp_port_sec, rtsp_port, playout_delay, tic_frame_size_at_1fs, sample_rate, max_tic_frame_size, sap_mcast_addr, sap_interval, mdns_enabled, custom_node_id, auto_sinks_update, streamer_enabled, streamer_channels, streamer_files_num, streamer_file_duration, streamer_player_buffer_files_num, nmos_enabled, nmos_registry_autodiscovery, nmos_registry_address, nmos_registry_port, nmos_registry_query_port, nmos_control_interface, nmos_node_port, nmos_mdns_enabled) {
     return this.doFetch(config, {
       body: JSON.stringify({
         log_severity: parseInt(log_severity, 10),
@@ -167,6 +189,8 @@ export default class RestAPI {
         nmos_registry_autodiscovery: nmos_registry_autodiscovery,
         nmos_registry_address: nmos_registry_address,
         nmos_registry_port: parseInt(nmos_registry_port, 10),
+        nmos_registry_query_port: parseInt(nmos_registry_query_port, 10),
+        nmos_control_interface: nmos_control_interface,
         nmos_node_port: parseInt(nmos_node_port, 10),
         nmos_mdns_enabled: nmos_mdns_enabled,
       }),
@@ -372,6 +396,13 @@ export default class RestAPI {
   static getChannelMapOutputProperties(id) {
     return this.doFetchRaw(channelMapping + '/outputs/' + id + '/properties/').catch(err => {
       toast.error('Channel map output properties get failed: ' + err.message)
+      return Promise.reject(Error(err.message));
+    });
+  }
+
+  static getChannelMapOutputSourceId(id) {
+    return this.doFetchRaw(channelMapping + '/outputs/' + id + '/sourceid/').catch(err => {
+      toast.error('Channel map output source id get failed: ' + err.message)
       return Promise.reject(Error(err.message));
     });
   }

@@ -467,6 +467,10 @@ class NmosManager {
   // ---- DNS-SD registry discovery ----
   std::string effective_registry_address() const;
   uint16_t    effective_registry_port() const;
+  // Query API port - may differ from the Registration API port
+  // (effective_registry_port()) on registries that split the two, e.g.
+  // nmos-cpp-registry. Only used for fetching remote senders' SDPs.
+  uint16_t    effective_registry_query_port() const;
 
 #ifdef _USE_AVAHI_
   void start_registry_discovery();

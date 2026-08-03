@@ -83,6 +83,9 @@ class Config extends Component {
       nmosRegistryAddressErr: false,
       nmosRegistryPort: 8010,
       nmosRegistryPortErr: false,
+      nmosRegistryQueryPort: 8010,
+      nmosRegistryQueryPortErr: false,
+      nmosControlInterface: '',
       nmosNodePort: 3212,
       nmosNodePortErr: false,
       nmosMdnsEnabled: true
@@ -143,6 +146,8 @@ class Config extends Component {
             nmosRegistryAutoDiscover: data.nmos_registry_autodiscovery,
             nmosRegistryAddress: data.nmos_registry_address,
             nmosRegistryPort: data.nmos_registry_port,
+            nmosRegistryQueryPort: data.nmos_registry_query_port !== undefined ? data.nmos_registry_query_port : data.nmos_registry_port,
+            nmosControlInterface: data.nmos_control_interface,
             nmosNodePort: data.nmos_node_port,
             nmosMdnsEnabled: data.nmos_mdns_enabled !== undefined ? data.nmos_mdns_enabled : true,
             isConfigLoading: false
@@ -174,6 +179,7 @@ class Config extends Component {
       (!this.state.customNodeIdErr || this.state.customNodeId  === '') &&
       !this.state.nmosRegistryAddressErr &&
       !this.state.nmosRegistryPortErr &&
+      !this.state.nmosRegistryQueryPortErr &&
       !this.state.nmosNodePortErr &&
       !this.state.isVersionLoading &&
       !this.state.isConfigLoading;
@@ -208,6 +214,8 @@ class Config extends Component {
       this.state.nmosRegistryAutoDiscover,
       this.state.nmosRegistryAddress,
       this.state.nmosRegistryPort,
+      this.state.nmosRegistryQueryPort,
+      this.state.nmosControlInterface,
       this.state.nmosNodePort,
       this.state.nmosMdnsEnabled)
     .then(response => toast.success('Applying new configuration ...'));
@@ -399,6 +407,14 @@ class Config extends Component {
           <tr>
             <th align="left"> <label>Registry port</label> </th>
             <th align="left"> <input type='number' min='1' max='65535' className='input-number' value={this.state.nmosRegistryPort} onChange={e => this.setState({nmosRegistryPort: e.target.value, nmosRegistryPortErr: !e.currentTarget.checkValidity()})} disabled={!this.state.nmosEnabled ? true : undefined} required/> </th>
+          </tr>
+          <tr>
+            <th align="left"> <label>Registry query API port</label> </th>
+            <th align="left"> <input type='number' min='1' max='65535' className='input-number' value={this.state.nmosRegistryQueryPort} onChange={e => this.setState({nmosRegistryQueryPort: e.target.value, nmosRegistryQueryPortErr: !e.currentTarget.checkValidity()})} disabled={!this.state.nmosEnabled ? true : undefined} required/> </th>
+          </tr>
+          <tr>
+            <th align="left"> <label>Control interface (empty = OS default route)</label> </th>
+            <th align="left"> <input type="text" minLength="0" maxLength="32" size="16" value={this.state.nmosControlInterface} onChange={e => this.setState({nmosControlInterface: e.target.value})} disabled={!this.state.nmosEnabled ? true : undefined}/> </th>
           </tr>
           <tr>
             <th align="left"> <label>Node API port</label> </th>
