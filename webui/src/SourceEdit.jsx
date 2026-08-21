@@ -61,6 +61,9 @@ class SourceEdit extends Component {
       codec: this.props.source.codec,
       address: this.props.source.address,
       addressErr: false,
+      addressSec: this.props.source.address_sec,
+      addressSecErr: false,
+      useSecondary: this.props.source.use_secondary !== undefined ? this.props.source.use_secondary : true,
       ttl: this.props.source.ttl,
       ttlErr: false,
       payloadType: this.props.source.payload_type,
@@ -106,6 +109,8 @@ class SourceEdit extends Component {
       this.state.maxSamplesPerPacket,
       this.state.codec,
       this.state.address ? this.state.address : "",
+      this.state.addressSec ? this.state.addressSec : "",
+      this.state.useSecondary,
       this.state.ttl,
       this.state.payloadType,
       this.state.dscp,
@@ -219,7 +224,8 @@ class SourceEdit extends Component {
       !this.state.ttlErr &&
       !this.state.channelsErr &&
       !this.state.payloadTypeErr &&
-      !this.state.addressErr;
+      !this.state.addressErr &&
+      !this.state.addressSecErr;
   }
 
   render()  {
@@ -268,8 +274,16 @@ class SourceEdit extends Component {
               </th>
             </tr>
             <tr>
-              <th align="left"> <label>RTP address</label> </th>
+              <th align="left"> <label>RTP address (Primary/Red)</label> </th>
               <th align="left"> <input type="text" minLength="7" maxLength="15" size="15" pattern="^$|^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$" value={this.state.address} onChange={e => this.setState({address: e.target.value, addressErr: !e.currentTarget.checkValidity()})} optional/> </th>
+            </tr>
+            <tr height="35">
+              <th align="left"> <label>ST 2022-7 redundancy (dual-leg)</label> </th>
+              <th align="left"> <input type="checkbox" onChange={e => this.setState({useSecondary: e.target.checked})} checked={this.state.useSecondary ? true : undefined}/> </th>
+            </tr>
+            <tr>
+              <th align="left"> <label>RTP address (Secondary/Blue)</label> </th>
+              <th align="left"> <input type="text" minLength="7" maxLength="15" size="15" pattern="^$|^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$" value={this.state.addressSec} onChange={e => this.setState({addressSec: e.target.value, addressSecErr: !e.currentTarget.checkValidity()})} disabled={!this.state.useSecondary ? true : undefined} optional/> </th>
             </tr>
             <tr>
               <th align="left"> <label>Payload Type</label> </th>

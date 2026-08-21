@@ -401,6 +401,10 @@ StreamSource SessionManager::get_source_(uint8_t id,
           info.stream[0].m_ui32MaxSamplesPerPacket,
           info.stream[0].m_cCodec,
           ip::address_v4(info.stream[0].m_ui32DestIP).to_string(),
+          info.st20227_enabled
+              ? ip::address_v4(info.stream[1].m_ui32DestIP).to_string()
+              : std::string(),
+          info.st20227_enabled,
           info.stream[0].m_byTTL,
           info.stream[0].m_byPayloadType,
           info.stream[0].m_ucDSCP,
@@ -567,7 +571,6 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
   info.stream[0].m_uiId = source.id;
   info.stream[0].m_ui32RTCPSrcIP = config_->get_ip_addr();
   info.stream[0].m_ui32SrcIP = config_->get_ip_addr();  // only for Source
-  bool use_source_address = false;
   boost::system::error_code ec;
 #if BOOST_VERSION < 108700
   ip::address_v4::from_string(source.address, ec);
@@ -581,7 +584,6 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
 #else
         ip::make_address(source.address).to_v4().to_uint();
 #endif
-    use_source_address = true;
   } else {
     info.stream[0].m_ui32DestIP =
 #if BOOST_VERSION < 108700
@@ -593,6 +595,29 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
             .to_uint() +
 #endif
         source.id;
+  }
+  // Secondary (ST 2022-7 Blue) leg address, parsed independently of the
+  // primary one above - explicitly specifying the primary must not make the
+  // secondary silently inherit it (that used to happen: the block below only
+  // ever set stream[1]'s dest IP when !use_source_address, leaving it as the
+  // memcpy'd-from-stream[0] value - i.e. identical to the primary - whenever
+  // a primary address was given explicitly).
+  bool use_source_address_sec = false;
+  uint32_t source_address_sec_ip = 0;
+  boost::system::error_code ec_sec;
+#if BOOST_VERSION < 108700
+  ip::address_v4::from_string(source.address_sec, ec_sec);
+#else
+  ip::make_address(source.address_sec, ec_sec);
+#endif
+  if (!ec_sec) {
+    source_address_sec_ip =
+#if BOOST_VERSION < 108700
+        ip::address_v4::from_string(source.address_sec).to_ulong();
+#else
+        ip::make_address(source.address_sec).to_v4().to_uint();
+#endif
+    use_source_address_sec = true;
   }
   info.stream[0].m_usSrcPort = config_->get_rtp_port();
   info.stream[0].m_usDestPort = config_->get_rtp_port();
@@ -670,11 +695,13 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
     }
 
     info.st20227_enabled = false;
-    if (config_->get_interface_name(1).length() > 0) {
+    if (source.use_secondary && config_->get_interface_name(1).length() > 0) {
       auto [ip_addr, ip_str] = get_interface_ip(config_->get_interface_name(1));
       if (!ip_str.empty()) {
         memcpy(&info.stream[1], &info.stream[0], sizeof(info.stream[0]));
-        if (!use_source_address) {
+        if (use_source_address_sec) {
+          info.stream[1].m_ui32DestIP = source_address_sec_ip;
+        } else {
           info.stream[1].m_ui32DestIP =
   #if BOOST_VERSION < 108700
               ip::address_v4::from_string(
@@ -1406,6 +1433,28 @@ void SessionManager::on_ptp_status_changed(const std::string& status) const {
       exit(0);
     }
     g_ptp_status = status;
+  }
+}
+
+void SessionManager::run_lldp_update_script() const {
+  if (config_->get_lldp_update_script().empty()) return;
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    /* child */
+    int fdlimit = (int)sysconf(_SC_OPEN_MAX);
+    /* close all parent's fds */
+    for (int i = STDERR_FILENO + 1; i < fdlimit; i++)
+      close(i);
+
+    char* argv_list[] = {
+        const_cast<char*>(config_->get_lldp_update_script().c_str()),
+        const_cast<char*>(config_->get_interface_name(0).c_str()),
+        const_cast<char*>(config_->get_interface_name(1).c_str()),
+        nullptr};
+
+    execv(config_->get_lldp_update_script().c_str(), argv_list);
+    exit(0);
   }
 }
 

@@ -43,6 +43,19 @@ struct StreamSource {
   uint32_t max_samples_per_packet{0};
   std::string codec;
   std::string address;
+  // Explicit secondary-leg (ST 2022-7 Blue) multicast/unicast address, set
+  // independently of `address` (Red). Empty falls back to
+  // rtp_mcast_base_sec + id, same as `address` falling back to
+  // rtp_mcast_base - see on_add_source(). Only meaningful when
+  // use_secondary is true.
+  std::string address_sec;
+  // Per-stream opt-in/out of ST 2022-7 redundancy, independent of whether
+  // the daemon has a secondary interface configured at all - previously
+  // any source automatically got a secondary leg whenever
+  // interface_name(1) was non-empty, with no way to make a specific stream
+  // single-leg. Defaults to true so existing configs/status files (which
+  // predate this field) keep today's always-on-when-configured behavior.
+  bool use_secondary{true};
   uint8_t ttl{0};
   uint8_t payload_type{0};
   uint8_t dscp{0};
@@ -159,6 +172,7 @@ class SessionManager {
                           std::chrono::seconds(1);
       // to have an increasing session versions between restarts
       res_ = std::async(std::launch::async, &SessionManager::worker, this);
+      run_lldp_update_script();
     }
     return true;
   }
@@ -238,6 +252,10 @@ class SessionManager {
   void on_remove_sink(const StreamInfo& info);
 
   void on_ptp_status_changed(const std::string& status) const;
+
+  // Run config_->get_lldp_update_script() once, if configured, with
+  // interface_name(0)/(1) as argv - see config.hpp for why.
+  void run_lldp_update_script() const;
 
   void on_update_sources();
 

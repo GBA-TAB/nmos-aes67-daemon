@@ -109,6 +109,14 @@ class Config {
   const std::string& get_ptp_status_script() const {
     return ptp_status_script_;
   }
+  // Run once at startup with argv {interface_name(0), interface_name(1)} -
+  // lets an external script (e.g. lldpcli) keep LLDP port descriptions in
+  // sync with which physical NIC is currently primary/secondary, instead of
+  // a hand-maintained /etc/lldpd.d/ file drifting out of sync with this
+  // config. Empty leg 1 argv when not running dual-leg.
+  const std::string& get_lldp_update_script() const {
+    return lldp_update_script_;
+  }
 
   void set_http_addr_str(std::string_view http_addr_str) {
     http_addr_str_ = http_addr_str;
@@ -186,6 +194,9 @@ class Config {
   void set_mdns_enabled(bool enabled) { mdns_enabled_ = enabled; };
   void set_ptp_status_script(std::string_view script) {
     ptp_status_script_ = script;
+  };
+  void set_lldp_update_script(std::string_view script) {
+    lldp_update_script_ = script;
   };
   void set_custom_node_id(std::string_view node_id) {
     custom_node_id_ = node_id;
@@ -286,6 +297,7 @@ class Config {
   std::vector<std::string> interfaces_;
   bool mdns_enabled_{true};
   std::string ptp_status_script_;
+  std::string lldp_update_script_;
   std::string custom_node_id_;
   std::string node_id_;
   bool auto_sinks_update_{true};

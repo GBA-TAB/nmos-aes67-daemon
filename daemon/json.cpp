@@ -110,6 +110,8 @@ std::string config_to_json(const Config& config) {
      << ",\n  \"node_id\": \"" << escape_json(config.get_node_id()) << "\""
      << ",\n  \"ptp_status_script\": \""
      << escape_json(config.get_ptp_status_script()) << "\""
+     << ",\n  \"lldp_update_script\": \""
+     << escape_json(config.get_lldp_update_script()) << "\""
      << ",\n  \"mac_addr\": \"" << escape_json(config.get_mac_addr_str())
      << "\"" << ",\n  \"ip_addr\": \"" << escape_json(config.get_ip_addr_str())
      << "\"" << ",\n  \"streamer_channels\": "
@@ -151,6 +153,8 @@ std::string source_to_json(const StreamSource& source) {
      << ",\n    \"max_samples_per_packet\": " << source.max_samples_per_packet
      << ",\n    \"codec\": \"" << escape_json(source.codec) << "\""
      << ",\n    \"address\": \"" << escape_json(source.address) << "\""
+     << ",\n    \"address_sec\": \"" << escape_json(source.address_sec) << "\""
+     << ",\n    \"use_secondary\": " << std::boolalpha << source.use_secondary
      << ",\n    \"ttl\": " << unsigned(source.ttl)
      << ",\n    \"payload_type\": " << unsigned(source.payload_type)
      << ",\n    \"dscp\": " << +unsigned(source.dscp)
@@ -420,6 +424,9 @@ Config json_to_config_(std::istream& js, Config& config) {
       } else if (key == "ptp_status_script") {
         config.set_ptp_status_script(
             remove_undesired_chars(val.get_value<std::string>()));
+      } else if (key == "lldp_update_script") {
+        config.set_lldp_update_script(
+            remove_undesired_chars(val.get_value<std::string>()));
       } else if (key == "custom_node_id") {
         config.set_custom_node_id(
             remove_undesired_chars(val.get_value<std::string>()));
@@ -503,6 +510,8 @@ StreamSource json_to_source(const std::string& id, const std::string& json) {
     "max_samples_per_packet": 48,
     "codec": "L24",
     "address": "",
+    "address_sec": "",
+    "use_secondary": true,
     "ttl": 15,
     "payload_type": 98,
     "dscp": 34,
@@ -527,6 +536,9 @@ StreamSource json_to_source(const std::string& id, const std::string& json) {
     source.max_samples_per_packet = pt.get<uint32_t>("max_samples_per_packet");
     source.codec = remove_undesired_chars(pt.get<std::string>("codec"));
     source.address = remove_undesired_chars(pt.get<std::string>("address"));
+    source.address_sec = remove_undesired_chars(
+        pt.get<std::string>("address_sec", ""));
+    source.use_secondary = pt.get<bool>("use_secondary", true);
     source.ttl = pt.get<uint8_t>("ttl");
     source.payload_type = pt.get<uint8_t>("payload_type");
     source.dscp = pt.get<uint8_t>("dscp");
@@ -626,6 +638,8 @@ static void parse_json_sources(boost::property_tree::ptree& pt,
         v.second.get<uint32_t>("max_samples_per_packet");
     source.codec = v.second.get<std::string>("codec");
     source.address = v.second.get<std::string>("address");
+    source.address_sec = v.second.get<std::string>("address_sec", "");
+    source.use_secondary = v.second.get<bool>("use_secondary", true);
     source.ttl = v.second.get<uint8_t>("ttl");
     source.payload_type = v.second.get<uint8_t>("payload_type");
     source.dscp = v.second.get<uint8_t>("dscp");
