@@ -37,6 +37,21 @@ pub fn source_receiver_id(daemon_id: u8) -> uuid::Uuid {
     stable_id(&format!("mxl-bridge-source-receiver:{daemon_id}"))
 }
 
+// Packed flows (Phase 2 plan §3/§4, nmos/is08.rs): identified by a controller-chosen `name`, not a
+// daemon id — no NMOS Sender/Receiver mirrors these, so a packed flow's own MXL flow_id isn't
+// otherwise discoverable through IS-04/05. It's deterministic instead, same convention as every
+// other id here: an app that wants to write into (or read from) mxl-bridge's packed-flow mechanism
+// computes it itself from the same `name` it used in its `/map/activations` request.
+pub fn packed_rx_flow_id(name: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-bridge-packed-rx-flow:{name}"))
+}
+pub fn packed_rx_source_id(name: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-bridge-packed-rx-source:{name}"))
+}
+pub fn packed_tx_flow_id(name: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-bridge-packed-tx-flow:{name}"))
+}
+
 /// Builds the flow_def JSON passed to `mxlCreateFlowWriter`. This *is* an NMOS Flow resource JSON
 /// (confirmed against MXL's own examples/flow-configs/flow-audio.json) — audio/float32 is MXL's only
 /// supported audio sample format (docs/Architecture.md:341), fixed regardless of the AES67 network
@@ -64,7 +79,13 @@ pub fn build_audio_flow_def(
         "bit_depth": 32,
         "parents": [],
         "tags": {
-            "urn:x-nmos:tag:grouphint/v1.0": [format!("mxl-bridge:{label}")]
+            // Fixed, never interpolated with `label`: MXL's FlowParser requires this tag's value
+            // as a strict "<scope>:<value>" pair where scope must literally be "device" or
+            // "node" (confirmed the hard way — a packed flow's label, e.g. "packed-rx:mix1",
+            // itself contains a colon, which broke this when it used to be
+            // `format!("mxl-bridge:{label}")`). Every flow mxl-bridge creates shares one device,
+            // so one fixed grouphint value is both correct and simpler.
+            "urn:x-nmos:tag:grouphint/v1.0": ["device:mxl-bridge"]
         }
     })
     .to_string()

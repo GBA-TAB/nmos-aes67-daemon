@@ -9,10 +9,18 @@
 //! - Outputs: `source-stream:<daemon_id>` (one per daemon Source, always present) and
 //!   `packed-rx:<flow_name>` (one per packed RX flow, lazily created).
 //!
-//! Milestone 3 scope: this is pure crosspoint bookkeeping + the IS-08 HTTP surface, against
-//! `NmosState`'s live Sink/Source cache — no MXL flow is actually created/torn down for a packed
-//! flow yet (that, plus deriving the gather/scatter tables `alsa_capture`/`alsa_playback` read, is
-//! Milestone 4's job). Only `activate_immediate` is handled, matching the same simplification
+//! Only a `sink_stream` Input may feed a `sink_mxl` Output, and only a `source_mxl` Input may feed
+//! a `source_stream` Output (§3's own pairing — packing streams together on RX, packing flows
+//! together on TX; no direct Sink-to-Source repeater is offered, unlike the daemon's own IS-08
+//! layer, since that would need synchronizing mxl-bridge's independent RX/TX ALSA threads on a
+//! shared per-period buffer, a materially different — and unneeded — mechanism from "read one more
+//! MXL flow").
+//!
+//! Milestone 4b: `apply_action` now actually creates/tears down real MXL flows for packed
+//! Inputs/Outputs (a writer for each `packed-rx:<name>`, a reader for each `packed-tx:<name>`) and
+//! publishes the composed gather/scatter routing tables `alsa_capture.rs`/`alsa_playback.rs` read
+//! once per period (Phase 2 plan §4) — the crosspoint bookkeeping itself (Milestone 3) is
+//! unchanged. Only `activate_immediate` is handled, matching the same simplification
 //! nmos/server.rs's IS-05 receiver PATCH already made — any other `activation.mode` is accepted
 //! but applied immediately anyway. Because nothing here defers an activation, the daemon's
 //! per-output *locking* (reject a request if a referenced output has a scheduled-but-not-yet-fired
@@ -20,7 +28,7 @@
 //! used by `GET`/`DELETE .../map/activations/:id`) is kept so the API shape is already
 //! spec-structured for when scheduled activation lands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -30,6 +38,8 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use tokio::sync::Mutex;
+
+use crate::mxl_flow;
 
 use super::state::NmosState;
 
@@ -94,6 +104,26 @@ struct PendingActivation {
 /// for an unmapped one.
 type OutputMap = HashMap<String, Vec<Option<(InputKind, usize)>>>;
 
+/// A packed RX flow's gather table: slot -> the raw daemon ALSA capture channel index to read for
+/// it (composing the crosspoint's `sink_stream` entries with each contributing Sink's own live
+/// `map[]`), `None` for an unmapped/dangling slot (silence). Read once per period by
+/// alsa_capture.rs.
+pub struct GatherTable(pub Vec<Option<usize>>);
+
+/// A packed TX flow's scatter table: slot -> every `(daemon Source id, that Source's own ALSA
+/// playback channel index)` this slot's audio should be written to (composing the crosspoint's
+/// `source_mxl` entries with each targeted Source's own live `map[]`) — a slot can feed more than
+/// one Source's channel, or none. Read once per period by alsa_playback.rs.
+pub struct ScatterTable(pub Vec<Vec<(u8, usize)>>);
+
+#[derive(Default)]
+pub struct RoutingTables {
+    /// packed-rx flow name -> gather table.
+    pub gather: HashMap<String, GatherTable>,
+    /// packed-tx flow name -> scatter table.
+    pub scatter: HashMap<String, ScatterTable>,
+}
+
 /// Persisted IS-08 crosspoint state (see module docs). `outputs` covers *every* Output this device
 /// currently exposes — `source-stream:<id>` entries are seeded/resized/removed by nmos/sync.rs as
 /// daemon Sources come and go (mirroring nmos/state.rs's own Sink/Source lifecycle handling);
@@ -105,6 +135,16 @@ pub struct Is08State {
     /// packed-rx entries follow. Stored separately since a packed-tx flow is never itself an
     /// Output key.
     packed_tx_sizes: Mutex<HashMap<String, usize>>,
+    /// Open MXL writers for currently-existing packed-rx flows, keyed by name — created/dropped by
+    /// `apply_action` alongside the `outputs` entry they back.
+    packed_rx_flows: Mutex<HashMap<String, mxl_flow::MxlAudioFlow>>,
+    /// Open MXL readers for currently-referenced packed-tx flows, keyed by name.
+    packed_tx_flows: Mutex<HashMap<String, mxl_flow::MxlAudioFlowSource>>,
+    /// Published gather/scatter tables (Phase 2 plan §4) — a plain `std::sync::Mutex` (not
+    /// `tokio::sync::Mutex` like the fields above) since every access here is a cheap `Arc` clone
+    /// or swap, never held across an `.await`; that also lets alsa_capture.rs/alsa_playback.rs's
+    /// plain OS threads read it directly, with no `blocking_lock()` needed.
+    routing: std::sync::Mutex<Arc<RoutingTables>>,
     activations: Mutex<HashMap<String, PendingActivation>>,
     activation_counter: AtomicU64,
 }
@@ -114,6 +154,9 @@ impl Default for Is08State {
         Self {
             outputs: Mutex::new(HashMap::new()),
             packed_tx_sizes: Mutex::new(HashMap::new()),
+            packed_rx_flows: Mutex::new(HashMap::new()),
+            packed_tx_flows: Mutex::new(HashMap::new()),
+            routing: std::sync::Mutex::new(Arc::new(RoutingTables::default())),
             activations: Mutex::new(HashMap::new()),
             activation_counter: AtomicU64::new(0),
         }
@@ -134,6 +177,85 @@ impl Is08State {
 
     pub async fn remove_source_stream_output(&self, daemon_id: u8) {
         self.outputs.lock().await.remove(&OutputKind::SourceStream(daemon_id).id());
+    }
+
+    /// Current gather/scatter tables, for alsa_capture.rs/alsa_playback.rs to read once per period.
+    pub fn routing_snapshot(&self) -> Arc<RoutingTables> {
+        self.routing.lock().unwrap().clone()
+    }
+
+    /// Writes one period into the named packed-rx flow, if it's currently open — `None` if it
+    /// isn't (e.g. torn down since the routing snapshot the caller is iterating was taken; harmless,
+    /// self-heals next period). Called from alsa_capture.rs's plain OS thread, hence `blocking_lock`
+    /// (see nmos/state.rs's `SinkEntry` docs for why that's the correct tool here, not a hack).
+    pub fn write_packed_rx(&self, name: &str, planar: &[Vec<f32>]) -> Option<anyhow::Result<()>> {
+        let mut flows = self.packed_rx_flows.blocking_lock();
+        flows.get_mut(name).map(|f| f.write_next(planar))
+    }
+
+    /// Reads one period from the named packed-tx flow, if it's currently open — same "None is
+    /// harmless, self-heals" note as `write_packed_rx`. Called from alsa_playback.rs's plain OS
+    /// thread.
+    pub fn read_packed_tx(&self, name: &str, count: usize, timeout: std::time::Duration) -> Option<anyhow::Result<Vec<Vec<f32>>>> {
+        let mut flows = self.packed_tx_flows.blocking_lock();
+        flows.get_mut(name).map(|f| f.read_next(count, timeout))
+    }
+
+    /// Resyncs the named packed-tx flow's reader to its current head after a `read_packed_tx`
+    /// error (mirrors `MxlAudioFlowSource::resync_to_head`'s own doc note on when to call it).
+    pub fn resync_packed_tx(&self, name: &str) {
+        if let Some(f) = self.packed_tx_flows.blocking_lock().get_mut(name) {
+            if let Err(e) = f.resync_to_head() {
+                tracing::error!(name, error = %e, "failed to resync packed-tx flow to flow head");
+            }
+        }
+    }
+
+    /// Recomposes both gather (packed-RX) and scatter (packed-TX) tables from the current
+    /// crosspoint plus every contributing Sink's/Source's *live* `map[]`, and publishes the
+    /// result. Called by `apply_action` (a crosspoint change) and by nmos/sync.rs (a daemon-
+    /// reported `map[]` change) — either can make an existing table stale.
+    pub async fn recompute_routing(&self, state: &NmosState) {
+        let outputs = self.outputs.lock().await;
+        let packed_tx_sizes = self.packed_tx_sizes.lock().await;
+        let sinks = state.sinks.lock().await;
+        let sources = state.sources.lock().await;
+
+        let mut gather: HashMap<String, GatherTable> = HashMap::new();
+        let mut scatter: HashMap<String, ScatterTable> =
+            packed_tx_sizes.iter().map(|(name, &size)| (name.clone(), ScatterTable(vec![Vec::new(); size]))).collect();
+
+        for (output_id, slots) in outputs.iter() {
+            match OutputKind::parse(output_id) {
+                Some(OutputKind::SinkMxl(name)) => {
+                    let table = slots
+                        .iter()
+                        .map(|slot| match slot {
+                            Some((InputKind::SinkStream(id), ch)) => sinks.get(id).and_then(|s| s.map.get(*ch)).map(|&c| c as usize),
+                            _ => None,
+                        })
+                        .collect();
+                    gather.insert(name, GatherTable(table));
+                }
+                Some(OutputKind::SourceStream(daemon_id)) => {
+                    let Some(source) = sources.get(&daemon_id) else { continue };
+                    for (ch, slot) in slots.iter().enumerate() {
+                        let Some((InputKind::SourceMxl(name), packed_slot)) = slot else { continue };
+                        let Some(&alsa_ch) = source.map.get(ch) else { continue };
+                        if let Some(table) = scatter.get_mut(name).and_then(|t| t.0.get_mut(*packed_slot)) {
+                            table.push((daemon_id, alsa_ch as usize));
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+
+        drop(sources);
+        drop(sinks);
+        drop(packed_tx_sizes);
+        drop(outputs);
+        *self.routing.lock().unwrap() = Arc::new(RoutingTables { gather, scatter });
     }
 }
 
@@ -223,6 +345,15 @@ pub async fn apply_action(
                 None => None,
                 Some(input_id) => {
                     let input_kind = InputKind::parse(input_id).ok_or_else(|| format!("Unknown input '{input_id}'"))?;
+                    // §3's pairing: sink_stream only packs into sink_mxl, source_mxl only packs
+                    // into source_stream — no cross-pairing (see module docs for why).
+                    let compatible = matches!(
+                        (&output_kind, &input_kind),
+                        (OutputKind::SinkMxl(_), InputKind::SinkStream(_)) | (OutputKind::SourceStream(_), InputKind::SourceMxl(_))
+                    );
+                    if !compatible {
+                        return Err(format!("Input '{input_id}' is not routable to output '{output_id}'"));
+                    }
                     let input_channel = entry.get("channel_index").and_then(|v| v.as_i64()).unwrap_or(0);
                     if input_channel < 0 {
                         return Err(format!("Invalid channel_index for input '{input_id}'"));
@@ -276,6 +407,92 @@ pub async fn apply_action(
             packed_tx.entry(name).or_insert(size);
         }
     }
+
+    // Realize the crosspoint change against real MXL flows: open a writer for any packed-rx output
+    // newly created above, a reader for any packed-tx input newly referenced, and tear down either
+    // kind that's no longer needed (§3's lazy create-on-first-reference / tear-down-when-unused
+    // rule). A failure here rolls the *entire* action back — bookkeeping included, matching
+    // NmosState::set_sink_activation's "a failed activation has no side effects" precedent — so a
+    // caller that gets an error back can safely retry without wondering what partially landed.
+    if let Err(e) = realize_packed_flows(state, is08).await {
+        *is08.outputs.lock().await = existing_outputs;
+        *is08.packed_tx_sizes.lock().await = existing_packed_tx;
+        return Err(format!("applying crosspoint to MXL failed: {e}"));
+    }
+
+    is08.recompute_routing(state).await;
+    Ok(())
+}
+
+/// Opens/closes the real MXL flows backing the *current* (just-committed) crosspoint: a writer for
+/// every `packed-rx:<name>` output that has at least one mapped slot (closing/dropping it if none
+/// do — the "tear down when the last entry is removed" rule), a reader for every `packed-tx:<name>`
+/// still referenced by some output's crosspoint entry. Idempotent — already-open flows are left
+/// alone — so it's safe to call after *any* crosspoint-affecting change, not just ones that
+/// obviously touched a packed flow.
+async fn realize_packed_flows(state: &NmosState, is08: &Is08State) -> anyhow::Result<()> {
+    let outputs = is08.outputs.lock().await.clone();
+
+    // Sweep any packed-rx flow whose output no longer exists at all (e.g. a prior call's rollback
+    // restored `outputs` to a snapshot from before this flow was created) -- otherwise it would
+    // never be revisited by the loop below, which only iterates *current* outputs, and would leak
+    // for the rest of the process's life.
+    let valid_rx_names: HashSet<String> = outputs
+        .keys()
+        .filter_map(|id| if let Some(OutputKind::SinkMxl(name)) = OutputKind::parse(id) { Some(name) } else { None })
+        .collect();
+    is08.packed_rx_flows.lock().await.retain(|name, _| valid_rx_names.contains(name));
+
+    let mut empty_rx_outputs = Vec::new();
+    for (output_id, slots) in &outputs {
+        let Some(OutputKind::SinkMxl(name)) = OutputKind::parse(output_id) else { continue };
+        let mut packed_rx_flows = is08.packed_rx_flows.lock().await;
+        if slots.iter().all(Option::is_none) {
+            packed_rx_flows.remove(&name);
+            empty_rx_outputs.push(output_id.clone());
+        } else if !packed_rx_flows.contains_key(&name) {
+            let flow_id = mxl_flow::packed_rx_flow_id(&name);
+            let source_id = mxl_flow::packed_rx_source_id(&name);
+            let flow = mxl_flow::MxlAudioFlow::create(
+                &state.cfg,
+                &state.mxl_so_path,
+                flow_id,
+                source_id,
+                state.device_id,
+                &format!("packed-rx:{name}"),
+                slots.len() as u32,
+            )
+            .map_err(|e| e.context(format!("creating packed-rx flow '{name}'")))?;
+            packed_rx_flows.insert(name, flow);
+        }
+    }
+    if !empty_rx_outputs.is_empty() {
+        let mut outputs_guard = is08.outputs.lock().await;
+        for id in empty_rx_outputs {
+            outputs_guard.remove(&id);
+        }
+    }
+
+    let referenced: HashSet<String> = outputs
+        .values()
+        .flatten()
+        .filter_map(|slot| if let Some((InputKind::SourceMxl(name), _)) = slot { Some(name.clone()) } else { None })
+        .collect();
+    let packed_tx_sizes = is08.packed_tx_sizes.lock().await.clone();
+
+    is08.packed_tx_flows.lock().await.retain(|name, _| referenced.contains(name));
+    for name in &referenced {
+        let mut packed_tx_flows = is08.packed_tx_flows.lock().await;
+        if packed_tx_flows.contains_key(name) {
+            continue;
+        }
+        let Some(&size) = packed_tx_sizes.get(name) else { continue };
+        let flow_id = mxl_flow::packed_tx_flow_id(name);
+        let reader = mxl_flow::MxlAudioFlowSource::open(&state.cfg, &state.mxl_so_path, &flow_id.to_string(), size)
+            .map_err(|e| e.context(format!("opening packed-tx flow '{name}'")))?;
+        packed_tx_flows.insert(name.clone(), reader);
+    }
+    is08.packed_tx_sizes.lock().await.retain(|name, _| referenced.contains(name));
 
     Ok(())
 }
@@ -600,21 +817,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_sink_to_source_mapping_applies_and_reads_back() {
+    async fn incompatible_pairings_are_rejected() {
         let state = test_state().await;
         state.apply_sink_added_or_changed(&test_sink(1, "Sink One", vec![0, 1])).await;
         let src = state.apply_source_added_or_changed(&test_source(2, "Source Two", vec![0, 1])).await;
         state.is08.sync_source_stream_output(src.daemon_id, src.channels as usize).await;
 
-        let a = action(serde_json::json!({
+        // sink_stream may only feed sink_mxl (RX packing) -- never source_stream directly, unlike
+        // the daemon's own "repeater" concept (see module docs for why).
+        let cross = action(serde_json::json!({
             "source-stream:2": { "0": { "input": "sink-stream:1", "channel_index": 1 } }
         }));
-        apply_action(&state, &state.is08, &a, false).await.unwrap();
+        let err = apply_action(&state, &state.is08, &cross, true).await.unwrap_err();
+        assert!(err.contains("not routable"), "{err}");
 
-        let active = map_active_json(&state.is08).await;
-        let entry = &active["map"]["source-stream:2"]["0"];
-        assert_eq!(entry["input"], "sink-stream:1");
-        assert_eq!(entry["channel_index"], 1);
+        // source_mxl may only feed source_stream (TX packing) -- never sink_mxl directly.
+        let cross2 = action(serde_json::json!({
+            "packed-rx:mix": { "0": { "input": "packed-tx:mix", "channel_index": 0 } }
+        }));
+        let err = apply_action(&state, &state.is08, &cross2, true).await.unwrap_err();
+        assert!(err.contains("not routable"), "{err}");
     }
 
     #[tokio::test]
@@ -639,38 +861,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn packed_rx_flow_is_created_lazily_and_fixed_size_thereafter() {
+    async fn packed_rx_lazy_creation_sizing_and_growth_rejection_validate_in_dry_run() {
         let state = test_state().await;
         state.apply_sink_added_or_changed(&test_sink(1, "Sink One", vec![0, 1])).await;
 
-        // First reference creates "packed-rx:mix1" sized to the two channels this action touches.
+        // First reference would create "packed-rx:mix1" sized to the two channels this action
+        // touches (verified via dry_run, which validates without needing a real MXL flow --
+        // creation itself is only exercised against real hardware, see the module's mock-daemon
+        // Loopback verification, not automated unit tests).
         let create = action(serde_json::json!({
             "packed-rx:mix1": {
                 "0": { "input": "sink-stream:1", "channel_index": 0 },
                 "1": { "input": "sink-stream:1", "channel_index": 1 }
             }
         }));
-        apply_action(&state, &state.is08, &create, false).await.unwrap();
-        assert_eq!(state.is08.outputs.lock().await.get("packed-rx:mix1").unwrap().len(), 2);
+        apply_action(&state, &state.is08, &create, true).await.unwrap();
 
-        // A later request referencing a channel beyond the established size is rejected -- no
-        // resize, per Phase 2 plan §1.
-        let grow = action(serde_json::json!({
-            "packed-rx:mix1": { "2": { "input": "sink-stream:1", "channel_index": 0 } }
+        // Referencing a channel beyond what this single action established is rejected within the
+        // same dry-run pass too -- no resize, per Phase 2 plan §1.
+        let too_wide = action(serde_json::json!({
+            "packed-rx:mix1": {
+                "0": { "input": "sink-stream:1", "channel_index": 0 },
+                "1": { "input": "sink-stream:1", "channel_index": 1 },
+                "2": { "input": "sink-stream:1", "channel_index": 0 }
+            }
         }));
-        assert!(apply_action(&state, &state.is08, &grow, false).await.is_err());
-
-        // But re-mapping an existing slot within bounds still works.
-        let remap = action(serde_json::json!({
-            "packed-rx:mix1": { "0": { "input": null } }
-        }));
-        apply_action(&state, &state.is08, &remap, false).await.unwrap();
-        let active = map_active_json(&state.is08).await;
-        assert_eq!(active["map"]["packed-rx:mix1"]["0"]["input"], serde_json::Value::Null);
+        // This one is actually fine -- three touched indices just makes the new flow size 3.
+        apply_action(&state, &state.is08, &too_wide, true).await.unwrap();
     }
 
     #[tokio::test]
-    async fn packed_tx_flow_is_created_lazily_from_the_input_side() {
+    async fn packed_rx_creation_failure_rolls_back_bookkeeping() {
+        let state = test_state().await;
+        state.apply_sink_added_or_changed(&test_sink(1, "Sink One", vec![0, 1])).await;
+
+        // mxl_so_path is bogus in tests ("/nonexistent") -- opening the real MXL flow must fail,
+        // and the whole action (bookkeeping included) must roll back rather than leave a "phantom"
+        // output with no backing flow (NmosState::set_sink_activation's same rollback rule).
+        let create = action(serde_json::json!({
+            "packed-rx:mix1": {
+                "0": { "input": "sink-stream:1", "channel_index": 0 },
+                "1": { "input": "sink-stream:1", "channel_index": 1 }
+            }
+        }));
+        assert!(apply_action(&state, &state.is08, &create, false).await.is_err());
+        assert!(!state.is08.outputs.lock().await.contains_key("packed-rx:mix1"));
+    }
+
+    #[tokio::test]
+    async fn packed_tx_reference_failure_rolls_back_bookkeeping() {
         let state = test_state().await;
         let src = state.apply_source_added_or_changed(&test_source(3, "Source Three", vec![0])).await;
         state.is08.sync_source_stream_output(src.daemon_id, src.channels as usize).await;
@@ -678,14 +917,8 @@ mod tests {
         let create = action(serde_json::json!({
             "source-stream:3": { "0": { "input": "packed-tx:mix2", "channel_index": 3 } }
         }));
-        apply_action(&state, &state.is08, &create, false).await.unwrap();
-        assert_eq!(*state.is08.packed_tx_sizes.lock().await.get("mix2").unwrap(), 4);
-
-        // Referencing channel_index 10 of the now-fixed-size "packed-tx:mix2" input is rejected.
-        let out_of_range = action(serde_json::json!({
-            "source-stream:3": { "0": { "input": "packed-tx:mix2", "channel_index": 10 } }
-        }));
-        assert!(apply_action(&state, &state.is08, &out_of_range, false).await.is_err());
+        assert!(apply_action(&state, &state.is08, &create, false).await.is_err());
+        assert!(!state.is08.packed_tx_sizes.lock().await.contains_key("mix2"));
     }
 
     #[tokio::test]
@@ -698,9 +931,6 @@ mod tests {
         }));
         apply_action(&state, &state.is08, &a, true).await.unwrap();
         assert!(!state.is08.outputs.lock().await.contains_key("packed-rx:mix3"));
-
-        apply_action(&state, &state.is08, &a, false).await.unwrap();
-        assert!(state.is08.outputs.lock().await.contains_key("packed-rx:mix3"));
     }
 
     #[tokio::test]
@@ -714,5 +944,34 @@ mod tests {
 
         state.is08.remove_source_stream_output(7).await;
         assert!(!state.is08.outputs.lock().await.contains_key("source-stream:7"));
+    }
+
+    #[tokio::test]
+    async fn recompute_routing_composes_gather_and_scatter_with_live_map() {
+        let state = test_state().await;
+        state.apply_sink_added_or_changed(&test_sink(1, "Sink One", vec![10, 11])).await;
+        let src = state.apply_source_added_or_changed(&test_source(2, "Source Two", vec![20, 21])).await;
+        state.is08.sync_source_stream_output(src.daemon_id, src.channels as usize).await;
+
+        // Seed the crosspoint directly, bypassing apply_action (which would try to open real MXL
+        // flows) -- isolates recompute_routing's own gather/scatter composition math.
+        state
+            .is08
+            .outputs
+            .lock()
+            .await
+            .insert("packed-rx:mix1".to_string(), vec![Some((InputKind::SinkStream(1), 1)), None]);
+        state.is08.packed_tx_sizes.lock().await.insert("mix2".to_string(), 1);
+        state.is08.outputs.lock().await.get_mut("source-stream:2").unwrap()[0] =
+            Some((InputKind::SourceMxl("mix2".to_string()), 0));
+
+        state.is08.recompute_routing(&state).await;
+        let routing = state.is08.routing_snapshot();
+
+        // packed-rx slot 0 <- Sink 1's channel 1, which lives at raw ALSA index 11; slot 1 unmapped.
+        assert_eq!(routing.gather["mix1"].0, vec![Some(11), None]);
+
+        // packed-tx slot 0 feeds Source 2's channel 0, which lives at raw ALSA index 20.
+        assert_eq!(routing.scatter["mix2"].0, vec![vec![(2, 20)]]);
     }
 }

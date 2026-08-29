@@ -27,11 +27,20 @@ pub async fn run(state: Arc<NmosState>, mut rx: tokio::sync::mpsc::UnboundedRece
 /// populated (Milestone 4, Phase 2 plan §4).
 pub async fn apply_diff(state: &Arc<NmosState>, client: &reqwest::Client, base: Option<&str>, ip: &str, diff: DaemonDiff) {
     state.set_alsa_channels(diff.state.alsa_channels);
+    let sink_changed = !diff.sink_changes.is_empty();
+    let source_changed = !diff.source_changes.is_empty();
     for change in diff.sink_changes {
         apply_sink_change(state, client, base, ip, change).await;
     }
     for change in diff.source_changes {
         apply_source_change(state, client, base, change).await;
+    }
+
+    // A Sink's/Source's `map[]` change can make an existing packed-flow gather/scatter table
+    // stale (Phase 2 plan §4) — recompute once per diff rather than per individual change, since a
+    // single daemon poll can report several at once.
+    if sink_changed || source_changed {
+        state.is08.recompute_routing(state).await;
     }
 }
 

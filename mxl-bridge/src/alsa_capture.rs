@@ -88,6 +88,23 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
         }
         let frame_window = &interleaved[..frames_read * channels as usize];
 
+        // Reads one raw ALSA channel's worth of samples out of this period's capture window,
+        // normalized to MXL's float32 range — shared by both the default per-Sink path below and
+        // the packed-flow gather path, since both ultimately just pick channels out of the same
+        // `frame_window`.
+        let read_channel = |alsa_ch: usize, buf: &mut Vec<f32>| {
+            buf.clear();
+            if alsa_ch >= channels as usize {
+                // The daemon (or a crosspoint entry) reported a channel outside the wide device's
+                // own width — can only happen if `alsa_channels` changed since this thread opened
+                // its device (§4: opened once, not reopened) or a stale/dangling reference; leave
+                // silence rather than panicking on an out-of-bounds slice.
+                buf.resize(frames_read, 0.0);
+            } else {
+                buf.extend(frame_window.iter().skip(alsa_ch).step_by(channels as usize).map(|&s| s as f32 / S32_FULL_SCALE));
+            }
+        };
+
         let mut sinks = state.sinks.blocking_lock();
         for entry in sinks.values_mut() {
             let Some(flow) = entry.flow.as_mut() else { continue };
@@ -96,21 +113,35 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
                 planar_scratch.resize(n, Vec::new());
             }
             for (ch_idx, &alsa_ch) in entry.map.iter().enumerate() {
-                let alsa_ch = alsa_ch as usize;
-                let buf = &mut planar_scratch[ch_idx];
-                buf.clear();
-                if alsa_ch >= channels as usize {
-                    // The daemon reported a map[] entry outside the wide device's own width — can
-                    // only happen if `alsa_channels` changed since this thread opened its device
-                    // (§4: opened once, not reopened) or a daemon bug; skip this channel (leaves
-                    // silence) rather than panicking on an out-of-bounds slice.
-                    buf.resize(frames_read, 0.0);
-                    continue;
-                }
-                buf.extend(frame_window.iter().skip(alsa_ch).step_by(channels as usize).map(|&s| s as f32 / S32_FULL_SCALE));
+                read_channel(alsa_ch as usize, &mut planar_scratch[ch_idx]);
             }
             if let Err(e) = flow.write_next(&planar_scratch[..n]) {
                 tracing::error!(daemon_id = entry.daemon_id, error = %e, "failed to write samples into MXL flow");
+            }
+        }
+        drop(sinks);
+
+        // Packed-RX flows (Phase 2 plan §3/§4, opt-in — see nmos/is08.rs): each slot draws from
+        // whichever daemon Sink channel the crosspoint currently assigns it, composed with that
+        // Sink's own live `map[]` into the gather table's raw ALSA index (recomputed on every
+        // crosspoint/`map[]` change, not here — this just reads the published result).
+        let routing = state.is08.routing_snapshot();
+        for (name, table) in &routing.gather {
+            let n = table.0.len();
+            if planar_scratch.len() < n {
+                planar_scratch.resize(n, Vec::new());
+            }
+            for (slot, alsa_ch) in table.0.iter().enumerate() {
+                match alsa_ch {
+                    Some(ch) => read_channel(*ch, &mut planar_scratch[slot]),
+                    None => {
+                        planar_scratch[slot].clear();
+                        planar_scratch[slot].resize(frames_read, 0.0);
+                    }
+                }
+            }
+            if let Some(Err(e)) = state.is08.write_packed_rx(name, &planar_scratch[..n]) {
+                tracing::error!(flow_name = name, error = %e, "failed to write samples into packed-rx MXL flow");
             }
         }
     }

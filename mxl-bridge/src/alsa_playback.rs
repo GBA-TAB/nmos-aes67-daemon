@@ -107,6 +107,39 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
         }
         drop(sources);
 
+        // Packed-TX flows (opt-in — see nmos/is08.rs): each slot's audio is scattered into every
+        // daemon Source channel the crosspoint currently assigns it to, per the published scatter
+        // table. Applied *after* the default per-Source path above so an explicit crosspoint entry
+        // overrides a Source's own default connection for that specific channel — the more
+        // deliberate routing action wins.
+        let routing = state.is08.routing_snapshot();
+        for (name, table) in &routing.scatter {
+            let planar = match state.is08.read_packed_tx(name, period, read_timeout) {
+                Some(Ok(p)) => p,
+                Some(Err(e)) => {
+                    tracing::warn!(flow_name = name, error = %e, "read failed, resyncing to flow head");
+                    state.is08.resync_packed_tx(name);
+                    continue;
+                }
+                // Torn down since this period's routing snapshot was taken -- harmless, the next
+                // snapshot won't list it either.
+                None => continue,
+            };
+            let frames = planar.first().map(|c| c.len()).unwrap_or(0).min(period);
+            for (slot, targets) in table.0.iter().enumerate() {
+                let Some(src_channel) = planar.get(slot) else { continue };
+                for &(_, alsa_ch) in targets {
+                    if alsa_ch >= channels as usize {
+                        // Same out-of-bounds guard as alsa_capture.rs — see its comment.
+                        continue;
+                    }
+                    for frame_idx in 0..frames {
+                        interleaved[frame_idx * channels as usize + alsa_ch] = (src_channel[frame_idx].clamp(-1.0, 1.0) * S32_FULL_SCALE) as i32;
+                    }
+                }
+            }
+        }
+
         let mut remaining = &interleaved[..];
         while !remaining.is_empty() {
             match io.writei(remaining) {
