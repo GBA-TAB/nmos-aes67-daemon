@@ -33,6 +33,14 @@ METER_HZ="${METER_HZ:-25}"
 # hostname is its short container id by default) for docker-compose/plain `docker run` use, so bus
 # flow ids are still deterministic-per-container without extra config there either.
 INSTANCE_NAME="${INSTANCE_NAME:-$(hostname)}"
+NMOS_LABEL="${NMOS_LABEL:-mxl-test-app ${INSTANCE_NAME}}"
+NMOS_REGISTRY_ADDRESS="${NMOS_REGISTRY_ADDRESS:-}"
+NMOS_REGISTRY_PORT="${NMOS_REGISTRY_PORT:-80}"
+INTERFACE_NAME="${INTERFACE_NAME:-eth0}"
+# The pod's own IP, for building href/manifest_href URLs a registry/controller can actually reach
+# -- Kubernetes' downward API exposes this as $(POD_IP) (fieldRef: status.podIP); falls back to
+# resolving this container's own hostname for docker-compose/plain `docker run` use.
+IP_ADDR="${IP_ADDR:-$(hostname -i 2>/dev/null | awk '{print $1}')}"
 
 CONFIG_PATH="${CONFIG_PATH:-/tmp/mxl-test-app.conf}"
 
@@ -77,6 +85,11 @@ cat > "$CONFIG_PATH" <<EOF
   "mixer_id": ${MIXER_ID},
   "meter_hz": ${METER_HZ},
   "instance_name": "${INSTANCE_NAME}",
+  "nmos_label": "${NMOS_LABEL}",
+  "nmos_registry_address": $([ -n "$NMOS_REGISTRY_ADDRESS" ] && printf '"%s"' "$NMOS_REGISTRY_ADDRESS" || printf 'null'),
+  "nmos_registry_port": ${NMOS_REGISTRY_PORT},
+  "interface_name": "${INTERFACE_NAME}",
+  "ip_addr": "${IP_ADDR}",
   "tracks": [${tracks_json}],
   "buses": [${buses_json}]
 }

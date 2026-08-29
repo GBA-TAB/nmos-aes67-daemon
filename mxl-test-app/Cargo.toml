@@ -13,6 +13,7 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

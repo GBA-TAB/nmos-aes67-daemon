@@ -35,9 +35,22 @@ pub fn packed_tx_flow_id(name: &str) -> uuid::Uuid {
 
 // This app's own ids. These don't need to match anything external — nothing looks them up by
 // name — so reusing the same namespace with an app-local prefix is just for internal consistency,
-// not interop.
-pub fn app_device_id() -> uuid::Uuid {
-    stable_id("mxl-test-app-device")
+// not interop. Node/Device are per-instance (like the bus/track ids below), keyed by
+// `instance_name`, so two replicas registering with the same registry don't collide.
+pub fn node_id(instance_name: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-test-app-instance-node:{instance_name}"))
+}
+pub fn device_id(instance_name: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-test-app-instance-device:{instance_name}"))
+}
+/// A bus's mirrored NMOS Sender id (the Flow's own id is `instance_bus_flow_id`, above — a
+/// Sender is a distinct resource from its Flow).
+pub fn instance_bus_sender_id(instance_name: &str, bus_id: u32) -> uuid::Uuid {
+    stable_id(&format!("mxl-test-app-instance-bus-sender:{instance_name}:{bus_id}"))
+}
+/// A track's mirrored NMOS Receiver id.
+pub fn instance_track_receiver_id(instance_name: &str, track_id: u32) -> uuid::Uuid {
+    stable_id(&format!("mxl-test-app-instance-track-receiver:{instance_name}:{track_id}"))
 }
 
 /// A bus's flow_id when no explicit target is configured (`BusTarget` absent) — derived from an
