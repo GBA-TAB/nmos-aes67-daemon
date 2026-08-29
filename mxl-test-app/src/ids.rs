@@ -33,14 +33,24 @@ pub fn packed_tx_flow_id(name: &str) -> uuid::Uuid {
     stable_id(&format!("mxl-bridge-packed-tx-flow:{name}"))
 }
 
-// This app's own ids, for buses it creates flows for itself (an explicit `flow_id` bus target).
-// These don't need to match anything external — nothing looks them up by name — so reusing the
-// same namespace with an app-local prefix is just for internal consistency, not interop.
+// This app's own ids. These don't need to match anything external — nothing looks them up by
+// name — so reusing the same namespace with an app-local prefix is just for internal consistency,
+// not interop.
 pub fn app_device_id() -> uuid::Uuid {
     stable_id("mxl-test-app-device")
 }
-pub fn bus_source_id(bus_id: u32) -> uuid::Uuid {
-    stable_id(&format!("mxl-test-app-bus-source:{bus_id}"))
+
+/// A bus's flow_id when no explicit target is configured (`BusTarget` absent) — derived from an
+/// `instance_name` (e.g. the pod name, so each replica in a container/Kubernetes deployment gets
+/// distinct, but still deterministic/reproducible-across-restarts, bus flow ids) plus the bus's
+/// own id, rather than requiring every containerized instance's config to spell out an explicit
+/// UUID per bus (see docker-entrypoint.sh, which generates config for an arbitrary track/bus count
+/// without computing any ids itself).
+pub fn instance_bus_flow_id(instance_name: &str, bus_id: u32) -> uuid::Uuid {
+    stable_id(&format!("mxl-test-app-instance-bus-flow:{instance_name}:{bus_id}"))
+}
+pub fn instance_bus_source_id(instance_name: &str, bus_id: u32) -> uuid::Uuid {
+    stable_id(&format!("mxl-test-app-instance-bus-source:{instance_name}:{bus_id}"))
 }
 
 #[cfg(test)]

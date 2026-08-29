@@ -27,8 +27,19 @@ pub struct Config {
     #[serde(default = "default_meter_hz")]
     pub meter_hz: f64,
 
+    /// Identifies this app instance for deriving bus flow ids when a bus has no explicit `target`
+    /// (see `BusTarget`/`ids::instance_bus_flow_id`) — set this to the pod name (Kubernetes'
+    /// downward API exposes it as `$(POD_NAME)`) so replicas in a container/Kubernetes deployment
+    /// each get distinct bus flows without any per-replica config authoring.
+    #[serde(default = "default_instance_name")]
+    pub instance_name: String,
+
     pub tracks: Vec<TrackConfig>,
     pub buses: Vec<BusConfig>,
+}
+
+fn default_instance_name() -> String {
+    "default".to_string()
 }
 
 fn default_channels() -> u32 {
@@ -86,14 +97,16 @@ impl TrackSource {
 pub struct BusConfig {
     pub id: u32,
     pub label: String,
-    /// Where this bus's own MXL flow is created — see `BusTarget`.
-    #[serde(flatten)]
-    pub target: BusTarget,
+    /// Where this bus's own MXL flow is created — see `BusTarget`. Absent means "just give me a
+    /// standalone flow, don't care about its id" — `ids::instance_bus_flow_id` derives one from
+    /// `instance_name` + this bus's own id, so a container-sized deployment (see
+    /// docker-entrypoint.sh) doesn't need to author an explicit target per bus.
+    #[serde(default)]
+    pub target: Option<BusTarget>,
     #[serde(default)]
     pub fader_db: f32,
 }
 
-/// Exactly one of these should be set.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum BusTarget {
@@ -105,11 +118,14 @@ pub enum BusTarget {
     PackedTxName(String),
 }
 
-impl BusTarget {
-    pub fn resolve(&self) -> uuid::Uuid {
-        match self {
-            BusTarget::FlowId(s) => s.parse().unwrap_or_else(|e| panic!("invalid flow_id '{s}': {e}")),
-            BusTarget::PackedTxName(name) => crate::ids::packed_tx_flow_id(name),
+impl BusConfig {
+    /// Resolves this bus's real MXL flow_id: its explicit `target` if given, otherwise a
+    /// standalone id derived from `instance_name` + this bus's own id (see `BusTarget`'s docs).
+    pub fn resolve_flow_id(&self, instance_name: &str) -> uuid::Uuid {
+        match &self.target {
+            Some(BusTarget::FlowId(s)) => s.parse().unwrap_or_else(|e| panic!("invalid flow_id '{s}': {e}")),
+            Some(BusTarget::PackedTxName(name)) => crate::ids::packed_tx_flow_id(name),
+            None => crate::ids::instance_bus_flow_id(instance_name, self.id),
         }
     }
 }
@@ -119,5 +135,42 @@ impl Config {
         let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading config file '{path}': {e}"))?;
         let cfg: Config = serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("parsing config file '{path}': {e}"))?;
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod entrypoint_tests {
+    use super::*;
+
+    /// Pinned against docker-entrypoint.sh's actual output shape (verified by hand against a real
+    /// run of the script with the same env vars) — catches drift between the two independently if
+    /// either the shell script's JSON construction or this struct's schema changes.
+    #[test]
+    fn generated_container_config_parses() {
+        let text = serde_json::json!({
+            "mxl_domain": "/tmp/fake-domain",
+            "sample_rate": 48000,
+            "period_frames": 480,
+            "channels": 2,
+            "ws_port": 9090,
+            "mixer_id": 0,
+            "meter_hz": 25,
+            "instance_name": "test-pod-1",
+            "tracks": [
+                {"id": 0, "label": "Track 1", "bus_assign": []},
+                {"id": 1, "label": "Track 2", "bus_assign": []}
+            ],
+            "buses": [
+                {"id": 0, "label": "Bus 1", "target": {"packed_tx_name": "testmix2"}},
+                {"id": 1, "label": "Bus 2"}
+            ]
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(cfg.tracks.len(), 2);
+        assert_eq!(cfg.buses.len(), 2);
+        assert_eq!(cfg.instance_name, "test-pod-1");
+        assert!(cfg.buses[0].target.is_some());
+        assert!(cfg.buses[1].target.is_none());
     }
 }

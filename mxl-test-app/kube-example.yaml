@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploys mxl-test-app sized purely via env vars/replica count -- no custom app-manager, matching
+# MXL's own reference deployment pattern (mxl/examples/kube-example.yaml: plain Deployments +
+# PersistentVolumeClaim, nothing MXL-specific beyond the shared domain mount). Assumes the
+# `domain-pv`/`domain-pvc` (and the `mxl-domain-volume-lifecycle-controller` that creates the
+# actual tmpfs mount on the node) from that same example already exist -- apply that manifest
+# first, or adapt the volume section below to however your cluster provisions the shared MXL
+# domain. `nodeSelector` is required for the same reason it is there: the MXL domain lives on a
+# node-local tmpfs, so every pod that touches it has to land on that specific node.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mxl-test-app
+spec:
+  replicas: 2 # "more than one container" -- each replica is a fully independent MXL app instance
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mxl-test-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mxl-test-app
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: __HOSTNAME__ # !! CHANGEME, same convention as mxl's own example
+      volumes:
+        - name: domain
+          persistentVolumeClaim:
+            claimName: domain-pvc
+      containers:
+        - name: mxl-test-app
+          image: mxl-test-app:latest
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: domain
+              mountPath: /home/mxl/domain
+          env:
+            - name: MXL_DOMAIN
+              value: /home/mxl/domain
+            # The actual "sizing" knobs -- this is the whole point of the container-starter
+            # approach: change these (or just `replicas` above) to resize, no image rebuild.
+            - name: TRACK_COUNT
+              value: "32"
+            - name: BUS_COUNT
+              value: "8"
+            - name: SAMPLE_RATE
+              value: "48000"
+            - name: PERIOD_FRAMES
+              value: "480"
+            - name: CHANNELS
+              value: "2"
+            - name: WS_PORT
+              value: "9090"
+            # Each replica's own pod name -- keeps bus flow ids distinct per replica without any
+            # per-replica config authoring (see ids::instance_bus_flow_id / config.rs's
+            # `instance_name` docs). Kubernetes' downward API is the normalized way to get a pod
+            # its own identity from inside itself.
+            - name: INSTANCE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - containerPort: 9090
+              name: amixer-ws
+---
+# Caveat: with replicas > 1, a plain load-balanced Service like this sends each new WebSocket
+# connection to an arbitrary replica -- fine if a client just needs "some mixer instance" (e.g.
+# smoke-testing that instances come up healthy), wrong if a controller needs to reach one
+# *specific* replica by name (the normal case for actually driving one mixer's tracks/buses).
+# For that, address pods directly -- e.g. a headless Service (`clusterIP: None`) and DNS names of
+# the form `<pod-name>.mxl-test-app.<namespace>.svc.cluster.local` -- rather than this one.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mxl-test-app
+spec:
+  selector:
+    app.kubernetes.io/name: mxl-test-app
+  ports:
+    - port: 9090
+      targetPort: amixer-ws

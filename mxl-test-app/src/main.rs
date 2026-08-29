@@ -61,13 +61,13 @@ async fn main() -> anyhow::Result<()> {
 
     let mut buses = Vec::with_capacity(cfg.buses.len());
     for b in &cfg.buses {
-        let flow_id = b.target.resolve();
+        let flow_id = b.resolve_flow_id(&cfg.instance_name);
         let writer = FlowWriter::create(
             &cfg.mxl_domain,
             &mxl_so,
             cfg.sample_rate,
             flow_id,
-            ids::bus_source_id(b.id),
+            ids::instance_bus_source_id(&cfg.instance_name, b.id),
             ids::app_device_id(),
             &b.label,
             cfg.channels,
