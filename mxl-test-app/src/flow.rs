@@ -1,0 +1,187 @@
+//! Adapted from mxl-bridge's own `src/mxl_flow.rs` (same per-flow running-index design, same
+//! grouphint-format fix — see its own comment below for why that specific tag value can't be
+//! interpolated with a label). Not shared as a library for the same reason as `ids.rs`: mxl-bridge
+//! is a binary crate. Trimmed to just the generic writer/reader wrapper — this app's own id
+//! derivation lives in `ids.rs`, not here.
+
+/// Builds the flow_def JSON passed to `mxlCreateFlowWriter`. This *is* an NMOS Flow resource JSON.
+pub fn build_audio_flow_def(
+    sample_rate: u32,
+    flow_id: uuid::Uuid,
+    source_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    label: &str,
+    channel_count: u32,
+) -> String {
+    serde_json::json!({
+        "id": flow_id.to_string(),
+        "device_id": device_id.to_string(),
+        "source_id": source_id.to_string(),
+        "label": label,
+        "description": format!("{label} (mxl-test-app bus output)"),
+        "format": "urn:x-nmos:format:audio",
+        "media_type": "audio/float32",
+        "sample_rate": { "numerator": sample_rate, "denominator": 1 },
+        "channel_count": channel_count,
+        "bit_depth": 32,
+        "parents": [],
+        "tags": {
+            // Fixed, never interpolated with `label`: MXL's FlowParser requires this tag's value
+            // as a strict "<scope>:<value>" pair where scope must literally be "device" or
+            // "node" — see mxl-bridge's mxl_flow.rs for how that was found (a colon in the label
+            // broke it there).
+            "urn:x-nmos:tag:grouphint/v1.0": ["device:mxl-test-app"]
+        }
+    })
+    .to_string()
+}
+
+/// Owns the MXL instance and the samples writer for one continuous (audio) flow, plus its own
+/// running write index.
+pub struct FlowWriter {
+    instance: mxl::MxlInstance,
+    writer: mxl::SamplesWriter,
+    channels: usize,
+    sample_rate: mxl::Rational,
+    next_index: Option<u64>,
+}
+
+impl FlowWriter {
+    #[allow(clippy::too_many_arguments)]
+    pub fn create(
+        mxl_domain: &str,
+        mxl_so_path: &std::path::Path,
+        sample_rate: u32,
+        flow_id: uuid::Uuid,
+        source_id: uuid::Uuid,
+        device_id: uuid::Uuid,
+        label: &str,
+        channel_count: u32,
+    ) -> anyhow::Result<Self> {
+        let api = mxl::load_api(mxl_so_path).map_err(|e| anyhow::anyhow!("mxl::load_api({mxl_so_path:?}) failed: {e:?}"))?;
+        let instance =
+            mxl::MxlInstance::new(api, mxl_domain, "").map_err(|e| anyhow::anyhow!("MxlInstance::new({mxl_domain}) failed: {e:?}"))?;
+
+        let flow_def = build_audio_flow_def(sample_rate, flow_id, source_id, device_id, label, channel_count);
+
+        let (writer, info, was_created) =
+            instance.create_flow_writer(&flow_def, None).map_err(|e| anyhow::anyhow!("create_flow_writer failed: {e:?}"))?;
+        if !was_created {
+            tracing::warn!(%flow_id, "reusing pre-existing MXL flow (was not newly created)");
+        }
+        let channels = info
+            .continuous()
+            .map_err(|e| anyhow::anyhow!("flow is not a continuous (audio) flow: {e:?}"))?
+            .channelCount as usize;
+        if channels != channel_count as usize {
+            anyhow::bail!("MXL flow channel_count ({channels}) does not match expected ({channel_count})");
+        }
+
+        let writer = writer.to_samples_writer().map_err(|e| anyhow::anyhow!("to_samples_writer failed: {e:?}"))?;
+
+        let sample_rate = mxl::Rational { numerator: sample_rate as i64, denominator: 1 };
+        Ok(Self { instance, writer, channels, sample_rate, next_index: None })
+    }
+
+    /// Writes one period of planar float32 samples, continuing this flow's own monotonic index
+    /// from wherever the previous call left off (seeded from MXL's own current-time-based index on
+    /// the first call).
+    pub fn write_next(&mut self, planar: &[Vec<f32>]) -> anyhow::Result<()> {
+        let count = planar.first().map(|c| c.len()).unwrap_or(0);
+        if count == 0 {
+            return Ok(());
+        }
+        let index = match self.next_index {
+            Some(i) => i,
+            None => self.instance.get_current_index(&self.sample_rate),
+        };
+
+        let mut access =
+            self.writer.open_samples(index + count as u64 - 1, count).map_err(|e| anyhow::anyhow!("open_samples failed: {e:?}"))?;
+
+        for ch in 0..self.channels.min(planar.len()) {
+            let (dst1, dst2) = access.channel_data_mut(ch).map_err(|e| anyhow::anyhow!("channel_data_mut({ch}) failed: {e:?}"))?;
+            let src = &planar[ch];
+            let src_bytes: &[u8] = bytemuck_cast_f32_slice(src);
+            let (b1, b2) = src_bytes.split_at(dst1.len().min(src_bytes.len()));
+            dst1[..b1.len()].copy_from_slice(b1);
+            if !b2.is_empty() {
+                dst2[..b2.len()].copy_from_slice(b2);
+            }
+        }
+
+        access.commit().map_err(|e| anyhow::anyhow!("commit failed: {e:?}"))?;
+        self.next_index = Some(index + count as u64);
+        Ok(())
+    }
+}
+
+fn bytemuck_cast_f32_slice(src: &[f32]) -> &[u8] {
+    // SAFETY: f32 has no padding and any bit pattern is valid; the resulting slice's lifetime and
+    // length are derived correctly from the source.
+    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, std::mem::size_of_val(src)) }
+}
+
+/// Reads an existing MXL audio flow — some other producer (mxl-bridge, or another MXL app) writes
+/// it, this app consumes and mixes it.
+pub struct FlowReader {
+    reader: mxl::SamplesReader,
+    channels: usize,
+    next_index: Option<u64>,
+}
+
+impl FlowReader {
+    pub fn open(mxl_domain: &str, mxl_so_path: &std::path::Path, flow_id: &str, expected_channels: usize) -> anyhow::Result<Self> {
+        let api = mxl::load_api(mxl_so_path).map_err(|e| anyhow::anyhow!("mxl::load_api({mxl_so_path:?}) failed: {e:?}"))?;
+        let instance =
+            mxl::MxlInstance::new(api, mxl_domain, "").map_err(|e| anyhow::anyhow!("MxlInstance::new({mxl_domain}) failed: {e:?}"))?;
+
+        let reader =
+            instance.create_flow_reader(flow_id).map_err(|e| anyhow::anyhow!("create_flow_reader({flow_id}) failed: {e:?}"))?;
+        let info = reader.get_info().map_err(|e| anyhow::anyhow!("get_info failed: {e:?}"))?.config;
+        let channels = info
+            .continuous()
+            .map_err(|e| anyhow::anyhow!("flow {flow_id} is not a continuous (audio) flow: {e:?}"))?
+            .channelCount as usize;
+        if channels != expected_channels {
+            anyhow::bail!("MXL flow channel_count ({channels}) does not match expected ({expected_channels})");
+        }
+
+        let reader = reader.to_samples_reader().map_err(|e| anyhow::anyhow!("to_samples_reader failed: {e:?}"))?;
+        Ok(Self { reader, channels, next_index: None })
+    }
+
+    pub fn head_index(&self) -> anyhow::Result<u64> {
+        Ok(self.reader.get_runtime_info().map_err(|e| anyhow::anyhow!("get_runtime_info failed: {e:?}"))?.headIndex)
+    }
+
+    pub fn resync_to_head(&mut self) -> anyhow::Result<()> {
+        self.next_index = Some(self.head_index()?);
+        Ok(())
+    }
+
+    pub fn read_next(&mut self, count: usize, timeout: std::time::Duration) -> anyhow::Result<Vec<Vec<f32>>> {
+        let index = match self.next_index {
+            Some(i) => i,
+            None => self.head_index()?,
+        };
+        let planar = self.read_samples_at(index, count, timeout)?;
+        self.next_index = Some(index + count as u64);
+        Ok(planar)
+    }
+
+    fn read_samples_at(&self, index: u64, count: usize, timeout: std::time::Duration) -> anyhow::Result<Vec<Vec<f32>>> {
+        let data = self.reader.get_samples(index, count, timeout).map_err(|e| anyhow::anyhow!("get_samples failed: {e:?}"))?;
+
+        let mut planar = Vec::with_capacity(self.channels);
+        for ch in 0..self.channels {
+            let (b1, b2) = data.channel_data(ch).map_err(|e| anyhow::anyhow!("channel_data({ch}) failed: {e:?}"))?;
+            let mut bytes = Vec::with_capacity(b1.len() + b2.len());
+            bytes.extend_from_slice(b1);
+            bytes.extend_from_slice(b2);
+            let samples: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            planar.push(samples);
+        }
+        Ok(planar)
+    }
+}
