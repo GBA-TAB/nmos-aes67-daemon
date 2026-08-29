@@ -33,6 +33,39 @@ pub struct Config {
     pub tx_source_flow_id: Option<String>,
     #[serde(default)]
     pub tx_alsa_playback_device: Option<String>,
+
+    // ---- Phase 2: NMOS/2110-first slot model (see the mxl-bridge Phase 2 plan) ----
+    /// Base URL of the C++ daemon's own HTTP API (e.g. "http://127.0.0.1:8081"), polled for its
+    /// live Source/Sink set and its alsa_channels pool ceiling — this is the "mirror the daemon's
+    /// actual resources" data source, replacing the raw ALSA-device-string config above as the
+    /// source of truth once the resource model catches up (Milestone 2+).
+    pub daemon_api_url: String,
+    /// How often to poll GET /api/streams + GET /api/config. A provisioning PUT (Milestone 5)
+    /// triggers an immediate out-of-cycle refresh on top of this, so this interval only bounds
+    /// latency for changes the daemon makes independently (e.g. via its own web UI).
+    #[serde(default = "default_daemon_poll_interval_ms")]
+    pub daemon_poll_interval_ms: u64,
+    /// Fallback alsa_channels ceiling used only if the daemon is unreachable when mxl-bridge starts
+    /// (the live value from GET /api/config is authoritative once a poll succeeds).
+    #[serde(default = "default_alsa_channels_fallback")]
+    pub alsa_channels_fallback: u8,
+    /// Inclusive [min, max] daemon Sink id range mxl-bridge is allowed to provision into on-demand
+    /// (Milestone 5) — kept disjoint from ids an operator assigns by hand through the daemon's own
+    /// config/UI.
+    #[serde(default)]
+    pub provisioned_sink_id_range: Option<(u8, u8)>,
+    /// How many always-inactive "not yet backing a Sink" spare Receivers to keep advertised at once
+    /// for on-demand provisioning (Milestone 5). 0 disables on-demand provisioning entirely.
+    #[serde(default)]
+    pub spare_receiver_slots: u8,
+}
+
+fn default_daemon_poll_interval_ms() -> u64 {
+    1500
+}
+
+fn default_alsa_channels_fallback() -> u8 {
+    64
 }
 
 impl Config {

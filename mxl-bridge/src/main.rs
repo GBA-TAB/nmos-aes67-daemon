@@ -2,6 +2,7 @@ mod alsa_capture;
 mod alsa_playback;
 mod clock;
 mod config;
+mod daemon_client;
 mod mxl_flow;
 mod nmos;
 
