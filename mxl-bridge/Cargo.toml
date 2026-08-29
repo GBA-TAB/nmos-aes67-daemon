@@ -1,0 +1,20 @@
+[package]
+name = "mxl-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+mxl = { path = "../../mxl/rust/mxl" }
+
+alsa = "0.9"
+libc = "0.2"
+uuid = { version = "1.17", features = ["v5", "v4"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
