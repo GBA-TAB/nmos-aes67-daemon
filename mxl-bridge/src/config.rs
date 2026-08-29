@@ -20,6 +20,15 @@ pub struct Config {
     pub nmos_registry_address: Option<String>,
     pub nmos_registry_port: u16,
     pub interface_name: String,
+
+    /// TX direction (MXL flow -> ALSA playback): which flow to consume and which ALSA device to
+    /// play it out on. Both optional and both required together — real deployments will get this
+    /// from IS-05 activation instead (not implemented yet, see README), this is a manual override
+    /// for testing the TX path standalone.
+    #[serde(default)]
+    pub tx_source_flow_id: Option<String>,
+    #[serde(default)]
+    pub tx_alsa_playback_device: Option<String>,
 }
 
 impl Config {

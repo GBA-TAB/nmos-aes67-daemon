@@ -120,3 +120,90 @@ fn bytemuck_cast_f32_slice(src: &[f32]) -> &[u8] {
     // length are derived correctly from the source.
     unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, std::mem::size_of_val(src)) }
 }
+
+/// Reads an existing MXL audio flow (TX direction — some other producer, possibly this same
+/// process's own MxlAudioFlow, or a genuinely separate MXL app, writes it; we consume and play it
+/// out over ALSA). Which flow_id to open is an IS-05 activation concern (not yet wired up — see
+/// README), passed in directly for now.
+pub struct MxlAudioFlowSource {
+    reader: mxl::SamplesReader,
+    channels: usize,
+}
+
+impl MxlAudioFlowSource {
+    pub fn open(cfg: &Config, mxl_so_path: &std::path::Path, flow_id: &str) -> anyhow::Result<Self> {
+        let api = mxl::load_api(mxl_so_path)
+            .map_err(|e| anyhow::anyhow!("mxl::load_api({mxl_so_path:?}) failed: {e:?}"))?;
+        let instance = mxl::MxlInstance::new(api, &cfg.mxl_domain, "")
+            .map_err(|e| anyhow::anyhow!("MxlInstance::new({}) failed: {e:?}", cfg.mxl_domain))?;
+
+        let reader = instance
+            .create_flow_reader(flow_id)
+            .map_err(|e| anyhow::anyhow!("create_flow_reader({flow_id}) failed: {e:?}"))?;
+        let info = reader
+            .get_info()
+            .map_err(|e| anyhow::anyhow!("get_info failed: {e:?}"))?
+            .config;
+        let channels = info
+            .continuous()
+            .map_err(|e| anyhow::anyhow!("flow {flow_id} is not a continuous (audio) flow: {e:?}"))?
+            .channelCount as usize;
+        if channels != cfg.channels as usize {
+            anyhow::bail!(
+                "MXL flow channel_count ({channels}) does not match configured channels ({})",
+                cfg.channels
+            );
+        }
+
+        let reader = reader
+            .to_samples_reader()
+            .map_err(|e| anyhow::anyhow!("to_samples_reader failed: {e:?}"))?;
+
+        // `instance` isn't stored on Self: `SamplesReader` already keeps its own
+        // Arc<InstanceContext> alive internally, so nothing here needs a separate handle to it.
+        Ok(Self { reader, channels })
+    }
+
+    /// Current write head of the flow — the sensible starting point for a fresh reader (matches
+    /// mxl's own flow-reader.rs example), rather than "now" per wall clock, since the writer may be
+    /// behind that.
+    pub fn head_index(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .reader
+            .get_runtime_info()
+            .map_err(|e| anyhow::anyhow!("get_runtime_info failed: {e:?}"))?
+            .headIndex)
+    }
+
+    /// Blocking read of `count` samples ending at `index` (same end-of-batch indexing convention as
+    /// write_samples). Returns owned planar float32 data, one Vec<f32> per channel.
+    pub fn read_samples(
+        &self,
+        index: u64,
+        count: usize,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let data = self
+            .reader
+            .get_samples(index, count, timeout)
+            .map_err(|e| anyhow::anyhow!("get_samples failed: {e:?}"))?;
+
+        let mut planar = Vec::with_capacity(self.channels);
+        for ch in 0..self.channels {
+            let (b1, b2) = data
+                .channel_data(ch)
+                .map_err(|e| anyhow::anyhow!("channel_data({ch}) failed: {e:?}"))?;
+            let mut bytes = Vec::with_capacity(b1.len() + b2.len());
+            bytes.extend_from_slice(b1);
+            bytes.extend_from_slice(b2);
+            // bytes is exactly count * 4 (f32) bytes per channel by construction (get_samples
+            // returns `count` samples' worth of data per fragment pair).
+            let samples: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            planar.push(samples);
+        }
+        Ok(planar)
+    }
+}

@@ -1,10 +1,11 @@
 mod alsa_capture;
+mod alsa_playback;
 mod clock;
 mod config;
 mod mxl_flow;
 
 use config::Config;
-use mxl_flow::MxlAudioFlow;
+use mxl_flow::{MxlAudioFlow, MxlAudioFlowSource};
 
 /// mxl-sys builds libmxl.so under `target/{debug,release}/build/mxl-sys-<fingerprint>/out/lib/`,
 /// alongside wherever this binary itself lives (`target/{debug,release}/mxl-bridge`) — the
@@ -59,7 +60,29 @@ fn main() -> anyhow::Result<()> {
     let flow = MxlAudioFlow::create(&cfg, &mxl_so)?;
     tracing::info!(flow_id = %flow.flow_id, "MXL flow created");
 
-    // ALSA I/O is blocking; run the capture+write loop on its own OS thread. The NMOS layer (not
-    // yet implemented) will own the main thread's async runtime.
-    alsa_capture::run(cfg, flow)
+    // ALSA I/O is blocking, so RX/TX each run on their own OS thread. The NMOS layer (not yet
+    // implemented) will own the main thread's async runtime; for now main() just joins whichever
+    // of these are configured.
+    let mut handles = Vec::new();
+    {
+        let cfg = cfg.clone();
+        handles.push(std::thread::spawn(move || alsa_capture::run(cfg, flow)));
+    }
+    if let (Some(flow_id), Some(device)) =
+        (cfg.tx_source_flow_id.clone(), cfg.tx_alsa_playback_device.clone())
+    {
+        let cfg = cfg.clone();
+        let mxl_so = mxl_so.clone();
+        handles.push(std::thread::spawn(move || {
+            let source = MxlAudioFlowSource::open(&cfg, &mxl_so, &flow_id)?;
+            alsa_playback::run(cfg, device, source)
+        }));
+    }
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("a bridge thread panicked"))??;
+    }
+    Ok(())
 }

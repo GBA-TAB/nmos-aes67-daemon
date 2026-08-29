@@ -21,9 +21,9 @@ Full design rationale lives in the conversation that produced this skeleton; the
 - **ALSA-layer integration, not RTP-layer.** Opens the RAVENNA PCM device directly as an independent
   client (same proven pattern as `alsa_src_driver.cpp`, which already does this for both capture and
   playback, independently of the C++ daemon). Never touches RTP, SDP, or the daemon's internals.
-- **Phase 1 scope: RX direction only** (AES67/ALSA capture → MXL flow, exposed as an NMOS Sender).
-  TX (MXL flow → ALSA playback, NMOS Receiver) is the structural mirror image and is the natural next
-  slice. RDMA/Fabrics cross-host wiring is a later phase, once same-host RX+TX both work.
+- **Phase 1 scope: same-host RX and TX** (AES67/ALSA capture → MXL flow, and MXL flow → ALSA
+  playback — both now implemented and verified). RDMA/Fabrics cross-host wiring is a later phase,
+  once the NMOS layer sits on top of this.
 - **IS-05 activation needs zero orchestrator changes.** The orchestrator's `ConnectionService`
   (`~/DEV/visualUniverse-nmosrouter*`) relays whatever a sender's `manifest_href` returns into the
   receiver's `/staged` PATCH but never validates it — so a receiver here can just ignore that relayed
@@ -33,20 +33,42 @@ Full design rationale lives in the conversation that produced this skeleton; the
 
 ## Status
 
-**RX direction (AES67/ALSA capture → MXL flow) works end to end**, verified with a real audio signal:
-ALSA Loopback (`snd-aloop`) fed a 440Hz test tone on the playback side, `mxl-bridge` captured from the
-paired capture subdevice, and MXL's own `mxl-info` tool (built separately from the MXL repo for
-verification, not a `mxl-bridge` dependency) confirmed the resulting flow had the correct format
-(`Audio`, 48000/1, 2 channels), a stable ~9ms latency matching the configured period exactly, and a head
-index advancing at ~48000/s in real time while the process ran. Not yet verified: actual sample *content*
-correctness (that it's really a clean sine wave and not, say, silence or a scaled/clipped version) — the
-available MXL CLI tools (`mxl-data-probe`) only read ANC/Data flows, not audio; would need a small custom
-`SamplesReader`-based check or a `mxl-gst` sink piped to an analyzer to confirm that specifically.
+**Same-host RX and TX both work end to end**, verified with a full round trip through real ALSA hardware
+(well, `snd-aloop`) and a real MXL flow in between — no shortcuts:
 
-Still to build: config for a real RAVENNA device (only tested against ALSA Loopback so far), the TX
-direction (MXL flow → ALSA playback), and the whole NMOS Node/IS-04/IS-05 layer (`nmos_node_port`,
-`nmos_label`, `nmos_registry_address`, etc. are already in `Config` but unused — the process currently
-just runs the capture loop directly with no NMOS surface at all).
+`speaker-test` (440Hz sine, `hw:Loopback,0,1`) → `mxl-bridge` RX (`hw:Loopback,1,1` capture → MXL flow) →
+`mxl-bridge` TX (same flow → `hw:Loopback,0,2` playback) → `arecord` (`hw:Loopback,1,2`) → WAV file.
+
+Checked two ways:
+- **Structural**: MXL's own `mxl-info` tool (built separately from the MXL repo for verification, not a
+  `mxl-bridge` dependency) confirmed the RX-written flow had the correct format (`Audio`, 48000/1, 2
+  channels), a stable ~9ms latency matching the configured period exactly, and a head index advancing at
+  ~48000/s in real time.
+- **Content**: the captured round-trip WAV was analyzed (zero-crossing rate, min/max, RMS) — amplitude
+  stayed within ±0.8 of full scale (no clipping), RMS (0.556× peak) matched sine-wave theory (0.566×
+  expected), and the zero-crossing frequency estimate (427Hz) was close to the actual 440Hz tone. This is
+  the first real confirmation that sample *content* survives the round trip correctly, not just flow
+  structure/timing.
+
+One real bug found and fixed along the way: the TX read loop's error path `continue`d before reaching the
+index-advance line, so any transient read failure (an `OutOfRangeTooLate` happened once at startup, before
+the writer had produced anything yet) turned into an infinite retry loop stuck on the same stale index.
+Fixed by resyncing to the flow's actual current head (`head_index()`) on any read error instead of blindly
+retrying — the more generally-correct behavior anyway (self-heals if the reader ever falls behind or the
+writer restarts), not just a one-off patch.
+
+**Caveat on both tests above**: this dev environment has no PTP grandmaster, so `clock_tai_driver`'s servo
+had nothing to discipline `CLOCK_TAI` against — it was running free (unsynchronized, though still validly
+TAI-formatted). The tests only demonstrate *internal* timing consistency (one host, one shared local clock
+feeding the whole pipeline), not real synchronization to an external reference. That distinction will
+matter once cross-host (Fabrics/RDMA) work needs two hosts' clocks to actually agree — worth re-verifying
+against a real PTP grandmaster before trusting this for that.
+
+Still to build: config for a real RAVENNA device (only tested against ALSA Loopback so far) and the whole
+NMOS Node/IS-04/IS-05 layer (`nmos_node_port`, `nmos_label`, `nmos_registry_address`, etc. are already in
+`Config` but unused — the process currently runs RX/TX directly with `tx_source_flow_id`/
+`tx_alsa_playback_device` config overrides standing in for what IS-05 activation should eventually drive,
+no NMOS surface at all yet).
 
 **Resolved**: `mxl::load_api()` (dynamic `dlopen` via `libloading`) works fine given an absolute path —
 `find_mxl_so()` in `main.rs` locates the built `libmxl.so` at runtime by searching
