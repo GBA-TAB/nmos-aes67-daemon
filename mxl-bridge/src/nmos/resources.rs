@@ -20,7 +20,9 @@ pub fn node_json(state: &NmosState, ip: &str) -> serde_json::Value {
         "description": "mxl-bridge: AES67/ALSA <-> MXL bridge",
         "tags": {},
         "href": format!("{base}/"),
-        "hostname": null,
+        // Must be a real string per the IS-04 schema, never null (gethostname(2) failing at all is
+        // exceedingly unlikely, but the schema gives no null-safe fallback if it did).
+        "hostname": crate::clock::system_hostname().unwrap_or_else(|| "mxl-bridge".to_string()),
         "api": {
             "versions": ["v1.3"],
             "endpoints": [{

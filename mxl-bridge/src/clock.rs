@@ -14,3 +14,17 @@ pub fn tai_now_ns() -> u64 {
     }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
+
+/// The OS's own hostname (`gethostname(2)`), for the NMOS Node's `hostname` field. IS-04's schema
+/// requires this to be a real string or omitted entirely — not `null` (found the hard way: the
+/// registry rejects a `null` hostname with a generic "no subschema succeeded" 400).
+pub fn system_hostname() -> Option<String> {
+    let mut buf = vec![0u8; 256];
+    // SAFETY: buf is a valid, correctly-sized out-buffer for gethostname.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..nul].to_vec()).ok()
+}
