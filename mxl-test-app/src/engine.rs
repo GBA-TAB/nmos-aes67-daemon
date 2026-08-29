@@ -1,12 +1,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::mixer::{db_to_linear, is_muted, is_soloed, peak_to_db, Bus, Track};
+use crate::mixer::{db_to_linear, is_muted, is_soloed, mix_into, peak_to_db, Bus, Track};
 
 pub struct MixerState {
     pub tracks: Vec<Arc<Track>>,
     pub buses: Vec<Arc<Bus>>,
-    pub channels: usize,
+    /// The widest channel count across every track and bus — sizes shared scratch buffers, which
+    /// each period's work then only uses the first `resource.channels` entries of (see `run`).
+    /// Not a uniform width every track/bus has to match — each has its own `channels` (mixer.rs).
+    pub max_channels: usize,
     pub period_frames: usize,
     pub sample_rate: u32,
 }
@@ -23,9 +26,11 @@ pub struct MixerState {
 /// whatever the previous iteration's processing actually cost, the same class of fix mxl's own
 /// `get_duration_until_index`/`sleep_for` example pattern exists for.
 ///
-/// Each period reads every track with an open reader, applies gain+fader, sums whatever's
-/// assigned into each bus (respecting mute/solo), applies the bus's own fader, and writes the
-/// result to that bus's real MXL flow. Runs on its own OS thread — same `std::sync::Mutex` +
+/// Each period reads every track with an open reader (at *that track's own* channel count —
+/// tracks and buses aren't all the same width, see mixer.rs), applies gain+fader, sums whatever's
+/// assigned into each bus (respecting mute/solo, and mixer.rs's `mix_into` for a mono/wider
+/// mismatch), applies the bus's own fader, and writes the result to that bus's real MXL flow (at
+/// *that bus's own* channel count). Runs on its own OS thread — same `std::sync::Mutex` +
 /// blocking-from-a-plain-thread reasoning as mxl-bridge's RX/TX threads (see mixer.rs's field
 /// docs), since the WebSocket handlers that mutate gain/fader/mute/solo/bus-assign run on tokio
 /// tasks concurrently with this loop.
@@ -38,15 +43,18 @@ pub fn run(state: Arc<MixerState>) {
     tracing::info!(
         tracks = state.tracks.len(),
         buses = state.buses.len(),
-        channels = state.channels,
+        max_channels = state.max_channels,
         period,
         "starting mixer engine"
     );
 
-    // Reused across periods, one entry per track, to avoid a fresh Vec<Vec<f32>> allocation every
-    // period for every track.
-    let mut track_signal: Vec<Vec<Vec<f32>>> = vec![vec![Vec::new(); state.channels]; state.tracks.len()];
-    let mut bus_sum: Vec<Vec<f32>> = vec![Vec::new(); state.channels];
+    // Reused across periods: one scratch buffer per track, each sized to *that track's own*
+    // channel count once at startup (a track's channel count never changes after startup, so this
+    // sizing is done once here, not re-derived every period).
+    let mut track_signal: Vec<Vec<Vec<f32>>> = state.tracks.iter().map(|t| vec![Vec::new(); t.channels]).collect();
+    // One shared scratch buffer sized to the widest bus, reused (and only partially filled, via
+    // `[..bus.channels]`) for every bus in turn each period.
+    let mut bus_sum: Vec<Vec<f32>> = vec![Vec::new(); state.max_channels];
 
     loop {
         let any_solo = state.tracks.iter().any(|t| is_soloed(&t.solo));
@@ -58,7 +66,7 @@ pub fn run(state: Arc<MixerState>) {
                 for ch in signal.iter_mut() {
                     ch.clear();
                 }
-                *track.meter_db.lock().unwrap() = vec![f32::NEG_INFINITY; state.channels];
+                *track.meter_db.lock().unwrap() = vec![f32::NEG_INFINITY; track.channels];
                 continue;
             };
             let planar = match r.read_next(period, read_timeout) {
@@ -71,7 +79,7 @@ pub fn run(state: Arc<MixerState>) {
                     for ch in signal.iter_mut() {
                         ch.clear();
                     }
-                    *track.meter_db.lock().unwrap() = vec![f32::NEG_INFINITY; state.channels];
+                    *track.meter_db.lock().unwrap() = vec![f32::NEG_INFINITY; track.channels];
                     continue;
                 }
             };
@@ -82,8 +90,8 @@ pub fn run(state: Arc<MixerState>) {
             let audible = !is_muted(&track.mute) && (!any_solo || is_soloed(&track.solo));
             let scale = if audible { gain * fader } else { 0.0 };
 
-            let mut meters = Vec::with_capacity(state.channels);
-            for ch in 0..state.channels {
+            let mut meters = Vec::with_capacity(track.channels);
+            for ch in 0..track.channels {
                 let src = planar.get(ch).map(Vec::as_slice).unwrap_or(&[]);
                 signal[ch].clear();
                 signal[ch].extend(src.iter().map(|&s| s * scale));
@@ -94,7 +102,8 @@ pub fn run(state: Arc<MixerState>) {
         }
 
         for bus in &state.buses {
-            for ch in bus_sum.iter_mut() {
+            let dst = &mut bus_sum[..bus.channels];
+            for ch in dst.iter_mut() {
                 ch.clear();
                 ch.resize(period, 0.0);
             }
@@ -102,17 +111,14 @@ pub fn run(state: Arc<MixerState>) {
                 if !track.bus_assign.lock().unwrap().contains(&bus.id) {
                     continue;
                 }
-                for ch in 0..state.channels {
-                    let src = &track_signal[i][ch];
-                    for (dst, &s) in bus_sum[ch].iter_mut().zip(src.iter()) {
-                        *dst += s;
-                    }
-                }
+                // Startup validation (main.rs) already warned about any incompatible pairing --
+                // mix_into itself just quietly no-ops for one, doesn't need to log here too.
+                mix_into(&track_signal[i], dst, period);
             }
 
             let fader = if is_muted(&bus.mute) { 0.0 } else { db_to_linear(*bus.fader_db.lock().unwrap()) };
-            let mut meters = Vec::with_capacity(state.channels);
-            for ch in bus_sum.iter_mut() {
+            let mut meters = Vec::with_capacity(bus.channels);
+            for ch in dst.iter_mut() {
                 let mut peak = 0.0f32;
                 for s in ch.iter_mut() {
                     *s *= fader;
@@ -122,7 +128,7 @@ pub fn run(state: Arc<MixerState>) {
             }
             *bus.meter_db.lock().unwrap() = meters;
 
-            if let Err(e) = bus.writer.lock().unwrap().write_next(&bus_sum) {
+            if let Err(e) = bus.writer.lock().unwrap().write_next(dst) {
                 tracing::error!(bus_id = bus.id, error = %e, "failed to write samples into bus MXL flow");
             }
         }

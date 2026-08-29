@@ -23,7 +23,6 @@ use axum::Router;
 use tokio::sync::broadcast;
 
 use crate::engine::MixerState;
-use crate::flow::FlowReader;
 use crate::mixer::{Bus, Track};
 
 #[derive(Clone)]
@@ -128,9 +127,8 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, value: &serde_
         // channel count), logged rather than crashing the whole app over one bad PUT.
         "source" => {
             let Some(flow_id) = value.as_str() else { return };
-            match FlowReader::open(&state.mxl_domain, &state.mxl_so_path, flow_id, state.mixer.channels) {
-                Ok(reader) => *track.reader.lock().unwrap() = Some(reader),
-                Err(e) => tracing::warn!(track_id = track.id, flow_id, error = %e, "PUT source: failed to open flow"),
+            if let Err(e) = track.open_source(&state.mxl_domain, &state.mxl_so_path, flow_id) {
+                tracing::warn!(track_id = track.id, flow_id, error = %e, "PUT source: failed to open flow");
             }
         }
         _ => {}

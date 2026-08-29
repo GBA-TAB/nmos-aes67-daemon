@@ -3,6 +3,7 @@ mod engine;
 mod flow;
 mod ids;
 mod mixer;
+mod nmos;
 mod ws;
 
 use std::sync::Arc;
@@ -43,10 +44,9 @@ async fn main() -> anyhow::Result<()> {
     let mxl_so = find_mxl_so()?;
     tracing::info!(?mxl_so, "resolved libmxl.so");
 
-    let channels = cfg.channels as usize;
-
     let mut tracks = Vec::with_capacity(cfg.tracks.len());
     for t in &cfg.tracks {
+        let channels = t.channels.unwrap_or(cfg.channels) as usize;
         let track = Track::new(t, channels);
         if let Some(source) = &t.source {
             let flow_id = source.resolve();
@@ -55,12 +55,13 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => tracing::warn!(track_id = t.id, %flow_id, error = %e, "failed to open configured track source at startup"),
             }
         }
-        tracing::info!(track_id = track.id, label = %track.label, has_source = t.source.is_some(), "track ready");
+        tracing::info!(track_id = track.id, label = %track.label, channels, has_source = t.source.is_some(), "track ready");
         tracks.push(Arc::new(track));
     }
 
     let mut buses = Vec::with_capacity(cfg.buses.len());
     for b in &cfg.buses {
+        let channels = b.channels.unwrap_or(cfg.channels) as usize;
         let flow_id = b.resolve_flow_id(&cfg.instance_name);
         let writer = FlowWriter::create(
             &cfg.mxl_domain,
@@ -68,39 +69,69 @@ async fn main() -> anyhow::Result<()> {
             cfg.sample_rate,
             flow_id,
             ids::instance_bus_source_id(&cfg.instance_name, b.id),
-            ids::app_device_id(),
+            ids::device_id(&cfg.instance_name),
             &b.label,
-            cfg.channels,
+            channels as u32,
         )
         .map_err(|e| anyhow::anyhow!("creating bus {} ('{}') flow {flow_id}: {e}", b.id, b.label))?;
-        let bus = Arc::new(Bus::new(b, writer, channels));
-        tracing::info!(bus_id = bus.id, label = %bus.label, %flow_id, "bus MXL flow ready");
+        let bus = Arc::new(Bus::new(b, flow_id, writer, channels));
+        tracing::info!(bus_id = bus.id, label = %bus.label, %flow_id, channels, "bus MXL flow ready");
         buses.push(bus);
     }
 
-    let mixer =
-        Arc::new(MixerState { tracks, buses, channels, period_frames: cfg.period_frames as usize, sample_rate: cfg.sample_rate });
+    // Warn once per incompatible track->bus channel-count pairing (see mixer::mix_into's docs for
+    // exactly which combinations it can handle) rather than let the engine silently no-op forever
+    // at audio rate for a mismatch nobody flagged.
+    for t in &tracks {
+        for &bus_id in t.bus_assign.lock().unwrap().iter() {
+            if let Some(bus) = buses.iter().find(|b| b.id == bus_id) {
+                if !mixer::channels_compatible(t.channels, bus.channels) {
+                    tracing::warn!(
+                        track_id = t.id,
+                        track_channels = t.channels,
+                        bus_id = bus.id,
+                        bus_channels = bus.channels,
+                        "track's channel count is not compatible with assigned bus's -- this pairing will be silently dropped by the mixer engine every period"
+                    );
+                }
+            }
+        }
+    }
+
+    let max_channels =
+        tracks.iter().map(|t| t.channels).chain(buses.iter().map(|b| b.channels)).max().unwrap_or(cfg.channels as usize);
+
+    let mixer = Arc::new(MixerState {
+        tracks,
+        buses,
+        max_channels,
+        period_frames: cfg.period_frames as usize,
+        sample_rate: cfg.sample_rate,
+    });
 
     {
         let mixer = mixer.clone();
         std::thread::spawn(move || engine::run(mixer));
     }
 
+    // NMOS (IS-04 Node API / IS-05 Connection API) makes this a real NMOS Node -- one Sender per
+    // bus, one Receiver per track -- discoverable/controllable via the registry like any other
+    // device, not just the amixer WebSocket protocol. Merged into the same HTTP server/port as
+    // the WebSocket endpoint below (mxl-bridge's own precedent for merging its IS-08 layer into
+    // one Node API port, rather than opening a second listener).
+    let nmos_state = Arc::new(nmos::NmosState::new(cfg.clone(), mxl_so.clone(), mixer.clone()));
+    nmos::spawn_registration(nmos_state.clone());
+
     let (updates_tx, _) = tokio::sync::broadcast::channel(1024);
-    let ws_state = ws::WsState {
-        mixer: mixer.clone(),
-        mixer_id: cfg.mixer_id,
-        mxl_domain: cfg.mxl_domain.clone(),
-        mxl_so_path: mxl_so,
-        updates: updates_tx,
-    };
+    let ws_state =
+        ws::WsState { mixer: mixer.clone(), mixer_id: cfg.mixer_id, mxl_domain: cfg.mxl_domain.clone(), mxl_so_path: mxl_so, updates: updates_tx };
 
     tokio::spawn(ws::run_meter_broadcaster(ws_state.clone(), cfg.meter_hz));
 
-    let app = ws::router(ws_state);
+    let app = nmos::server::router(nmos_state).merge(ws::router(ws_state));
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", cfg.ws_port))
         .await
-        .map_err(|e| anyhow::anyhow!("binding WebSocket server to 0.0.0.0:{}: {e}", cfg.ws_port))?;
-    tracing::info!(port = cfg.ws_port, "amixer WebSocket server listening at /amixer/api/socket");
+        .map_err(|e| anyhow::anyhow!("binding HTTP server to 0.0.0.0:{}: {e}", cfg.ws_port))?;
+    tracing::info!(port = cfg.ws_port, "amixer WebSocket + NMOS Node/Connection API listening");
     axum::serve(listener, app).await.map_err(|e| anyhow::anyhow!("HTTP server error: {e}"))
 }

@@ -9,9 +9,12 @@ pub struct Config {
     /// ALSA-style period size in frames — also this app's own audio-engine block size and MXL
     /// sample-batch size per commit, same convention as mxl-bridge's `period_frames`.
     pub period_frames: u32,
-    /// Every track and bus is this many channels (stereo by default) — no per-track channel count
-    /// or mono/pan downmixing in this first pass (see ids.rs module docs' sibling note in the
-    /// Phase 2 plan's Verification section: pan is deferred).
+    /// Default channel count for a track/bus that doesn't specify its own (`TrackConfig`/
+    /// `BusConfig`'s own `channels`) — stereo by default. Mono and stereo resources can be freely
+    /// mixed (see `mixer::mix_into`'s dual-mono/downmix rule for a channel-count mismatch between
+    /// a track and a bus it's assigned to); real stereo panning of a mono track is still deferred
+    /// (see the Phase 2 plan's Verification section note on this app) — there's no pan control, a
+    /// mono track just goes equally to every channel of a wider bus.
     #[serde(default = "default_channels")]
     pub channels: u32,
 
@@ -34,8 +37,28 @@ pub struct Config {
     #[serde(default = "default_instance_name")]
     pub instance_name: String,
 
+    // ---- NMOS (IS-04 Node API / IS-05 Connection API) — makes this a real NMOS Node, one Sender
+    // per bus and one Receiver per track, served on the same `ws_port` as the amixer WebSocket
+    // (matching mxl-bridge's own pattern of merging IS-08 into its one Node API port rather than
+    // opening a second listener). ----
+    pub nmos_label: String,
+    /// IS-04 registry address. If unset, registration is skipped (Node API still served).
+    #[serde(default)]
+    pub nmos_registry_address: Option<String>,
+    #[serde(default = "default_nmos_registry_port")]
+    pub nmos_registry_port: u16,
+    pub interface_name: String,
+    /// IP address the Node/Connection API HTTP server is reachable at — used to build
+    /// href/manifest_href URLs advertised to controllers, same as mxl-bridge's own config (not
+    /// auto-resolved from interface_name).
+    pub ip_addr: String,
+
     pub tracks: Vec<TrackConfig>,
     pub buses: Vec<BusConfig>,
+}
+
+fn default_nmos_registry_port() -> u16 {
+    80
 }
 
 fn default_instance_name() -> String {
@@ -60,6 +83,11 @@ pub struct TrackConfig {
     /// `tx_source_flow_id` manual-override precedent for testing without a full activation flow).
     #[serde(default)]
     pub source: Option<TrackSource>,
+    /// This track's own channel count (1 = mono, 2 = stereo, ...) — defaults to `Config::channels`
+    /// when unset. Independent of every other track's and bus's own count; see `mixer::mix_into`
+    /// for how a mismatch against an assigned bus is handled.
+    #[serde(default)]
+    pub channels: Option<u32>,
     #[serde(default)]
     pub bus_assign: Vec<u32>,
     #[serde(default)]
@@ -103,6 +131,10 @@ pub struct BusConfig {
     /// docker-entrypoint.sh) doesn't need to author an explicit target per bus.
     #[serde(default)]
     pub target: Option<BusTarget>,
+    /// This bus's own channel count — defaults to `Config::channels` when unset. See
+    /// `TrackConfig::channels`'s docs.
+    #[serde(default)]
+    pub channels: Option<u32>,
     #[serde(default)]
     pub fader_db: f32,
 }
@@ -156,6 +188,9 @@ mod entrypoint_tests {
             "mixer_id": 0,
             "meter_hz": 25,
             "instance_name": "test-pod-1",
+            "nmos_label": "mxl-test-app test-pod-1",
+            "interface_name": "eth0",
+            "ip_addr": "127.0.0.1",
             "tracks": [
                 {"id": 0, "label": "Track 1", "bus_assign": []},
                 {"id": 1, "label": "Track 2", "bus_assign": []}
