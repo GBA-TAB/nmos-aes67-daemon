@@ -124,27 +124,77 @@ impl DaemonClient {
         Ok((new_state, source_changes, sink_changes))
     }
 
-    /// Polls on `interval` forever, calling `on_change` with each poll's diff. Errors are logged
-    /// and the loop continues (a transient daemon-unreachable blip shouldn't kill mxl-bridge) —
-    /// the previous state is kept as-is until a poll succeeds again.
+    /// Polls on `interval` forever, sending each poll's diff on `tx`. Errors are logged and the
+    /// loop continues (a transient daemon-unreachable blip shouldn't kill mxl-bridge) — the
+    /// previous state is kept as-is until a poll succeeds again. A channel (rather than a
+    /// callback) so the consumer (nmos/sync.rs) can freely `.await` registry calls per change
+    /// without this loop needing to know anything about async closures.
     pub async fn run(
         &self,
         interval: Duration,
         mut state: DaemonState,
-        mut on_change: impl FnMut(&DaemonState, Vec<StreamChange<DaemonSource>>, Vec<StreamChange<DaemonSink>>),
+        tx: tokio::sync::mpsc::UnboundedSender<DaemonDiff>,
     ) -> ! {
         loop {
             match self.poll_once(&state).await {
                 Ok((new_state, source_changes, sink_changes)) => {
                     state = new_state;
                     if !source_changes.is_empty() || !sink_changes.is_empty() {
-                        on_change(&state, source_changes, sink_changes);
+                        let diff = DaemonDiff { state: state.clone(), source_changes, sink_changes };
+                        if tx.send(diff).is_err() {
+                            tracing::warn!("daemon diff receiver dropped, mirror sync task must have exited");
+                        }
                     }
                 }
                 Err(e) => tracing::warn!(error = %e, "daemon poll failed, keeping previous state"),
             }
             tokio::time::sleep(interval).await;
         }
+    }
+}
+
+/// One poll's detected changes, bundled with the resulting full state. Consumed by
+/// `nmos/sync.rs` to keep the mirrored NMOS Source/Flow/Sender (per Sink) and Receiver (per
+/// Source) resources in sync with the daemon's live Source/Sink set.
+pub struct DaemonDiff {
+    pub state: DaemonState,
+    pub source_changes: Vec<StreamChange<DaemonSource>>,
+    pub sink_changes: Vec<StreamChange<DaemonSink>>,
+}
+
+/// Shared test builders for `DaemonSink`/`DaemonSource` — used here and by nmos/state.rs's and
+/// nmos/sync.rs's own test modules, which need daemon-mirror fixtures but shouldn't each hand-roll
+/// (and risk drifting) the same field list.
+#[cfg(test)]
+pub(crate) fn test_source(id: u8, name: &str, map: Vec<u8>) -> DaemonSource {
+    DaemonSource {
+        id,
+        enabled: true,
+        name: name.to_string(),
+        io: "network".to_string(),
+        max_samples_per_packet: 48,
+        codec: "L24".to_string(),
+        address: "239.1.0.1:5004".to_string(),
+        ttl: 15,
+        payload_type: 98,
+        dscp: 34,
+        refclk_ptp_traceable: true,
+        map,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_sink(id: u8, name: &str, map: Vec<u8>) -> DaemonSink {
+    DaemonSink {
+        id,
+        name: name.to_string(),
+        io: "network".to_string(),
+        use_sdp: false,
+        source: String::new(),
+        sdp: String::new(),
+        delay: 0,
+        ignore_refclk_gmid: false,
+        map,
     }
 }
 

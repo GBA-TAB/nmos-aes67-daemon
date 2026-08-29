@@ -1,6 +1,6 @@
 use crate::config::Config;
 
-use super::state::NmosState;
+use super::state::{version_string, NmosState, SinkEntrySnapshot, SourceEntrySnapshot};
 
 /// mxl-bridge's private-use transport type for MXL-backed resources — there's no AMWA-registered
 /// URN for this (see README's IS-05 design note), fine within this closed daemon/orchestrator
@@ -48,7 +48,10 @@ pub fn node_json(state: &NmosState, ip: &str) -> serde_json::Value {
     })
 }
 
-pub fn device_json(state: &NmosState, ip: &str) -> serde_json::Value {
+/// `sender_ids`/`receiver_ids` are the current mirrored resources' own ids — collected by the
+/// caller (server.rs/registration.rs) from the live `sinks`/`sources` maps, since this function
+/// itself is plain data-in/JSON-out with no locking of its own.
+pub fn device_json(state: &NmosState, ip: &str, sender_ids: &[uuid::Uuid], receiver_ids: &[uuid::Uuid]) -> serde_json::Value {
     let base = base_url(&state.cfg, ip);
     serde_json::json!({
         "id": state.device_id.to_string(),
@@ -58,8 +61,8 @@ pub fn device_json(state: &NmosState, ip: &str) -> serde_json::Value {
         "tags": {},
         "type": "urn:x-nmos:device:generic",
         "node_id": state.node_id.to_string(),
-        "senders": [state.sender_id.to_string()],
-        "receivers": [state.receiver_id.to_string()],
+        "senders": sender_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "receivers": receiver_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
         "controls": [{
             "href": format!("{base}/x-nmos/connection/v1.1/"),
             "type": "urn:x-nmos:control:sr-ctrl/v1.1",
@@ -68,12 +71,12 @@ pub fn device_json(state: &NmosState, ip: &str) -> serde_json::Value {
     })
 }
 
-pub fn source_json(state: &NmosState) -> serde_json::Value {
+pub fn source_json(state: &NmosState, entry: &SinkEntrySnapshot) -> serde_json::Value {
     serde_json::json!({
-        "id": state.source_id.to_string(),
-        "version": state.version(),
-        "label": state.cfg.label,
-        "description": "",
+        "id": entry.source_id.to_string(),
+        "version": version_string(entry.version),
+        "label": entry.label,
+        "description": format!("daemon Sink {} audio, mirrored via mxl-bridge", entry.daemon_id),
         "tags": {},
         "device_id": state.device_id.to_string(),
         "parents": [],
@@ -81,55 +84,55 @@ pub fn source_json(state: &NmosState) -> serde_json::Value {
         "grain_rate": { "numerator": state.cfg.sample_rate, "denominator": 1 },
         "caps": {},
         "format": "urn:x-nmos:format:audio",
-        "channels": channels_json(state.cfg.channels)
+        "channels": channels_json(entry.channels)
     })
 }
 
-pub fn flow_json(state: &NmosState) -> serde_json::Value {
+pub fn flow_json(state: &NmosState, entry: &SinkEntrySnapshot) -> serde_json::Value {
     serde_json::json!({
-        "id": state.flow_id.to_string(),
-        "version": state.version(),
-        "label": state.cfg.label,
+        "id": entry.flow_id.to_string(),
+        "version": version_string(entry.version),
+        "label": entry.label,
         "description": "",
         "tags": {},
         "grain_rate": { "numerator": state.cfg.sample_rate, "denominator": 1 },
-        "source_id": state.source_id.to_string(),
+        "source_id": entry.source_id.to_string(),
         "parents": [],
         "device_id": state.device_id.to_string(),
         "format": "urn:x-nmos:format:audio",
         "media_type": "audio/float32",
         "sample_rate": { "numerator": state.cfg.sample_rate, "denominator": 1 },
         "bit_depth": 32,
-        "channels": channels_json(state.cfg.channels)
+        "channels": channels_json(entry.channels)
     })
 }
 
-pub fn sender_json(state: &NmosState, ip: &str, active: bool, receiver_id: Option<String>) -> serde_json::Value {
+pub fn sender_json(state: &NmosState, ip: &str, entry: &SinkEntrySnapshot) -> serde_json::Value {
     let base = base_url(&state.cfg, ip);
     serde_json::json!({
-        "id": state.sender_id.to_string(),
-        "version": state.version(),
-        "label": state.cfg.label,
+        "id": entry.sender_id.to_string(),
+        "version": version_string(entry.version),
+        "label": entry.label,
         "description": "",
         "tags": {},
-        "flow_id": state.flow_id.to_string(),
+        "flow_id": entry.flow_id.to_string(),
         "transport": TRANSPORT_TYPE,
         "device_id": state.device_id.to_string(),
-        "manifest_href": format!("{base}/x-nmos/connection/v1.1/single/senders/{}/transportfile", state.sender_id),
+        "manifest_href": format!("{base}/x-nmos/connection/v1.1/single/senders/{}/transportfile", entry.sender_id),
         "interface_bindings": [state.cfg.interface_name],
         "subscription": {
-            "receiver_id": receiver_id,
-            "active": active
+            "receiver_id": entry.receiver_id,
+            "active": entry.active
         }
     })
 }
 
-pub fn receiver_json(state: &NmosState, active: bool, sender_id: Option<String>) -> serde_json::Value {
+pub fn receiver_json(state: &NmosState, entry: &SourceEntrySnapshot) -> serde_json::Value {
     serde_json::json!({
-        "id": state.receiver_id.to_string(),
-        "version": state.version(),
-        "label": format!("{} (playback)", state.cfg.label),
-        "description": "",
+        "id": entry.receiver_id.to_string(),
+        "version": version_string(entry.version),
+        "label": entry.label,
+        "description": format!("feeds daemon Source {} for TX", entry.daemon_id),
         "tags": {},
         "device_id": state.device_id.to_string(),
         "transport": TRANSPORT_TYPE,
@@ -139,8 +142,8 @@ pub fn receiver_json(state: &NmosState, active: bool, sender_id: Option<String>)
             "media_types": ["audio/float32"]
         },
         "subscription": {
-            "sender_id": sender_id,
-            "active": active
+            "sender_id": entry.sender_id,
+            "active": entry.active
         }
     })
 }

@@ -33,6 +33,22 @@ pub fn receiver_id(label: &str) -> uuid::Uuid {
     stable_id(&format!("mxl-bridge-receiver:{label}"))
 }
 
+// Phase 2: one Source/Flow/Sender mirrors each daemon Sink, one Receiver mirrors each daemon
+// Source (see nmos/state.rs) — keyed by the daemon's own small-integer id rather than a
+// config-provided label, since these are discovered at runtime, not fixed at startup.
+pub fn sink_source_id(daemon_id: u8) -> uuid::Uuid {
+    stable_id(&format!("mxl-bridge-sink-source:{daemon_id}"))
+}
+pub fn sink_flow_id(daemon_id: u8) -> uuid::Uuid {
+    stable_id(&format!("mxl-bridge-sink-flow:{daemon_id}"))
+}
+pub fn sink_sender_id(daemon_id: u8) -> uuid::Uuid {
+    stable_id(&format!("mxl-bridge-sink-sender:{daemon_id}"))
+}
+pub fn source_receiver_id(daemon_id: u8) -> uuid::Uuid {
+    stable_id(&format!("mxl-bridge-source-receiver:{daemon_id}"))
+}
+
 /// Builds the flow_def JSON passed to `mxlCreateFlowWriter`. This *is* an NMOS Flow resource JSON
 /// (confirmed against MXL's own examples/flow-configs/flow-audio.json) — audio/float32 is MXL's only
 /// supported audio sample format (docs/Architecture.md:341), fixed regardless of the AES67 network

@@ -8,7 +8,7 @@ use axum::{Json, Router};
 
 use super::registration;
 use super::resources;
-use super::state::NmosState;
+use super::state::{NmosState, SinkEntrySnapshot, SourceEntrySnapshot};
 
 type S = Arc<NmosState>;
 
@@ -63,73 +63,92 @@ async fn node_self(State(state): State<S>) -> Json<serde_json::Value> {
 }
 
 async fn devices_list(State(state): State<S>) -> Json<serde_json::Value> {
-    Json(serde_json::json!([resources::device_json(&state, &client_ip(&state))]))
+    let (senders, receivers) = sender_receiver_ids(&state).await;
+    Json(serde_json::json!([resources::device_json(&state, &client_ip(&state), &senders, &receivers)]))
 }
 
 async fn device_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    if id == state.device_id.to_string() {
-        Json(resources::device_json(&state, &client_ip(&state))).into_response()
-    } else {
-        not_found()
+    if id != state.device_id.to_string() {
+        return not_found();
     }
+    let (senders, receivers) = sender_receiver_ids(&state).await;
+    Json(resources::device_json(&state, &client_ip(&state), &senders, &receivers)).into_response()
+}
+
+async fn sender_receiver_ids(state: &NmosState) -> (Vec<uuid::Uuid>, Vec<uuid::Uuid>) {
+    let senders = state.sinks.lock().await.values().map(|e| e.sender_id).collect();
+    let receivers = state.sources.lock().await.values().map(|e| e.receiver_id).collect();
+    (senders, receivers)
 }
 
 async fn sources_list(State(state): State<S>) -> Json<serde_json::Value> {
-    Json(serde_json::json!([resources::source_json(&state)]))
+    let sinks = state.sinks.lock().await;
+    let list: Vec<_> = sinks.values().map(|e| resources::source_json(&state, &SinkEntrySnapshot::from(e))).collect();
+    Json(serde_json::json!(list))
 }
 
 async fn source_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    if id == state.source_id.to_string() {
-        Json(resources::source_json(&state)).into_response()
-    } else {
-        not_found()
+    let sinks = state.sinks.lock().await;
+    match sinks.values().find(|e| e.source_id.to_string() == id) {
+        Some(e) => Json(resources::source_json(&state, &SinkEntrySnapshot::from(e))).into_response(),
+        None => not_found(),
     }
 }
 
 async fn flows_list(State(state): State<S>) -> Json<serde_json::Value> {
-    Json(serde_json::json!([resources::flow_json(&state)]))
+    let sinks = state.sinks.lock().await;
+    let list: Vec<_> = sinks.values().map(|e| resources::flow_json(&state, &SinkEntrySnapshot::from(e))).collect();
+    Json(serde_json::json!(list))
 }
 
 async fn flow_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    if id == state.flow_id.to_string() {
-        Json(resources::flow_json(&state)).into_response()
-    } else {
-        not_found()
+    let sinks = state.sinks.lock().await;
+    match sinks.values().find(|e| e.flow_id.to_string() == id) {
+        Some(e) => Json(resources::flow_json(&state, &SinkEntrySnapshot::from(e))).into_response(),
+        None => not_found(),
     }
 }
 
 async fn sender_ids(State(state): State<S>) -> Json<serde_json::Value> {
-    Json(serde_json::json!([format!("{}/", state.sender_id)]))
+    let sinks = state.sinks.lock().await;
+    let ids: Vec<_> = sinks.values().map(|e| format!("{}/", e.sender_id)).collect();
+    Json(serde_json::json!(ids))
 }
 
 async fn senders_list(State(state): State<S>) -> Json<serde_json::Value> {
-    let sender = state.sender.lock().await;
-    Json(serde_json::json!([resources::sender_json(&state, &client_ip(&state), sender.active, sender.receiver_id.clone())]))
+    let sinks = state.sinks.lock().await;
+    let ip = client_ip(&state);
+    let list: Vec<_> = sinks.values().map(|e| resources::sender_json(&state, &ip, &SinkEntrySnapshot::from(e))).collect();
+    Json(serde_json::json!(list))
 }
 
 async fn sender_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    if id != state.sender_id.to_string() {
-        return not_found();
+    let sinks = state.sinks.lock().await;
+    let ip = client_ip(&state);
+    match sinks.values().find(|e| e.sender_id.to_string() == id) {
+        Some(e) => Json(resources::sender_json(&state, &ip, &SinkEntrySnapshot::from(e))).into_response(),
+        None => not_found(),
     }
-    let sender = state.sender.lock().await;
-    Json(resources::sender_json(&state, &client_ip(&state), sender.active, sender.receiver_id.clone())).into_response()
 }
 
 async fn receiver_ids(State(state): State<S>) -> Json<serde_json::Value> {
-    Json(serde_json::json!([format!("{}/", state.receiver_id)]))
+    let sources = state.sources.lock().await;
+    let ids: Vec<_> = sources.values().map(|e| format!("{}/", e.receiver_id)).collect();
+    Json(serde_json::json!(ids))
 }
 
 async fn receivers_list(State(state): State<S>) -> Json<serde_json::Value> {
-    let receiver = state.receiver.lock().await;
-    Json(serde_json::json!([resources::receiver_json(&state, receiver.active, receiver.sender_id.clone())]))
+    let sources = state.sources.lock().await;
+    let list: Vec<_> = sources.values().map(|e| resources::receiver_json(&state, &SourceEntrySnapshot::from(e))).collect();
+    Json(serde_json::json!(list))
 }
 
 async fn receiver_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    if id != state.receiver_id.to_string() {
-        return not_found();
+    let sources = state.sources.lock().await;
+    match sources.values().find(|e| e.receiver_id.to_string() == id) {
+        Some(e) => Json(resources::receiver_json(&state, &SourceEntrySnapshot::from(e))).into_response(),
+        None => not_found(),
     }
-    let receiver = state.receiver.lock().await;
-    Json(resources::receiver_json(&state, receiver.active, receiver.sender_id.clone())).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -155,14 +174,18 @@ async fn sender_transportfile(Path(_id): Path<String>) -> impl IntoResponse {
     )
 }
 
-async fn sender_staged(State(state): State<S>, Path(_id): Path<String>) -> Json<serde_json::Value> {
-    let sender = state.sender.lock().await;
-    Json(serde_json::json!({
-        "master_enable": sender.active,
-        "activation": { "mode": null, "requested_time": null, "activation_time": null },
-        "receiver_id": sender.receiver_id,
-        "transport_params": [{}]
-    }))
+async fn sender_staged(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
+    let sinks = state.sinks.lock().await;
+    match sinks.values().find(|e| e.sender_id.to_string() == id) {
+        Some(e) => Json(serde_json::json!({
+            "master_enable": e.active,
+            "activation": { "mode": null, "requested_time": null, "activation_time": null },
+            "receiver_id": e.receiver_id,
+            "transport_params": [{}]
+        }))
+        .into_response(),
+        None => not_found(),
+    }
 }
 
 async fn sender_patch(
@@ -170,19 +193,16 @@ async fn sender_patch(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
-    if id != state.sender_id.to_string() {
-        return not_found();
+    let active = body.get("master_enable").and_then(|v| v.as_bool());
+    let receiver_id = body.get("receiver_id").map(|v| v.as_str().map(str::to_string));
+
+    match state.set_sink_activation(&id, active, receiver_id).await {
+        Ok(entry) => {
+            tracing::info!(sink_id = entry.daemon_id, active = entry.active, receiver_id = ?entry.receiver_id, "sender staged/patched");
+        }
+        Err(_) => return not_found(),
     }
-    let mut sender = state.sender.lock().await;
-    if let Some(v) = body.get("master_enable").and_then(|v| v.as_bool()) {
-        sender.active = v;
-    }
-    if let Some(v) = body.get("receiver_id") {
-        sender.receiver_id = v.as_str().map(str::to_string);
-    }
-    tracing::info!(active = sender.active, receiver_id = ?sender.receiver_id, "sender staged/patched");
-    drop(sender);
-    sender_staged(State(state), Path(id)).await.into_response()
+    sender_staged(State(state), Path(id)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -197,62 +217,66 @@ async fn receiver_transporttype(Path(_id): Path<String>) -> Json<serde_json::Val
     Json(serde_json::json!(resources::TRANSPORT_TYPE))
 }
 
-async fn receiver_staged(State(state): State<S>, Path(_id): Path<String>) -> Json<serde_json::Value> {
-    let receiver = state.receiver.lock().await;
-    Json(serde_json::json!({
-        "master_enable": receiver.active,
-        "activation": { "mode": null, "requested_time": null, "activation_time": null },
-        "sender_id": receiver.sender_id,
-        "transport_file": { "data": null, "type": null },
-        "transport_params": [{}]
-    }))
+async fn receiver_staged(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
+    let sources = state.sources.lock().await;
+    match sources.values().find(|e| e.receiver_id.to_string() == id) {
+        Some(e) => Json(serde_json::json!({
+            "master_enable": e.active,
+            "activation": { "mode": null, "requested_time": null, "activation_time": null },
+            "sender_id": e.sender_id,
+            "transport_file": { "data": null, "type": null },
+            "transport_params": [{}]
+        }))
+        .into_response(),
+        None => not_found(),
+    }
 }
 
-/// The interesting one: resolves sender_id -> flow_id and (re)starts the TX thread accordingly.
-/// Only `activate_immediate` is handled — matches what the orchestrator actually sends
-/// (ConnectionService.cs never uses scheduled activation) and this project's stated Phase 1 scope;
-/// any other `activation.mode` is accepted but treated the same way (applied immediately) rather
-/// than rejected, since a partial IS-05 implementation degrading gracefully seemed better than
-/// erroring on otherwise-reasonable requests.
+/// The interesting one: resolves sender_id -> flow_id (via a local lookup if it names one of this
+/// node's own mirrored Senders, otherwise the registry) to validate the activation, then records
+/// activation state. Only `activate_immediate` is handled — matches what the orchestrator actually
+/// sends (ConnectionService.cs never uses scheduled activation) and this project's stated Phase 1
+/// scope; any other `activation.mode` is accepted but treated the same way (applied immediately)
+/// rather than rejected, since a partial IS-05 implementation degrading gracefully seemed better
+/// than erroring on otherwise-reasonable requests.
+///
+/// Milestone 2 scope note: this validates the sender_id resolves to a real flow_id and records
+/// activation state/subscription over IS-05 correctly for N receivers, but doesn't yet open that
+/// flow or move any audio — that lands in Milestone 4 alongside the rest of the ALSA data-path
+/// rework (wide-device open, per-Source routing), see the Phase 2 plan §4.
 async fn receiver_patch(
     State(state): State<S>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
-    if id != state.receiver_id.to_string() {
+    let exists = state.sources.lock().await.values().any(|e| e.receiver_id.to_string() == id);
+    if !exists {
         return not_found();
     }
 
     let sender_id = body.get("sender_id").and_then(|v| v.as_str()).map(str::to_string);
     let master_enable = body.get("master_enable").and_then(|v| v.as_bool());
-
     let active = master_enable.unwrap_or(sender_id.is_some());
 
-    let flow_id = if active {
-        match &sender_id {
-            Some(sid) if *sid == state.sender_id.to_string() => {
-                // Self-connection (this node's own sender feeding this node's own receiver) —
-                // no registry round trip needed, we already know our own flow_id.
-                Some(state.flow_id.to_string())
+    if active {
+        if let Some(sid) = &sender_id {
+            let resolved = if let Some(flow_id) = state.own_sink_flow_id(sid).await {
+                Ok(flow_id.to_string())
+            } else {
+                registration::resolve_sender_flow_id(&state, sid).await
+            };
+            if let Err(e) = resolved {
+                tracing::error!(error = %e, sender_id = sid, "failed to resolve sender's flow_id");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"code": 400, "error": format!("could not resolve sender_id: {e}"), "debug": null})),
+                )
+                    .into_response();
             }
-            Some(sid) => match registration::resolve_sender_flow_id(&state, sid).await {
-                Ok(fid) => Some(fid),
-                Err(e) => {
-                    tracing::error!(error = %e, sender_id = sid, "failed to resolve sender's flow_id");
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"code": 400, "error": format!("could not resolve sender_id: {e}"), "debug": null})),
-                    )
-                        .into_response();
-                }
-            },
-            None => None,
         }
-    } else {
-        None
-    };
+    }
 
-    if let Err(e) = state.activate_receiver(flow_id, sender_id, active).await {
+    if let Err(e) = state.set_source_activation(&id, active, sender_id).await {
         tracing::error!(error = %e, "receiver activation failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -261,5 +285,5 @@ async fn receiver_patch(
             .into_response();
     }
 
-    receiver_staged(State(state), Path(id)).await.into_response()
+    receiver_staged(State(state), Path(id)).await
 }

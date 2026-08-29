@@ -7,9 +7,9 @@ mod mxl_flow;
 mod nmos;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use config::Config;
-use mxl_flow::MxlAudioFlow;
 
 /// mxl-sys builds libmxl.so under `target/{debug,release}/build/mxl-sys-<fingerprint>/out/lib/`,
 /// alongside wherever this binary itself lives (`target/{debug,release}/mxl-bridge`) — the
@@ -62,25 +62,27 @@ async fn main() -> anyhow::Result<()> {
     // project relies on.
     tracing::info!(tai_now_ns = clock::tai_now_ns(), "CLOCK_TAI is readable");
 
-    let flow = MxlAudioFlow::create(&cfg, &mxl_so)?;
-    tracing::info!(flow_id = %flow.flow_id, "MXL flow created");
+    let state = Arc::new(nmos::NmosState::new(cfg.clone(), mxl_so));
 
-    // RX runs unconditionally for the lifetime of the process (ALSA I/O is blocking, hence its own
-    // OS thread) — unlike TX, which IS-05 activation starts/stops dynamically per receiver
-    // (nmos/state.rs::activate_receiver), there's no "sender master_enable" -> "stop capturing"
-    // wiring in Phase 1; the Sender's active/master_enable flag is reported/PATCHable but doesn't
-    // gate the underlying capture. Fire-and-forget: if this thread panics the process keeps running
-    // with a dead RX path rather than taking the whole bridge down — acceptable for Phase 1, revisit
-    // if that gap matters in practice.
+    // Phase 2 (NMOS/2110-first model, see the mxl-bridge Phase 2 plan): poll the daemon's own
+    // Source/Sink set and mirror it into persistent NMOS resources — one Source/Flow/Sender per
+    // daemon Sink, one Receiver per daemon Source — kept in sync via nmos::sync as the daemon's
+    // set changes. This replaces Phase 1's single fixed flow/Sender/Receiver pair.
+    //
+    // Milestone 2 scope: this wires up IS-04 discovery and IS-05 activation bookkeeping for all
+    // of the daemon's mirrored resources. Actual MXL flow creation and ALSA data movement for
+    // them is Milestone 4's job (the wide-device-open + per-Sink/Source routing rework) — until
+    // then, alsa_capture/alsa_playback are not yet wired to anything.
+    let (diff_tx, diff_rx) = tokio::sync::mpsc::unbounded_channel();
     {
         let cfg = cfg.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = alsa_capture::run(cfg, flow) {
-                tracing::error!(error = %e, "RX thread exited with error");
-            }
+        tokio::spawn(async move {
+            let client = daemon_client::DaemonClient::new(cfg.daemon_api_url.clone());
+            let interval = Duration::from_millis(cfg.daemon_poll_interval_ms);
+            client.run(interval, daemon_client::DaemonState::default(), diff_tx).await;
         });
     }
+    tokio::spawn(nmos::sync::run(state.clone(), diff_rx));
 
-    let state = Arc::new(nmos::NmosState::new(cfg, mxl_so));
     nmos::run(state).await
 }

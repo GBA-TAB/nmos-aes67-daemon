@@ -77,3 +77,26 @@ impl Config {
         Ok(cfg)
     }
 }
+
+/// A minimal-but-complete Config for tests elsewhere in the crate (nmos/state.rs, nmos/sync.rs)
+/// that need an `NmosState` but don't care about its exact values — one shared helper instead of
+/// each test module hand-rolling its own field list and drifting as Config grows.
+#[cfg(test)]
+pub(crate) fn test_config() -> Config {
+    serde_json::from_value(serde_json::json!({
+        "alsa_source_device": "hw:Loopback,1,1",
+        "sample_rate": 48000,
+        "channels": 2,
+        "period_frames": 480,
+        "mxl_domain": "/dev/shm/mxl-bridge-test",
+        "label": "test",
+        "nmos_node_port": 3213,
+        "nmos_label": "mxl-bridge test",
+        "nmos_registry_address": null,
+        "nmos_registry_port": 80,
+        "interface_name": "lo",
+        "ip_addr": "127.0.0.1",
+        "daemon_api_url": "http://127.0.0.1:0"
+    }))
+    .expect("test_config JSON must deserialize")
+}
