@@ -1,25 +1,27 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 
 use crate::config::Config;
-use crate::mxl_flow::MxlAudioFlowSource;
+use crate::nmos::NmosState;
 
 /// Inverse of alsa_capture.rs's S32_FULL_SCALE normalization — MXL's audio/float32 is [-1.0, 1.0]
 /// full scale, ALSA S32_LE wants the full 32-bit integer range, left-justified (same convention
 /// regardless of the true AES67 network bit depth this ends up transmitted at).
 const S32_FULL_SCALE: f32 = 2147483648.0; // 2^31
 
-fn open_playback(cfg: &Config, device: &str) -> anyhow::Result<PCM> {
+fn open_playback(cfg: &Config, channels: u32) -> anyhow::Result<PCM> {
+    let device = cfg.tx_alsa_playback_device.as_deref().unwrap_or(&cfg.alsa_source_device);
     let pcm = PCM::new(device, Direction::Playback, false)
         .map_err(|e| anyhow::anyhow!("opening ALSA playback device '{device}': {e}"))?;
     {
         let hwp = HwParams::any(&pcm)?;
         hwp.set_access(Access::RWInterleaved)?;
         hwp.set_format(Format::S32LE)?;
-        hwp.set_channels(cfg.channels)?;
+        hwp.set_channels(channels)?;
         let negotiated_rate = hwp.set_rate_near(cfg.sample_rate, ValueOr::Nearest)?;
         if negotiated_rate != cfg.sample_rate {
             tracing::warn!(
@@ -36,77 +38,79 @@ fn open_playback(cfg: &Config, device: &str) -> anyhow::Result<PCM> {
     Ok(pcm)
 }
 
-/// Blocking playback loop: reads one batch of samples from the MXL flow at a time, converts planar
-/// f32 -> interleaved i32, and writes to ALSA playback. `device` is the RAVENNA ALSA playback device
-/// (distinct from the capture device used for RX — a real deployment bridges different channel
-/// ranges in each direction). Checks `stop` once per loop iteration (bounded by the read timeout
-/// below, not instant) so IS-05 deactivation can shut this down — see nmos/state.rs.
-pub fn run_until_stopped(
-    cfg: Config,
-    device: String,
-    source: MxlAudioFlowSource,
-    stop: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
-    let pcm = open_playback(&cfg, &device)?;
+/// Blocking playback loop: opens the wide RAVENNA playback device *once* (same width/lifetime
+/// model as alsa_capture.rs's RX thread — see its docs for the `alsa_channels`/`blocking_lock`
+/// notes, which apply here identically). Runs for the whole process lifetime, unlike Phase 1's
+/// per-connection thread — deactivating a specific Source just clears its `reader`
+/// (nmos/state.rs::set_source_activation), which this loop naturally starts skipping; there is
+/// only ever one TX thread, not one per active Receiver.
+///
+/// Each period: for every currently-active Source (has a `reader`), reads one period from its
+/// resolved MXL flow and scatters it into that Source's own channels (per its `map[]`) of a wide
+/// interleaved buffer; channels belonging to no active Source are left silent. That buffer is then
+/// written once via `snd_pcm_writei`, keeping the shared hardware clock fed regardless of how many
+/// Sources are currently active (including zero).
+///
+/// Known limitation: reads from multiple active Sources happen sequentially, each blocking up to
+/// `read_timeout` — a slow/stalled upstream flow on one Source can delay the shared write for
+/// every other currently-active Source in the same period. Acceptable for this pass (verified
+/// against one active Source at a time); revisit if multi-Source TX in practice shows underruns.
+pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
+    let channels = state.alsa_channels.load(Ordering::Relaxed) as u32;
+    let pcm = open_playback(&state.cfg, channels)?;
     let io = pcm.io_i32()?;
 
-    let channels = cfg.channels as usize;
-    let period = cfg.period_frames as usize;
-    let mut interleaved = vec![0i32; period * channels];
+    let period = state.cfg.period_frames as usize;
+    let mut interleaved = vec![0i32; period * channels as usize];
+    // Bounded to roughly one period's real-time budget (with slack for jitter) rather than a flat
+    // timeout — a shared wide device can't afford one slow Source stalling everyone else's cadence
+    // for long (see the "Known limitation" note above).
+    let read_timeout = Duration::from_secs_f64(2.0 * period as f64 / state.cfg.sample_rate as f64);
 
     tracing::info!(
-        device = %device,
         channels,
-        sample_rate = cfg.sample_rate,
+        sample_rate = state.cfg.sample_rate,
         period,
-        "starting MXL flow -> ALSA playback bridge"
+        "starting wide ALSA playback <- per-Source MXL flow bridge"
     );
 
-    // Start a little behind the current head so the first read doesn't race the writer — matches
-    // MXL's own flow-reader.rs example starting from the flow's actual head rather than "now".
-    let mut read_index = source.head_index()?;
-    let read_timeout = std::time::Duration::from_millis(500);
-
     loop {
-        if stop.load(Ordering::Relaxed) {
-            tracing::info!("TX stop requested, exiting playback loop");
-            return Ok(());
-        }
-        let planar = match source.read_samples(read_index, period, read_timeout) {
-            Ok(p) => p,
-            Err(e) => {
-                // Most likely cause: our tracked read_index has drifted out of the writer's valid
-                // ring-buffer window (e.g. a stall on our side let the writer lap us, or the reader
-                // started before the writer had produced enough history). Resync to the flow's
-                // actual current head rather than retrying the same now-invalid index forever.
-                tracing::warn!(error = %e, index = read_index, "read failed, resyncing to flow head");
-                match source.head_index() {
-                    Ok(head) => read_index = head,
-                    Err(e) => tracing::error!(error = %e, "failed to resync to flow head"),
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                continue;
-            }
-        };
-        read_index += period as u64;
+        interleaved.fill(0);
 
-        let frames = planar.first().map(|c| c.len()).unwrap_or(0);
-        if frames == 0 {
-            continue;
-        }
-        interleaved.truncate(0);
-        interleaved.resize(frames * channels, 0);
-        for (frame_idx, frame) in interleaved.chunks_exact_mut(channels).enumerate() {
-            for (ch, sample) in frame.iter_mut().enumerate() {
-                let f = planar.get(ch).and_then(|c| c.get(frame_idx)).copied().unwrap_or(0.0);
-                *sample = (f.clamp(-1.0, 1.0) * S32_FULL_SCALE) as i32;
+        let mut sources = state.sources.blocking_lock();
+        for entry in sources.values_mut() {
+            let Some(reader) = entry.reader.as_mut() else { continue };
+            let planar = match reader.read_next(period, read_timeout) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(daemon_id = entry.daemon_id, error = %e, "read failed, resyncing to flow head");
+                    if let Err(e) = reader.resync_to_head() {
+                        tracing::error!(daemon_id = entry.daemon_id, error = %e, "failed to resync to flow head");
+                    }
+                    continue;
+                }
+            };
+            let frames = planar.first().map(|c| c.len()).unwrap_or(0).min(period);
+
+            for (ch_idx, &alsa_ch) in entry.map.iter().enumerate() {
+                let alsa_ch = alsa_ch as usize;
+                if alsa_ch >= channels as usize {
+                    // Same out-of-bounds guard as alsa_capture.rs — see its comment.
+                    continue;
+                }
+                let Some(src_channel) = planar.get(ch_idx) else { continue };
+                for frame_idx in 0..frames {
+                    let f = src_channel[frame_idx];
+                    interleaved[frame_idx * channels as usize + alsa_ch] = (f.clamp(-1.0, 1.0) * S32_FULL_SCALE) as i32;
+                }
             }
         }
+        drop(sources);
 
         let mut remaining = &interleaved[..];
         while !remaining.is_empty() {
             match io.writei(remaining) {
-                Ok(written) => remaining = &remaining[written * channels..],
+                Ok(written) => remaining = &remaining[written * channels as usize..],
                 Err(e) => {
                     tracing::warn!(error = %e, "ALSA write error, attempting recovery");
                     if let Err(e) = pcm.try_recover(e, true) {

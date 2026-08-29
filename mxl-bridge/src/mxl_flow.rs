@@ -20,18 +20,6 @@ pub fn node_id() -> uuid::Uuid {
 pub fn device_id() -> uuid::Uuid {
     stable_id("mxl-bridge-device")
 }
-pub fn source_id(label: &str) -> uuid::Uuid {
-    stable_id(&format!("mxl-bridge-source:{label}"))
-}
-pub fn flow_id(label: &str) -> uuid::Uuid {
-    stable_id(&format!("mxl-bridge-flow:{label}"))
-}
-pub fn sender_id(label: &str) -> uuid::Uuid {
-    stable_id(&format!("mxl-bridge-sender:{label}"))
-}
-pub fn receiver_id(label: &str) -> uuid::Uuid {
-    stable_id(&format!("mxl-bridge-receiver:{label}"))
-}
 
 // Phase 2: one Source/Flow/Sender mirrors each daemon Sink, one Receiver mirrors each daemon
 // Source (see nmos/state.rs) — keyed by the daemon's own small-integer id rather than a
@@ -53,46 +41,63 @@ pub fn source_receiver_id(daemon_id: u8) -> uuid::Uuid {
 /// (confirmed against MXL's own examples/flow-configs/flow-audio.json) — audio/float32 is MXL's only
 /// supported audio sample format (docs/Architecture.md:341), fixed regardless of the AES67 network
 /// codec's bit depth (that's a separate, source-side concern handled in alsa_capture.rs's int32->f32
-/// conversion).
-pub fn build_audio_flow_def(cfg: &Config, flow_id: uuid::Uuid, source_id: uuid::Uuid, device_id: uuid::Uuid) -> String {
+/// conversion). `label`/`channel_count` are the caller's own (a per-Sink/Source mirror's, or a packed
+/// flow's) — not read from `Config`, since Phase 2 has many independently-sized flows, not one.
+pub fn build_audio_flow_def(
+    cfg: &Config,
+    flow_id: uuid::Uuid,
+    source_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    label: &str,
+    channel_count: u32,
+) -> String {
     serde_json::json!({
         "id": flow_id.to_string(),
         "device_id": device_id.to_string(),
         "source_id": source_id.to_string(),
-        "label": cfg.label,
-        "description": format!("{} (bridged from AES67 via mxl-bridge)", cfg.label),
+        "label": label,
+        "description": format!("{label} (bridged from AES67 via mxl-bridge)"),
         "format": "urn:x-nmos:format:audio",
         "media_type": "audio/float32",
         "sample_rate": { "numerator": cfg.sample_rate, "denominator": 1 },
-        "channel_count": cfg.channels,
+        "channel_count": channel_count,
         "bit_depth": 32,
         "parents": [],
         "tags": {
-            "urn:x-nmos:tag:grouphint/v1.0": [format!("mxl-bridge:{}", cfg.label)]
+            "urn:x-nmos:tag:grouphint/v1.0": [format!("mxl-bridge:{label}")]
         }
     })
     .to_string()
 }
 
-/// Owns the MXL instance and the samples writer for one continuous (audio) flow.
+/// Owns the MXL instance and the samples writer for one continuous (audio) flow, plus its own
+/// running write index (Phase 2: each Sink's flow is created/destroyed independently as leases
+/// come and go, §1 — so unlike Phase 1's one global index, every flow now tracks its own).
 pub struct MxlAudioFlow {
-    pub flow_id: uuid::Uuid,
     instance: mxl::MxlInstance,
     writer: mxl::SamplesWriter,
     channels: usize,
+    sample_rate: mxl::Rational,
+    next_index: Option<u64>,
 }
 
 impl MxlAudioFlow {
-    pub fn create(cfg: &Config, mxl_so_path: &std::path::Path) -> anyhow::Result<Self> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn create(
+        cfg: &Config,
+        mxl_so_path: &std::path::Path,
+        flow_id: uuid::Uuid,
+        source_id: uuid::Uuid,
+        device_id: uuid::Uuid,
+        label: &str,
+        channel_count: u32,
+    ) -> anyhow::Result<Self> {
         let api = mxl::load_api(mxl_so_path)
             .map_err(|e| anyhow::anyhow!("mxl::load_api({mxl_so_path:?}) failed: {e:?}"))?;
         let instance = mxl::MxlInstance::new(api, &cfg.mxl_domain, "")
             .map_err(|e| anyhow::anyhow!("MxlInstance::new({}) failed: {e:?}", cfg.mxl_domain))?;
 
-        let flow_id = flow_id(&cfg.label);
-        let source_id = source_id(&cfg.label);
-        let device_id = device_id();
-        let flow_def = build_audio_flow_def(cfg, flow_id, source_id, device_id);
+        let flow_def = build_audio_flow_def(cfg, flow_id, source_id, device_id, label, channel_count);
 
         let (writer, info, was_created) = instance
             .create_flow_writer(&flow_def, None)
@@ -104,31 +109,35 @@ impl MxlAudioFlow {
             .continuous()
             .map_err(|e| anyhow::anyhow!("flow is not a continuous (audio) flow: {e:?}"))?
             .channelCount as usize;
-        if channels != cfg.channels as usize {
-            anyhow::bail!(
-                "MXL flow channel_count ({channels}) does not match configured channels ({})",
-                cfg.channels
-            );
+        if channels != channel_count as usize {
+            anyhow::bail!("MXL flow channel_count ({channels}) does not match expected ({channel_count})");
         }
 
         let writer = writer
             .to_samples_writer()
             .map_err(|e| anyhow::anyhow!("to_samples_writer failed: {e:?}"))?;
 
-        Ok(Self { flow_id, instance, writer, channels })
+        let sample_rate = mxl::Rational { numerator: cfg.sample_rate as i64, denominator: 1 };
+        Ok(Self { instance, writer, channels, sample_rate, next_index: None })
     }
 
-    pub fn current_index(&self, sample_rate: &mxl::Rational) -> u64 {
-        self.instance.get_current_index(sample_rate)
-    }
-
-    /// Writes one period of planar float32 samples (one Vec per channel, all the same length) at
-    /// `index` (the sample index of the *first* sample in this batch — see mxl/docs/Timing.md).
-    pub fn write_samples(&self, index: u64, planar: &[Vec<f32>]) -> anyhow::Result<()> {
+    /// Writes one period of planar float32 samples (one Vec per channel, all the same length),
+    /// continuing this flow's own monotonic index from wherever the previous call left off —
+    /// seeded from MXL's own current-time-based index on the very first call (it reads the same
+    /// ptp-clock-manager-disciplined system clock internally per mxl/docs/Timing.md's "index 0 =
+    /// SMPTE 2059-1 epoch" model, no need to duplicate that computation here). Mirrors the
+    /// write_samples loop in mxl's own flow-writer.rs example, generalized to per-flow state.
+    pub fn write_next(&mut self, planar: &[Vec<f32>]) -> anyhow::Result<()> {
         let count = planar.first().map(|c| c.len()).unwrap_or(0);
         if count == 0 {
             return Ok(());
         }
+        let index = match self.next_index {
+            Some(i) => i,
+            None => self.instance.get_current_index(&self.sample_rate),
+        };
+
+        tracing::debug!(index, count, "write_next");
         let mut access = self
             .writer
             .open_samples(index + count as u64 - 1, count)
@@ -147,7 +156,9 @@ impl MxlAudioFlow {
             }
         }
 
-        access.commit().map_err(|e| anyhow::anyhow!("commit failed: {e:?}"))
+        access.commit().map_err(|e| anyhow::anyhow!("commit failed: {e:?}"))?;
+        self.next_index = Some(index + count as u64);
+        Ok(())
     }
 }
 
@@ -166,10 +177,14 @@ fn bytemuck_cast_f32_slice(src: &[f32]) -> &[u8] {
 pub struct MxlAudioFlowSource {
     reader: mxl::SamplesReader,
     channels: usize,
+    next_index: Option<u64>,
 }
 
 impl MxlAudioFlowSource {
-    pub fn open(cfg: &Config, mxl_so_path: &std::path::Path, flow_id: &str) -> anyhow::Result<Self> {
+    /// `expected_channels` is the caller's own — the activating mirror's (a Source's, or a packed
+    /// flow's) known channel count, not read from `Config` (Phase 2 has many independently-sized
+    /// flows, not one).
+    pub fn open(cfg: &Config, mxl_so_path: &std::path::Path, flow_id: &str, expected_channels: usize) -> anyhow::Result<Self> {
         let api = mxl::load_api(mxl_so_path)
             .map_err(|e| anyhow::anyhow!("mxl::load_api({mxl_so_path:?}) failed: {e:?}"))?;
         let instance = mxl::MxlInstance::new(api, &cfg.mxl_domain, "")
@@ -186,11 +201,8 @@ impl MxlAudioFlowSource {
             .continuous()
             .map_err(|e| anyhow::anyhow!("flow {flow_id} is not a continuous (audio) flow: {e:?}"))?
             .channelCount as usize;
-        if channels != cfg.channels as usize {
-            anyhow::bail!(
-                "MXL flow channel_count ({channels}) does not match configured channels ({})",
-                cfg.channels
-            );
+        if channels != expected_channels {
+            anyhow::bail!("MXL flow channel_count ({channels}) does not match expected ({expected_channels})");
         }
 
         let reader = reader
@@ -199,7 +211,7 @@ impl MxlAudioFlowSource {
 
         // `instance` isn't stored on Self: `SamplesReader` already keeps its own
         // Arc<InstanceContext> alive internally, so nothing here needs a separate handle to it.
-        Ok(Self { reader, channels })
+        Ok(Self { reader, channels, next_index: None })
     }
 
     /// Current write head of the flow — the sensible starting point for a fresh reader (matches
@@ -213,9 +225,32 @@ impl MxlAudioFlowSource {
             .headIndex)
     }
 
+    /// Resets this reader's own tracked index to the flow's current head — call after `read_next`
+    /// returns an error (most likely cause: the tracked index drifted out of the writer's valid
+    /// ring-buffer window, e.g. a stall let the writer lap the reader).
+    pub fn resync_to_head(&mut self) -> anyhow::Result<()> {
+        self.next_index = Some(self.head_index()?);
+        Ok(())
+    }
+
+    /// Blocking read of `count` samples, continuing this reader's own monotonic index from
+    /// wherever the previous call left off (seeded from `head_index()` on the first call, or after
+    /// `resync_to_head`). Each SourceEntry's reader tracks this independently (Phase 2: readers are
+    /// opened/closed per-activation, not one global index like Phase 1).
+    pub fn read_next(&mut self, count: usize, timeout: std::time::Duration) -> anyhow::Result<Vec<Vec<f32>>> {
+        let index = match self.next_index {
+            Some(i) => i,
+            None => self.head_index()?,
+        };
+        tracing::debug!(index, count, "read_next");
+        let planar = self.read_samples_at(index, count, timeout)?;
+        self.next_index = Some(index + count as u64);
+        Ok(planar)
+    }
+
     /// Blocking read of `count` samples ending at `index` (same end-of-batch indexing convention as
-    /// write_samples). Returns owned planar float32 data, one Vec<f32> per channel.
-    pub fn read_samples(
+    /// write_next). Returns owned planar float32 data, one Vec<f32> per channel.
+    fn read_samples_at(
         &self,
         index: u64,
         count: usize,

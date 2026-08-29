@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use super::is08;
 use super::registration;
 use super::resources;
-use super::state::{NmosState, SinkEntrySnapshot, SourceEntrySnapshot};
+use super::state::{NmosState, SinkEntrySnapshot, SinkLeaseAction, SourceEntrySnapshot};
 
 type S = Arc<NmosState>;
 
@@ -190,19 +190,56 @@ async fn sender_staged(State(state): State<S>, Path(id): Path<String>) -> axum::
     }
 }
 
+/// `master_enable: true` acquires a lease for this Sender keyed by `receiver_id` (required — see
+/// nmos/state.rs's `SinkLeaseAction`); `master_enable: false` releases one (`receiver_id` given) or
+/// force-clears every lease (omitted). A PATCH with neither field present is a no-op on activation
+/// state, just echoing current status.
 async fn sender_patch(
     State(state): State<S>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
-    let active = body.get("master_enable").and_then(|v| v.as_bool());
-    let receiver_id = body.get("receiver_id").map(|v| v.as_str().map(str::to_string));
+    let exists = state.sinks.lock().await.values().any(|e| e.sender_id.to_string() == id);
+    if !exists {
+        return not_found();
+    }
 
-    match state.set_sink_activation(&id, active, receiver_id).await {
-        Ok(entry) => {
-            tracing::info!(sink_id = entry.daemon_id, active = entry.active, receiver_id = ?entry.receiver_id, "sender staged/patched");
+    let master_enable = body.get("master_enable").and_then(|v| v.as_bool());
+    let receiver_id = body.get("receiver_id").and_then(|v| v.as_str()).map(str::to_string);
+
+    let action = match master_enable {
+        Some(true) => match receiver_id {
+            Some(rid) => Some(SinkLeaseAction::Acquire(rid)),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "code": 400,
+                        "error": "master_enable:true requires a receiver_id (mxl-bridge tracks Sender activation per-subscriber)",
+                        "debug": null
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        Some(false) => Some(SinkLeaseAction::Release(receiver_id)),
+        None => None,
+    };
+
+    if let Some(action) = action {
+        match state.set_sink_activation(&id, action).await {
+            Ok(entry) => {
+                tracing::info!(sink_id = entry.daemon_id, active = entry.active, receiver_id = ?entry.receiver_id, "sender staged/patched");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "sender activation failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"code": 500, "error": e.to_string(), "debug": null})),
+                )
+                    .into_response();
+            }
         }
-        Err(_) => return not_found(),
     }
     sender_staged(State(state), Path(id)).await
 }
@@ -235,17 +272,13 @@ async fn receiver_staged(State(state): State<S>, Path(id): Path<String>) -> axum
 }
 
 /// The interesting one: resolves sender_id -> flow_id (via a local lookup if it names one of this
-/// node's own mirrored Senders, otherwise the registry) to validate the activation, then records
-/// activation state. Only `activate_immediate` is handled — matches what the orchestrator actually
-/// sends (ConnectionService.cs never uses scheduled activation) and this project's stated Phase 1
-/// scope; any other `activation.mode` is accepted but treated the same way (applied immediately)
-/// rather than rejected, since a partial IS-05 implementation degrading gracefully seemed better
-/// than erroring on otherwise-reasonable requests.
-///
-/// Milestone 2 scope note: this validates the sender_id resolves to a real flow_id and records
-/// activation state/subscription over IS-05 correctly for N receivers, but doesn't yet open that
-/// flow or move any audio — that lands in Milestone 4 alongside the rest of the ALSA data-path
-/// rework (wide-device open, per-Source routing), see the Phase 2 plan §4.
+/// node's own mirrored Senders, otherwise the registry) and opens it as this Receiver's reader
+/// (nmos/state.rs::set_source_activation — real MXL data movement as of Milestone 4). Only
+/// `activate_immediate` is handled — matches what the orchestrator actually sends
+/// (ConnectionService.cs never uses scheduled activation) and this project's stated Phase 1 scope;
+/// any other `activation.mode` is accepted but treated the same way (applied immediately) rather
+/// than rejected, since a partial IS-05 implementation degrading gracefully seemed better than
+/// erroring on otherwise-reasonable requests.
 async fn receiver_patch(
     State(state): State<S>,
     Path(id): Path<String>,
@@ -260,14 +293,23 @@ async fn receiver_patch(
     let master_enable = body.get("master_enable").and_then(|v| v.as_bool());
     let active = master_enable.unwrap_or(sender_id.is_some());
 
+    let mut flow_id = None;
     if active {
-        if let Some(sid) = &sender_id {
-            let resolved = if let Some(flow_id) = state.own_sink_flow_id(sid).await {
-                Ok(flow_id.to_string())
-            } else {
-                registration::resolve_sender_flow_id(&state, sid).await
-            };
-            if let Err(e) = resolved {
+        let Some(sid) = &sender_id else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"code": 400, "error": "activating a receiver requires sender_id", "debug": null})),
+            )
+                .into_response();
+        };
+        let resolved = if let Some(fid) = state.own_sink_flow_id(sid).await {
+            Ok(fid.to_string())
+        } else {
+            registration::resolve_sender_flow_id(&state, sid).await
+        };
+        match resolved {
+            Ok(fid) => flow_id = Some(fid),
+            Err(e) => {
                 tracing::error!(error = %e, sender_id = sid, "failed to resolve sender's flow_id");
                 return (
                     StatusCode::BAD_REQUEST,
@@ -278,7 +320,7 @@ async fn receiver_patch(
         }
     }
 
-    if let Err(e) = state.set_source_activation(&id, active, sender_id).await {
+    if let Err(e) = state.set_source_activation(&id, active, sender_id, flow_id).await {
         tracing::error!(error = %e, "receiver activation failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

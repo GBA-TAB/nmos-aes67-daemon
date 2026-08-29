@@ -68,20 +68,53 @@ async fn main() -> anyhow::Result<()> {
     // Source/Sink set and mirror it into persistent NMOS resources — one Source/Flow/Sender per
     // daemon Sink, one Receiver per daemon Source — kept in sync via nmos::sync as the daemon's
     // set changes. This replaces Phase 1's single fixed flow/Sender/Receiver pair.
-    //
-    // Milestone 2 scope: this wires up IS-04 discovery and IS-05 activation bookkeeping for all
-    // of the daemon's mirrored resources. Actual MXL flow creation and ALSA data movement for
-    // them is Milestone 4's job (the wide-device-open + per-Sink/Source routing rework) — until
-    // then, alsa_capture/alsa_playback are not yet wired to anything.
-    let (diff_tx, diff_rx) = tokio::sync::mpsc::unbounded_channel();
+    let daemon_client = daemon_client::DaemonClient::new(cfg.daemon_api_url.clone());
+    let poll_interval = Duration::from_millis(cfg.daemon_poll_interval_ms);
+
+    // Milestone 4: alsa_capture/alsa_playback's RX/TX threads open their wide ALSA devices once,
+    // at the daemon's own `alsa_channels` width, and need `state.sinks`/`sources` already
+    // populated for any Sink/Source that's already active at startup. So do one synchronous poll
+    // here — before spawning those threads — rather than waiting for the first tick of the
+    // ongoing polling loop below. A failure here (daemon unreachable at startup) isn't fatal:
+    // fall back to the configured ceiling and start with an empty mirror set, exactly as
+    // `alsa_channels_fallback`'s own doc comment (config.rs) says it's for.
+    let registration_client = reqwest::Client::new();
+    let registry_base = nmos::registration::registry_base(&state);
+    let initial_state = match daemon_client.poll_once(&daemon_client::DaemonState::default()).await {
+        Ok((new_state, source_changes, sink_changes)) => daemon_client::DaemonDiff { state: new_state, source_changes, sink_changes },
+        Err(e) => {
+            tracing::warn!(error = %e, "initial daemon poll failed, starting with an empty mirror set and the configured alsa_channels fallback");
+            daemon_client::DaemonDiff {
+                state: daemon_client::DaemonState { alsa_channels: cfg.alsa_channels_fallback, ..Default::default() },
+                source_changes: Vec::new(),
+                sink_changes: Vec::new(),
+            }
+        }
+    };
+    let polling_baseline = initial_state.state.clone();
+    nmos::sync::apply_diff(&state, &registration_client, registry_base.as_deref(), &cfg.ip_addr, initial_state).await;
+
     {
-        let cfg = cfg.clone();
-        tokio::spawn(async move {
-            let client = daemon_client::DaemonClient::new(cfg.daemon_api_url.clone());
-            let interval = Duration::from_millis(cfg.daemon_poll_interval_ms);
-            client.run(interval, daemon_client::DaemonState::default(), diff_tx).await;
+        let state = state.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = alsa_capture::run(state) {
+                tracing::error!(error = %e, "RX thread exited with error");
+            }
         });
     }
+    {
+        let state = state.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = alsa_playback::run(state) {
+                tracing::error!(error = %e, "TX thread exited with error");
+            }
+        });
+    }
+
+    let (diff_tx, diff_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        daemon_client.run(poll_interval, polling_baseline, diff_tx).await;
+    });
     tokio::spawn(nmos::sync::run(state.clone(), diff_rx));
 
     nmos::run(state).await

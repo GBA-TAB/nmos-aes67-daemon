@@ -2,17 +2,15 @@ use serde::Deserialize;
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
-    /// ALSA capture device to bridge from (the RAVENNA PCM device), e.g. "hw:RAVENNA,0".
+    /// The wide RAVENNA ALSA capture device to open once at startup, at the daemon's own
+    /// `alsa_channels` width (Phase 2 plan §4) — e.g. "hw:RAVENNA,0".
     pub alsa_source_device: String,
     pub sample_rate: u32,
-    pub channels: u32,
     /// ALSA period size in frames. Also the MXL sample-batch size per commit.
     pub period_frames: u32,
 
     /// MXL domain directory (must live on tmpfs) where flow ring buffers are stored.
     pub mxl_domain: String,
-    /// Human-readable label used for both the MXL flow and the NMOS Source/Flow/Sender.
-    pub label: String,
 
     pub nmos_node_port: u16,
     pub nmos_label: String,
@@ -26,11 +24,9 @@ pub struct Config {
     /// resolved field rather than deriving it here).
     pub ip_addr: String,
 
-    /// TX direction (MXL flow -> ALSA playback): manual override to auto-activate the receiver at
-    /// startup from a fixed flow_id, for testing the TX path without a running NMOS
-    /// controller/registry. Real deployments drive this via IS-05 activation instead.
-    #[serde(default)]
-    pub tx_source_flow_id: Option<String>,
+    /// The wide RAVENNA ALSA playback device for TX, if different from `alsa_source_device` (a
+    /// real deployment usually bridges different channel ranges/devices in each direction). Falls
+    /// back to `alsa_source_device` when unset.
     #[serde(default)]
     pub tx_alsa_playback_device: Option<String>,
 
@@ -86,10 +82,8 @@ pub(crate) fn test_config() -> Config {
     serde_json::from_value(serde_json::json!({
         "alsa_source_device": "hw:Loopback,1,1",
         "sample_rate": 48000,
-        "channels": 2,
         "period_frames": 480,
         "mxl_domain": "/dev/shm/mxl-bridge-test",
-        "label": "test",
         "nmos_node_port": 3213,
         "nmos_label": "mxl-bridge test",
         "nmos_registry_address": null,

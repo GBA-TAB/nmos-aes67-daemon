@@ -1,8 +1,11 @@
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 
 use crate::config::Config;
-use crate::mxl_flow::MxlAudioFlow;
+use crate::nmos::NmosState;
 
 /// Full-scale divisor for ALSA's S32_LE format: samples are always left-justified within the 32-bit
 /// container regardless of the true network bit depth (16/24/32 — see daemon's codec_to_nmos), so
@@ -10,14 +13,14 @@ use crate::mxl_flow::MxlAudioFlow;
 /// them.
 const S32_FULL_SCALE: f32 = 2147483648.0; // 2^31
 
-fn open_capture(cfg: &Config) -> anyhow::Result<PCM> {
+fn open_capture(cfg: &Config, channels: u32) -> anyhow::Result<PCM> {
     let pcm = PCM::new(&cfg.alsa_source_device, Direction::Capture, false)
         .map_err(|e| anyhow::anyhow!("opening ALSA capture device '{}': {e}", cfg.alsa_source_device))?;
     {
         let hwp = HwParams::any(&pcm)?;
         hwp.set_access(Access::RWInterleaved)?;
         hwp.set_format(Format::S32LE)?;
-        hwp.set_channels(cfg.channels)?;
+        hwp.set_channels(channels)?;
         let negotiated_rate = hwp.set_rate_near(cfg.sample_rate, ValueOr::Nearest)?;
         if negotiated_rate != cfg.sample_rate {
             tracing::warn!(
@@ -34,33 +37,39 @@ fn open_capture(cfg: &Config) -> anyhow::Result<PCM> {
     Ok(pcm)
 }
 
-/// Blocking capture loop: reads one ALSA period at a time, converts interleaved i32 -> planar f32,
-/// timestamps against CLOCK_TAI, and writes into the MXL flow at the corresponding sample index.
-/// Runs on its own OS thread (ALSA's blocking I/O doesn't play well with async).
-pub fn run(cfg: Config, flow: MxlAudioFlow) -> anyhow::Result<()> {
-    let pcm = open_capture(&cfg)?;
+/// Blocking capture loop: opens the wide RAVENNA capture device *once*, at the daemon's own
+/// `alsa_channels` pool width (read from `state.alsa_channels`, set from the daemon's `GET
+/// /api/config` — see main.rs's startup sequencing, which populates it before spawning this
+/// thread; not reopened if that value changes later, Phase 2 plan §4). Each period, slices out and
+/// forwards every currently-active Sink's own channels (per its `map[]`, physical ALSA channel
+/// indices — not necessarily contiguous) into that Sink's own dedicated MXL flow; an inactive Sink
+/// (no `flow`, i.e. no leases — Phase 2 plan §1) is skipped entirely, no crosspoint lookup for this
+/// default path. Runs on its own OS thread (ALSA's blocking I/O doesn't play well with async).
+///
+/// Uses `state.sinks.blocking_lock()` — safe specifically because this is a plain OS thread, not a
+/// tokio task (`tokio::sync::Mutex::blocking_lock` is built for exactly this: synchronously
+/// blocking from *outside* the runtime; it panics if called from within it, which nmos/server.rs's
+/// async handlers never do since they use `.lock().await` instead. Holding it only across the
+/// synchronous per-Sink convert-and-write work below, never across any `.await`, keeps this from
+/// stalling those handlers for longer than one period's worth of work).
+pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
+    let channels = state.alsa_channels.load(Ordering::Relaxed) as u32;
+    let pcm = open_capture(&state.cfg, channels)?;
     let io = pcm.io_i32()?;
 
-    let channels = cfg.channels as usize;
-    let period = cfg.period_frames as usize;
-    let mut interleaved = vec![0i32; period * channels];
-    let mut planar: Vec<Vec<f32>> = vec![vec![0.0f32; period]; channels];
-
-    let sample_rate = mxl::Rational { numerator: cfg.sample_rate as i64, denominator: 1 };
+    let period = state.cfg.period_frames as usize;
+    let mut interleaved = vec![0i32; period * channels as usize];
+    // Reused across periods, grown on demand to the widest active Sink seen so far — avoids a
+    // fresh allocation per Sink per period.
+    let mut planar_scratch: Vec<Vec<f32>> = Vec::new();
 
     tracing::info!(
-        device = %cfg.alsa_source_device,
+        device = %state.cfg.alsa_source_device,
         channels,
-        sample_rate = cfg.sample_rate,
+        sample_rate = state.cfg.sample_rate,
         period,
-        "starting ALSA capture -> MXL flow bridge"
+        "starting wide ALSA capture -> per-Sink MXL flow bridge"
     );
-
-    // Seed from MXL's own current-time-based index (it reads the same, ptp-clock-manager-disciplined
-    // system clock internally per mxl/docs/Timing.md's "index 0 = SMPTE 2059-1 epoch" model — no need
-    // to duplicate that computation here), then just advance by however many frames we actually read
-    // each period. Mirrors the write_samples loop in mxl's own flow-writer.rs example exactly.
-    let mut start_index = flow.current_index(&sample_rate);
 
     loop {
         let frames_read = match io.readi(&mut interleaved) {
@@ -77,21 +86,32 @@ pub fn run(cfg: Config, flow: MxlAudioFlow) -> anyhow::Result<()> {
         if frames_read == 0 {
             continue;
         }
+        let frame_window = &interleaved[..frames_read * channels as usize];
 
-        for ch in 0..channels {
-            planar[ch].truncate(0);
-            planar[ch].extend(
-                interleaved[..frames_read * channels]
-                    .iter()
-                    .skip(ch)
-                    .step_by(channels)
-                    .map(|&s| s as f32 / S32_FULL_SCALE),
-            );
+        let mut sinks = state.sinks.blocking_lock();
+        for entry in sinks.values_mut() {
+            let Some(flow) = entry.flow.as_mut() else { continue };
+            let n = entry.map.len();
+            if planar_scratch.len() < n {
+                planar_scratch.resize(n, Vec::new());
+            }
+            for (ch_idx, &alsa_ch) in entry.map.iter().enumerate() {
+                let alsa_ch = alsa_ch as usize;
+                let buf = &mut planar_scratch[ch_idx];
+                buf.clear();
+                if alsa_ch >= channels as usize {
+                    // The daemon reported a map[] entry outside the wide device's own width — can
+                    // only happen if `alsa_channels` changed since this thread opened its device
+                    // (§4: opened once, not reopened) or a daemon bug; skip this channel (leaves
+                    // silence) rather than panicking on an out-of-bounds slice.
+                    buf.resize(frames_read, 0.0);
+                    continue;
+                }
+                buf.extend(frame_window.iter().skip(alsa_ch).step_by(channels as usize).map(|&s| s as f32 / S32_FULL_SCALE));
+            }
+            if let Err(e) = flow.write_next(&planar_scratch[..n]) {
+                tracing::error!(daemon_id = entry.daemon_id, error = %e, "failed to write samples into MXL flow");
+            }
         }
-
-        if let Err(e) = flow.write_samples(start_index, &planar) {
-            tracing::error!(error = %e, "failed to write samples into MXL flow");
-        }
-        start_index += frames_read as u64;
     }
 }

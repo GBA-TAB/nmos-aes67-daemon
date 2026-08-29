@@ -16,14 +16,23 @@ pub async fn run(state: Arc<NmosState>, mut rx: tokio::sync::mpsc::UnboundedRece
     let base = registration::registry_base(&state);
 
     while let Some(diff) = rx.recv().await {
-        for change in diff.sink_changes {
-            apply_sink_change(&state, &client, base.as_deref(), &ip, change).await;
-        }
-        for change in diff.source_changes {
-            apply_source_change(&state, &client, base.as_deref(), change).await;
-        }
+        apply_diff(&state, &client, base.as_deref(), &ip, diff).await;
     }
     tracing::warn!("daemon diff channel closed, mirror sync task stopped");
+}
+
+/// Applies one `DaemonDiff` to `state`. Exposed separately from `run`'s loop so main.rs can also
+/// call it directly for the very first, synchronous poll at startup — before the RX/TX threads
+/// open their wide ALSA devices, which need `state.sinks`/`sources`/`alsa_channels` already
+/// populated (Milestone 4, Phase 2 plan §4).
+pub async fn apply_diff(state: &Arc<NmosState>, client: &reqwest::Client, base: Option<&str>, ip: &str, diff: DaemonDiff) {
+    state.set_alsa_channels(diff.state.alsa_channels);
+    for change in diff.sink_changes {
+        apply_sink_change(state, client, base, ip, change).await;
+    }
+    for change in diff.source_changes {
+        apply_source_change(state, client, base, change).await;
+    }
 }
 
 async fn apply_sink_change(state: &Arc<NmosState>, client: &reqwest::Client, base: Option<&str>, ip: &str, change: StreamChange<DaemonSink>) {
