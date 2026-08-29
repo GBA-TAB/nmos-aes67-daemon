@@ -20,11 +20,15 @@ pub struct Config {
     pub nmos_registry_address: Option<String>,
     pub nmos_registry_port: u16,
     pub interface_name: String,
+    /// IP address the Node API/Connection API HTTP server is reachable at — used to build
+    /// href/manifest_href URLs advertised to controllers. Not auto-resolved from interface_name
+    /// (matching the C++ daemon's config.hpp, which also takes this as an explicit, separately-
+    /// resolved field rather than deriving it here).
+    pub ip_addr: String,
 
-    /// TX direction (MXL flow -> ALSA playback): which flow to consume and which ALSA device to
-    /// play it out on. Both optional and both required together — real deployments will get this
-    /// from IS-05 activation instead (not implemented yet, see README), this is a manual override
-    /// for testing the TX path standalone.
+    /// TX direction (MXL flow -> ALSA playback): manual override to auto-activate the receiver at
+    /// startup from a fixed flow_id, for testing the TX path without a running NMOS
+    /// controller/registry. Real deployments drive this via IS-05 activation instead.
     #[serde(default)]
     pub tx_source_flow_id: Option<String>,
     #[serde(default)]

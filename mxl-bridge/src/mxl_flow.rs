@@ -11,6 +11,28 @@ pub fn stable_id(name: &str) -> uuid::Uuid {
     uuid::Uuid::new_v5(&ID_NAMESPACE, name.as_bytes())
 }
 
+// Single source of truth for the ids that must agree between the MXL flow itself and the NMOS
+// resources describing it (nmos/resources.rs and nmos/state.rs both call these, instead of each
+// re-deriving the same string format independently and risking drift).
+pub fn node_id() -> uuid::Uuid {
+    stable_id("mxl-bridge-node")
+}
+pub fn device_id() -> uuid::Uuid {
+    stable_id("mxl-bridge-device")
+}
+pub fn source_id(label: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-bridge-source:{label}"))
+}
+pub fn flow_id(label: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-bridge-flow:{label}"))
+}
+pub fn sender_id(label: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-bridge-sender:{label}"))
+}
+pub fn receiver_id(label: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-bridge-receiver:{label}"))
+}
+
 /// Builds the flow_def JSON passed to `mxlCreateFlowWriter`. This *is* an NMOS Flow resource JSON
 /// (confirmed against MXL's own examples/flow-configs/flow-audio.json) — audio/float32 is MXL's only
 /// supported audio sample format (docs/Architecture.md:341), fixed regardless of the AES67 network
@@ -51,9 +73,9 @@ impl MxlAudioFlow {
         let instance = mxl::MxlInstance::new(api, &cfg.mxl_domain, "")
             .map_err(|e| anyhow::anyhow!("MxlInstance::new({}) failed: {e:?}", cfg.mxl_domain))?;
 
-        let flow_id = stable_id(&format!("mxl-bridge-flow:{}", cfg.label));
-        let source_id = stable_id(&format!("mxl-bridge-source:{}", cfg.label));
-        let device_id = stable_id("mxl-bridge-device");
+        let flow_id = flow_id(&cfg.label);
+        let source_id = source_id(&cfg.label);
+        let device_id = device_id();
         let flow_def = build_audio_flow_def(cfg, flow_id, source_id, device_id);
 
         let (writer, info, was_created) = instance

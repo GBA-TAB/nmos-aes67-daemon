@@ -3,9 +3,12 @@ mod alsa_playback;
 mod clock;
 mod config;
 mod mxl_flow;
+mod nmos;
+
+use std::sync::Arc;
 
 use config::Config;
-use mxl_flow::{MxlAudioFlow, MxlAudioFlowSource};
+use mxl_flow::MxlAudioFlow;
 
 /// mxl-sys builds libmxl.so under `target/{debug,release}/build/mxl-sys-<fingerprint>/out/lib/`,
 /// alongside wherever this binary itself lives (`target/{debug,release}/mxl-bridge`) — the
@@ -35,7 +38,8 @@ fn find_mxl_so() -> anyhow::Result<std::path::PathBuf> {
     anyhow::bail!("could not find libmxl.so under {build_dir:?}/mxl-sys-*/out/lib/")
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -60,29 +64,22 @@ fn main() -> anyhow::Result<()> {
     let flow = MxlAudioFlow::create(&cfg, &mxl_so)?;
     tracing::info!(flow_id = %flow.flow_id, "MXL flow created");
 
-    // ALSA I/O is blocking, so RX/TX each run on their own OS thread. The NMOS layer (not yet
-    // implemented) will own the main thread's async runtime; for now main() just joins whichever
-    // of these are configured.
-    let mut handles = Vec::new();
+    // RX runs unconditionally for the lifetime of the process (ALSA I/O is blocking, hence its own
+    // OS thread) — unlike TX, which IS-05 activation starts/stops dynamically per receiver
+    // (nmos/state.rs::activate_receiver), there's no "sender master_enable" -> "stop capturing"
+    // wiring in Phase 1; the Sender's active/master_enable flag is reported/PATCHable but doesn't
+    // gate the underlying capture. Fire-and-forget: if this thread panics the process keeps running
+    // with a dead RX path rather than taking the whole bridge down — acceptable for Phase 1, revisit
+    // if that gap matters in practice.
     {
         let cfg = cfg.clone();
-        handles.push(std::thread::spawn(move || alsa_capture::run(cfg, flow)));
-    }
-    if let (Some(flow_id), Some(device)) =
-        (cfg.tx_source_flow_id.clone(), cfg.tx_alsa_playback_device.clone())
-    {
-        let cfg = cfg.clone();
-        let mxl_so = mxl_so.clone();
-        handles.push(std::thread::spawn(move || {
-            let source = MxlAudioFlowSource::open(&cfg, &mxl_so, &flow_id)?;
-            alsa_playback::run(cfg, device, source)
-        }));
+        std::thread::spawn(move || {
+            if let Err(e) = alsa_capture::run(cfg, flow) {
+                tracing::error!(error = %e, "RX thread exited with error");
+            }
+        });
     }
 
-    for handle in handles {
-        handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("a bridge thread panicked"))??;
-    }
-    Ok(())
+    let state = Arc::new(nmos::NmosState::new(cfg, mxl_so));
+    nmos::run(state).await
 }

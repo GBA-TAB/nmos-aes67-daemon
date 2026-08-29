@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 
@@ -36,8 +39,14 @@ fn open_playback(cfg: &Config, device: &str) -> anyhow::Result<PCM> {
 /// Blocking playback loop: reads one batch of samples from the MXL flow at a time, converts planar
 /// f32 -> interleaved i32, and writes to ALSA playback. `device` is the RAVENNA ALSA playback device
 /// (distinct from the capture device used for RX — a real deployment bridges different channel
-/// ranges in each direction).
-pub fn run(cfg: Config, device: String, source: MxlAudioFlowSource) -> anyhow::Result<()> {
+/// ranges in each direction). Checks `stop` once per loop iteration (bounded by the read timeout
+/// below, not instant) so IS-05 deactivation can shut this down — see nmos/state.rs.
+pub fn run_until_stopped(
+    cfg: Config,
+    device: String,
+    source: MxlAudioFlowSource,
+    stop: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     let pcm = open_playback(&cfg, &device)?;
     let io = pcm.io_i32()?;
 
@@ -59,6 +68,10 @@ pub fn run(cfg: Config, device: String, source: MxlAudioFlowSource) -> anyhow::R
     let read_timeout = std::time::Duration::from_millis(500);
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            tracing::info!("TX stop requested, exiting playback loop");
+            return Ok(());
+        }
         let planar = match source.read_samples(read_index, period, read_timeout) {
             Ok(p) => p,
             Err(e) => {

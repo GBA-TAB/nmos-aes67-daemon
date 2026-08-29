@@ -29,7 +29,8 @@ Full design rationale lives in the conversation that produced this skeleton; the
   receiver's `/staged` PATCH but never validates it — so a receiver here can just ignore that relayed
   content and self-resolve the paired sender via `sender_id` against the IS-04 registry, mirroring the
   daemon's own `fetch_remote_sender_sdp()` pattern. A private-use `transporttype`
-  (e.g. `urn:x-mxl:transport:flow`) is used since there's no AMWA-registered URN for this.
+  (`urn:x-mxl:transport:flow`) is used since there's no AMWA-registered URN for this. **Implemented and
+  verified — see Status.**
 
 ## Status
 
@@ -64,11 +65,36 @@ feeding the whole pipeline), not real synchronization to an external reference. 
 matter once cross-host (Fabrics/RDMA) work needs two hosts' clocks to actually agree — worth re-verifying
 against a real PTP grandmaster before trusting this for that.
 
-Still to build: config for a real RAVENNA device (only tested against ALSA Loopback so far) and the whole
-NMOS Node/IS-04/IS-05 layer (`nmos_node_port`, `nmos_label`, `nmos_registry_address`, etc. are already in
-`Config` but unused — the process currently runs RX/TX directly with `tx_source_flow_id`/
-`tx_alsa_playback_device` config overrides standing in for what IS-05 activation should eventually drive,
-no NMOS surface at all yet).
+**The NMOS Node/IS-04/IS-05 layer is implemented and verified against a real activation**, not just
+discovery. With the same RX/TX round-trip test running, a real `PATCH .../single/receivers/{id}/staged`
+(via plain `curl`, no controller needed) with `{sender_id, master_enable: true, activation: {mode:
+"activate_immediate"}}` correctly resolved the sender's `flow_id` (self-connection shortcut — same-node
+sender/receiver pairs skip the registry round trip, see `nmos/server.rs::receiver_patch`), started the TX
+thread pointed at it, and produced a captured WAV with an **exact 440.0Hz** zero-crossing match and an
+RMS/peak ratio of 0.707 — the precise theoretical value for an undistorted sine wave (1/√2). Cleaner than
+the earlier config-driven test (427Hz estimate), likely just measurement variance rather than anything
+architecturally different.
+
+What's implemented: IS-04 Node API (Node/Device/Source/Flow/Sender/Receiver, GET-only, one fixed
+Sender+Receiver pair per process), IS-05 Connection API (staged/active GET, PATCH for both — sender PATCH
+only toggles `master_enable`/`receiver_id` bookkeeping; receiver PATCH is the real one, driving TX thread
+lifecycle), and registry registration + heartbeat (skipped cleanly if `nmos_registry_address` is unset —
+Node API still serves). Cross-node connections (a receiver activated with a sender_id belonging to some
+*other* mxl-bridge instance) go through `nmos/registration.rs::resolve_sender_flow_id`, an IS-04 Query API
+GET — not yet tested against a second real instance or the actual orchestrator, only the self-connection
+path above.
+
+Known simplifications, deliberately deferred rather than unnoticed: no scheduled activation (only
+`activate_immediate` is meaningfully handled, matching what the orchestrator's `ConnectionService` actually
+sends); `staged` and `active` are the same state (no separate staged-not-yet-active concept); no IS-04
+Query API websocket subscriptions; `transportfile`/`constraints` are minimal placeholders (the design
+deliberately doesn't need real SDP-shaped transport_file content — see the IS-05 design note above); no
+config yet for a real RAVENNA device (only tested against ALSA Loopback).
+
+One route-syntax bug found while testing this: axum 0.7's path-parameter syntax is `:id`, not `{id}` — the
+latter is silently treated as a literal path segment (matches nothing real, falls through to axum's default
+404) rather than erroring at startup, so this went unnoticed until the first real PATCH with an actual UUID
+failed. `{id}` is axum 0.8's syntax; easy to mix up if skimming newer docs against an older pinned version.
 
 **Resolved**: `mxl::load_api()` (dynamic `dlopen` via `libloading`) works fine given an absolute path —
 `find_mxl_so()` in `main.rs` locates the built `libmxl.so` at runtime by searching
