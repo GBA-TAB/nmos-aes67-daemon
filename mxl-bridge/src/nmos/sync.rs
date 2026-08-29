@@ -54,6 +54,9 @@ async fn apply_source_change(state: &Arc<NmosState>, client: &reqwest::Client, b
     match change {
         StreamChange::Added(source) | StreamChange::Changed(source) => {
             let entry = state.apply_source_added_or_changed(&source).await;
+            // Keeps IS-08's always-present "source-stream:<id>" Output sized to match — see
+            // is08.rs's module docs (Phase 2 plan §3).
+            state.is08.sync_source_stream_output(entry.daemon_id, entry.channels as usize).await;
             tracing::info!(daemon_id = source.id, label = %entry.label, channels = entry.channels, "mirroring daemon Source");
             if let Some(base) = base {
                 if let Err(e) = registration::register_source(client, base, state, &entry).await {
@@ -63,6 +66,7 @@ async fn apply_source_change(state: &Arc<NmosState>, client: &reqwest::Client, b
         }
         StreamChange::Removed(id) => {
             if let Some(entry) = state.remove_source(id).await {
+                state.is08.remove_source_stream_output(id).await;
                 tracing::info!(daemon_id = id, "daemon Source removed, un-mirroring");
                 if let Some(base) = base {
                     if let Err(e) = registration::unregister_source(client, base, &entry).await {

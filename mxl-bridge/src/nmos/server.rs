@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 
+use super::is08;
 use super::registration;
 use super::resources;
 use super::state::{NmosState, SinkEntrySnapshot, SourceEntrySnapshot};
@@ -14,7 +15,7 @@ type S = Arc<NmosState>;
 
 pub fn router(state: S) -> Router {
     Router::new()
-        .route("/x-nmos/", get(|| list(&["node/", "connection/"])))
+        .route("/x-nmos/", get(|| list(&["node/", "connection/", "channelmapping/"])))
         .route("/x-nmos/node/", get(|| list(&["v1.3/"])))
         .route("/x-nmos/node/v1.3/", get(|| list(&["self", "devices/", "sources/", "flows/", "senders/", "receivers/"])))
         .route("/x-nmos/node/v1.3/self", get(node_self))
@@ -43,6 +44,7 @@ pub fn router(state: S) -> Router {
         .route("/x-nmos/connection/v1.1/single/receivers/:id/staged", get(receiver_staged).patch(receiver_patch))
         .route("/x-nmos/connection/v1.1/single/receivers/:id/active", get(receiver_staged))
         .route("/x-nmos/connection/v1.1/single/receivers/:id/transporttype", get(receiver_transporttype))
+        .merge(is08::router())
         .with_state(state)
 }
 

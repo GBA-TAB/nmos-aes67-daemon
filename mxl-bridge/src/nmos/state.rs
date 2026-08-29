@@ -100,6 +100,8 @@ pub struct NmosState {
 
     pub sinks: Mutex<HashMap<u8, SinkEntry>>,
     pub sources: Mutex<HashMap<u8, SourceEntry>>,
+
+    pub is08: super::is08::Is08State,
 }
 
 impl NmosState {
@@ -112,6 +114,7 @@ impl NmosState {
             mxl_so_path,
             sinks: Mutex::new(HashMap::new()),
             sources: Mutex::new(HashMap::new()),
+            is08: super::is08::Is08State::default(),
         }
     }
 

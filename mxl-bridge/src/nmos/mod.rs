@@ -1,3 +1,4 @@
+pub mod is08;
 pub mod registration;
 pub mod resources;
 pub mod server;
