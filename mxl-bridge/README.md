@@ -7,11 +7,17 @@ IS-04/IS-05 like the rest of this project. New standalone process, same placemen
 
 Full design rationale lives in the conversation that produced this skeleton; the summary:
 
-- **Timing is already solved by this project.** `../ptp-clock-manager/drivers/clock_tai_driver.cpp`
-  disciplines the OS's `CLOCK_TAI` directly from the RAVENNA driver's PTP offset. Linux's `CLOCK_TAI`
-  epoch matches MXL's SMPTE ST 2059-1 epoch exactly, so timestamping a captured ALSA period is just
-  `clock_gettime(CLOCK_TAI)` → `sampleIndex = taiNs / (1_000_000_000 / sampleRate)`. No PTP client code
-  needed here.
+- **Timing is already solved by this project — and MXL doesn't even need our help with it.**
+  `../ptp-clock-manager/drivers/clock_tai_driver.cpp` disciplines the OS's `CLOCK_TAI` directly from the
+  RAVENNA driver's PTP offset, and MXL's `MxlInstance::get_current_index()` already reads the system
+  clock internally to compute a TAI-epoch-based sample index (confirmed empirically — see below). So the
+  capture loop just seeds a running index from `get_current_index()` once and advances it by the actual
+  frame count read each period, exactly matching the pattern in MXL's own `flow-writer.rs` example — no
+  manual `clock_gettime(CLOCK_TAI)` arithmetic needed in the hot path. (`src/clock.rs` still exists as a
+  startup diagnostic — logs a raw `CLOCK_TAI` read at boot to fail loudly if `clock_tai_driver` isn't
+  running — but isn't used for the actual sample-index math; an earlier version tried to compute the
+  index manually and reimplement what MXL already does, which was subtly wrong and made every
+  `open_samples` call fail with `InvalidArg`.)
 - **ALSA-layer integration, not RTP-layer.** Opens the RAVENNA PCM device directly as an independent
   client (same proven pattern as `alsa_src_driver.cpp`, which already does this for both capture and
   playback, independently of the C++ daemon). Never touches RTP, SDP, or the daemon's internals.
@@ -27,17 +33,26 @@ Full design rationale lives in the conversation that produced this skeleton; the
 
 ## Status
 
-Skeleton only — `Cargo.toml` wires up the `mxl` dependency and the whole build toolchain is validated
-end to end (see below), but `src/main.rs` doesn't do anything yet. Real implementation (config, ALSA
-capture loop, MXL flow writer, NMOS Node/IS-04/IS-05 layer) is in progress.
+**RX direction (AES67/ALSA capture → MXL flow) works end to end**, verified with a real audio signal:
+ALSA Loopback (`snd-aloop`) fed a 440Hz test tone on the playback side, `mxl-bridge` captured from the
+paired capture subdevice, and MXL's own `mxl-info` tool (built separately from the MXL repo for
+verification, not a `mxl-bridge` dependency) confirmed the resulting flow had the correct format
+(`Audio`, 48000/1, 2 channels), a stable ~9ms latency matching the configured period exactly, and a head
+index advancing at ~48000/s in real time while the process ran. Not yet verified: actual sample *content*
+correctness (that it's really a clean sine wave and not, say, silence or a scaled/clipped version) — the
+available MXL CLI tools (`mxl-data-probe`) only read ANC/Data flows, not audio; would need a small custom
+`SamplesReader`-based check or a `mxl-gst` sink piped to an analyzer to confirm that specifically.
 
-**Open/unverified**: whether `mxl::load_api("libmxl.so")` (dynamic `dlopen` via `libloading`) actually
-finds the built `libmxl.so` at runtime without extra environment setup. The skeleton binary has *no*
-`DT_NEEDED` entry for `libmxl` at all (confirmed via `readelf -d`) since nothing calls into it yet — so
-this hasn't been exercised. If it doesn't resolve on its own, the fallback is `LD_LIBRARY_PATH` pointed
-at wherever `mxl-sys`'s build script placed `libmxl.so` under
-`target/debug/build/mxl-sys-<hash>/out/build/lib/` (that hash is a Cargo build-script fingerprint, not
-stable across dependency changes — resolve the actual path per-build rather than hardcoding it).
+Still to build: config for a real RAVENNA device (only tested against ALSA Loopback so far), the TX
+direction (MXL flow → ALSA playback), and the whole NMOS Node/IS-04/IS-05 layer (`nmos_node_port`,
+`nmos_label`, `nmos_registry_address`, etc. are already in `Config` but unused — the process currently
+just runs the capture loop directly with no NMOS surface at all).
+
+**Resolved**: `mxl::load_api()` (dynamic `dlopen` via `libloading`) works fine given an absolute path —
+`find_mxl_so()` in `main.rs` locates the built `libmxl.so` at runtime by searching
+`<exe_dir>/build/mxl-sys-*/out/lib/libmxl.so` relative to the running binary's own path (robust regardless
+of CWD or debug/release profile, no `LD_LIBRARY_PATH` needed). Passing the bare string `"libmxl.so"`
+instead (relying on ambient library search paths, as MXL's own examples do) was not tested.
 
 ## Building
 
