@@ -462,24 +462,43 @@ fn parse_path(path: &str, expected_mixer_id: u32) -> Option<(&str, &str, &str)> 
     Some((kind, id, param))
 }
 
-/// Periodically broadcasts every track's and bus's current meter, and the input grid's current
-/// entry list (other params are pushed immediately on change by `handle_put`, not polled here) to
-/// all connected clients. A separate tokio task, not tied to the audio engine's own period (see
-/// module docs). The input grid is folded into this same always-on tick rather than given its own
-/// change-triggered publish path -- it changes rarely, and this keeps `nmos/server.rs`'s ephemeral
-/// entry synthesis (IS-05 receiver activation) from needing any direct wiring into the WS layer to
-/// notify it of a grid change; a new/removed entry just shows up on the next tick.
+/// Periodically broadcasts every track's and bus's current meter and processing-chain stage state
+/// (`filter`/`eq`/`dyn1`/`dyn2`/`phase`/`delay`, plus a track's own `sends`), and the input/output
+/// grid's current entry lists, to all connected clients. A separate tokio task, not tied to the
+/// audio engine's own period (see module docs).
+///
+/// The stage params ride this same always-on tick rather than only being pushed on change (like
+/// `fader`/`mute`/etc. are) because a freshly-connected client has no other way to learn whether a
+/// stage even *exists* for a given track/bus (its `ChannelTemplate` isn't queryable any other way)
+/// — the value is `null` if absent, the real object if present, so this tick is what lets the
+/// dashboard decide whether to render that stage's controls at all, not just what to show in them.
+/// The input/output grid listings are folded in for the same underlying reason (no other
+/// change-triggered publish path — see git history for why) — a new/removed entry or stage just
+/// shows up on the next tick either way.
 pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
     let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / hz));
     loop {
         interval.tick().await;
         for track in &state.mixer.tracks {
-            let path = format!("amixer/{}/channel/{}/peakmeter", state.mixer_id, track.id);
-            publish(&state, &path, serde_json::json!(*track.meter_db.lock().unwrap()));
+            let base = format!("amixer/{}/channel/{}", state.mixer_id, track.id);
+            publish(&state, &format!("{base}/peakmeter"), serde_json::json!(*track.meter_db.lock().unwrap()));
+            publish(&state, &format!("{base}/sends"), sends_json(track));
+            publish(&state, &format!("{base}/filter"), filter_json(&track.filter));
+            publish(&state, &format!("{base}/eq"), eq_json(&track.eq));
+            publish(&state, &format!("{base}/dyn1"), dynamics_json(&track.dyn1));
+            publish(&state, &format!("{base}/dyn2"), dynamics_json(&track.dyn2));
+            publish(&state, &format!("{base}/phase"), phase_json(&track.phase));
+            publish(&state, &format!("{base}/delay"), delay_json(&track.delay));
         }
         for bus in &state.mixer.buses {
-            let path = format!("amixer/{}/sum/{}/peakmeter", state.mixer_id, bus.id);
-            publish(&state, &path, serde_json::json!(*bus.meter_db.lock().unwrap()));
+            let base = format!("amixer/{}/sum/{}", state.mixer_id, bus.id);
+            publish(&state, &format!("{base}/peakmeter"), serde_json::json!(*bus.meter_db.lock().unwrap()));
+            publish(&state, &format!("{base}/filter"), filter_json(&bus.filter));
+            publish(&state, &format!("{base}/eq"), eq_json(&bus.eq));
+            publish(&state, &format!("{base}/dyn1"), dynamics_json(&bus.dyn1));
+            publish(&state, &format!("{base}/dyn2"), dynamics_json(&bus.dyn2));
+            publish(&state, &format!("{base}/phase"), phase_json(&bus.phase));
+            publish(&state, &format!("{base}/delay"), delay_json(&bus.delay));
         }
         publish(&state, &format!("amixer/{}/input-grid", state.mixer_id), state.mixer.input_grid.list_json());
         publish(&state, &format!("amixer/{}/output-grid", state.mixer_id), state.mixer.output_grid.list_json());
