@@ -164,7 +164,7 @@ async fn receiver_ids(State(state): State<S>) -> Json<serde_json::Value> {
 
 fn receiver_json_for(state: &NmosState, t: &crate::mixer::Track) -> serde_json::Value {
     let receiver_id = state.track_receiver_ids[&t.id];
-    let active = t.reader.lock().unwrap().is_some();
+    let active = state.mixer.patch.has_track_in(t.id);
     let sender_id = t.sender_id.lock().unwrap().clone();
     resources::receiver_json(&state.cfg, state.device_id, t, receiver_id, active, sender_id, &state.version())
 }
@@ -240,7 +240,7 @@ async fn receiver_transporttype(Path(_id): Path<String>) -> Json<serde_json::Val
 async fn receiver_staged(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
     match state.mixer.tracks.iter().find(|t| state.track_receiver_ids[&t.id].to_string() == id) {
         Some(t) => Json(serde_json::json!({
-            "master_enable": t.reader.lock().unwrap().is_some(),
+            "master_enable": state.mixer.patch.has_track_in(t.id),
             "activation": { "mode": null, "requested_time": null, "activation_time": null },
             "sender_id": *t.sender_id.lock().unwrap(),
             "transport_file": { "data": null, "type": null },
@@ -252,20 +252,28 @@ async fn receiver_staged(State(state): State<S>, Path(id): Path<String>) -> axum
 }
 
 /// Resolves sender_id -> flow_id (a local lookup if it names one of this app's own bus Senders,
-/// otherwise the registry) and opens it as this track's reader — same shape as mxl-bridge's own
-/// receiver_patch, and the same Milestone-2-era scope note applies here too: only
-/// `activate_immediate` is really handled, anything else is just applied immediately as well.
+/// otherwise the registry), synthesizes/refreshes an ephemeral input-grid entry
+/// (`"recv:<track_id>"`, patch.rs) backed by that flow, and applies an exclusive whole-track
+/// `track-in` patch pointing this track's channels 0..N at that entry's channels 0..N — the
+/// pickoff-point patch bay's one bridge between IS-05 activation and the WS-only patch protocol
+/// (plan §Files-to-touch flagged this as the one place the two models actually meet). Same
+/// Milestone-2-era scope note as mxl-bridge's own receiver_patch: only `activate_immediate` is
+/// really handled, anything else is just applied immediately as well.
 async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(body): Json<serde_json::Value>) -> axum::response::Response {
     let Some(track) = state.mixer.tracks.iter().find(|t| state.track_receiver_ids[&t.id].to_string() == id) else {
         return not_found();
     };
+    let entry_id = format!("recv:{}", track.id);
 
     let sender_id = body.get("sender_id").and_then(|v| v.as_str()).map(str::to_string);
     let master_enable = body.get("master_enable").and_then(|v| v.as_bool());
     let active = master_enable.unwrap_or(sender_id.is_some());
 
     if !active {
-        track.close_source();
+        let empty_patch = vec![None; track.channels];
+        let _ = state.mixer.patch.set_track_in(&state.mixer.tracks, &state.mixer.input_grid, track.id, empty_patch);
+        state.mixer.input_grid.remove(&entry_id);
+        *track.sender_id.lock().unwrap() = None;
         return receiver_staged(State(state), Path(id)).await;
     }
 
@@ -294,11 +302,33 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
         }
     };
 
-    if let Err(e) = track.open_source(&state.cfg.mxl_domain, &state.mxl_so_path, &flow_id) {
-        tracing::error!(error = %e, "receiver activation failed to open flow");
+    match crate::flow::FlowReader::open(&state.cfg.mxl_domain, &state.mxl_so_path, &flow_id, track.channels) {
+        Ok(reader) => {
+            state.mixer.input_grid.insert(crate::patch::InputGridEntry {
+                id: entry_id.clone(),
+                label: format!("Receiver activation for track {}", track.id),
+                channels: track.channels,
+                reader: std::sync::Mutex::new(Some(reader)),
+            });
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "receiver activation failed to open flow");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"code": 500, "error": e.to_string(), "debug": null})),
+            )
+                .into_response();
+        }
+    }
+
+    let whole_track_patch: Vec<Option<crate::patch::SourceRef>> =
+        (0..track.channels).map(|ch| Some(crate::patch::SourceRef::Input { entry_id: entry_id.clone(), channel: ch })).collect();
+    if let Err(e) = state.mixer.patch.set_track_in(&state.mixer.tracks, &state.mixer.input_grid, track.id, whole_track_patch) {
+        state.mixer.input_grid.remove(&entry_id);
+        tracing::error!(error = %e, "receiver activation failed to apply input-patch");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"code": 500, "error": e.to_string(), "debug": null})),
+            Json(serde_json::json!({"code": 500, "error": e, "debug": null})),
         )
             .into_response();
     }

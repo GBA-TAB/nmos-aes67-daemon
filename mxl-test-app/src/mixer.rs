@@ -22,20 +22,21 @@ pub struct Track {
     pub mute: AtomicBool,
     pub solo: AtomicBool,
     pub bus_assign: Mutex<HashSet<u32>>,
-    /// The real MXL reader, if this track has a source configured — `None` reads as silence.
-    /// `std::sync::Mutex`, not `tokio::sync::Mutex`: the audio engine (a plain OS thread) needs a
-    /// blocking lock every period, and the WebSocket handlers (async) only ever hold it briefly to
-    /// swap the reader, never across an `.await` — same reasoning as mxl-bridge's own
-    /// `nmos/is08.rs::routing` field.
-    pub reader: Mutex<Option<crate::flow::FlowReader>>,
     /// The `sender_id` this track's Receiver was last activated against, for IS-05's
-    /// `subscription.sender_id` — purely informational, set alongside `reader` by
-    /// `open_source`/`close_source`'s callers (nmos/server.rs); the amixer WebSocket `source` PUT
-    /// (ws.rs) sets a raw flow_id directly and doesn't have an NMOS sender_id to report here.
+    /// `subscription.sender_id` — purely informational, set by `nmos/server.rs`'s `receiver_patch`
+    /// alongside the ephemeral input-grid entry + track-in patch it synthesizes for the activation
+    /// (see `patch.rs` module docs).
     pub sender_id: Mutex<Option<String>>,
     /// Post-fader peak, one value per channel, in dBFS (`f32::NEG_INFINITY` for silence) — written
     /// by the engine once per period, read by the WebSocket broadcaster.
     pub meter_db: Mutex<Vec<f32>>,
+    /// This track's post-fader signal from the *previous* period — the `track-out:<id>` pickoff
+    /// point (`patch.rs`) other tracks' `track-in` patches read from. Necessarily one period stale
+    /// when consumed that way (this period's own track processing hasn't run yet at the point
+    /// `track-in` is resolved) — see `engine.rs`'s pipeline docs for why. Starts empty (silent);
+    /// `std::sync::Mutex` for the same plain-OS-thread-engine reasoning as `mixer.rs`'s other
+    /// per-period-written fields.
+    pub direct_out_prev: Mutex<Vec<Vec<f32>>>,
 }
 
 impl Track {
@@ -49,29 +50,10 @@ impl Track {
             mute: AtomicBool::new(false),
             solo: AtomicBool::new(false),
             bus_assign: Mutex::new(cfg.bus_assign.iter().copied().collect()),
-            reader: Mutex::new(None),
             sender_id: Mutex::new(None),
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
+            direct_out_prev: Mutex::new(vec![Vec::new(); channels]),
         }
-    }
-
-    /// Opens `flow_id` as this track's reader (at this track's own `channels` count — the flow
-    /// being opened must actually have that many channels, or this fails), replacing whatever it
-    /// had before (or nothing). Shared by both the amixer WebSocket `source` PUT (ws.rs) and IS-05
-    /// receiver activation (nmos/server.rs) — same underlying action, two different protocols
-    /// asking for it. Does not touch `sender_id` — callers that have one (nmos/server.rs) set it
-    /// themselves alongside this.
-    pub fn open_source(&self, mxl_domain: &str, mxl_so_path: &std::path::Path, flow_id: &str) -> anyhow::Result<()> {
-        let reader = crate::flow::FlowReader::open(mxl_domain, mxl_so_path, flow_id, self.channels)?;
-        *self.reader.lock().unwrap() = Some(reader);
-        Ok(())
-    }
-
-    /// Drops this track's reader, if any — IS-05 deactivation (nmos/server.rs). The WS protocol
-    /// has no equivalent "clear source" PUT yet (not asked for; `source` only ever sets one).
-    pub fn close_source(&self) {
-        *self.reader.lock().unwrap() = None;
-        *self.sender_id.lock().unwrap() = None;
     }
 }
 
@@ -94,6 +76,10 @@ pub struct Bus {
     /// to — purely informational (see nmos/resources.rs's `sender_json` docs: nothing here is
     /// actually gated by it, unlike mxl-bridge's Sinks).
     pub receiver_id: Mutex<Option<String>>,
+    /// This bus's post-fader signal from the *most recently completed* period — the `bus-out:<id>`
+    /// pickoff point (`patch.rs`). Not consumed by anything in this pass (Milestone 2's output grid
+    /// is the first consumer) — established now for symmetry with `Track.direct_out_prev`.
+    pub output_prev: Mutex<Vec<Vec<f32>>>,
 }
 
 impl Bus {
@@ -108,6 +94,7 @@ impl Bus {
             writer: Mutex::new(writer),
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             receiver_id: Mutex::new(None),
+            output_prev: Mutex::new(vec![Vec::new(); channels]),
         }
     }
 }

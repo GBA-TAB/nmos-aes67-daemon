@@ -9,7 +9,13 @@
 //! rate (engine.rs) — a real mixer's meter *display* doesn't need updating at audio-block rate
 //! (10ms/100Hz for a typical period), that's just wasted WebSocket traffic to every client; 20-30Hz
 //! matches what a human eye actually resolves and what the dashboard's own README already assumes
-//! ("Real-time (30+ FPS)").
+//! ("Real-time (30+ FPS)"). The pickoff-point patch bay's `input-grid` listing (patch.rs) rides
+//! this same timer rather than a separate change-triggered path — see `run_meter_broadcaster`.
+//!
+//! `input-patch` (both "channel" and "sum") is the pickoff-point patch bay's own param (patch.rs,
+//! plan §1/§5) — not a plain scalar/bool value like the others, but a per-channel array of source
+//! references (`null`/one object for a track's exclusive input, an array of objects per channel for
+//! a bus's summing input).
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -29,8 +35,6 @@ use crate::mixer::{Bus, Track};
 pub struct WsState {
     pub mixer: Arc<MixerState>,
     pub mixer_id: u32,
-    pub mxl_domain: String,
-    pub mxl_so_path: std::path::PathBuf,
     pub updates: broadcast::Sender<(String, serde_json::Value)>,
 }
 
@@ -84,8 +88,8 @@ fn handle_put(state: &WsState, path: &str, value: Option<&serde_json::Value>) {
         }
         "sum" => {
             let Some(bus) = state.mixer.buses.iter().find(|b| b.id == id) else { return };
-            apply_bus_param(bus, param, value);
-            publish(state, path, current_bus_value(bus, param));
+            apply_bus_param(state, bus, param, value);
+            publish(state, path, current_bus_value(state, bus, param));
         }
         _ => (),
     }
@@ -119,24 +123,24 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, value: &serde_
                 *track.bus_assign.lock().unwrap() = set;
             }
         }
-        // Dynamic source assignment (not fixed-at-startup-only, unlike mxl-bridge's Phase 1
-        // `tx_source_flow_id` precedent this app's config docs mention) — needed once a mixer's
-        // size is generated from a track/bus *count* (container startup, no per-track config) so
-        // each track's actual source still has to be assignable somehow after the process starts.
-        // `value` is a raw MXL flow_id string; opening it can genuinely fail (wrong id, wrong
-        // channel count), logged rather than crashing the whole app over one bad PUT.
-        "source" => {
-            let Some(flow_id) = value.as_str() else { return };
-            if let Err(e) = track.open_source(&state.mxl_domain, &state.mxl_so_path, flow_id) {
-                tracing::warn!(track_id = track.id, flow_id, error = %e, "PUT source: failed to open flow");
+        // The pickoff-point patch bay's per-track input-patch (patch.rs, plan §1/§5) -- one entry
+        // per track channel, `null` or `{"source":"input:<id>"|"track-out:<id>","channel":n}`
+        // (exclusive: a channel accepts at most one source). Replaces the old whole-track raw-
+        // flow_id `source` PUT this app used before the patch bay existed.
+        "input-patch" => match crate::patch::PatchState::parse_track_in(value) {
+            Ok(patch) => {
+                if let Err(e) = state.mixer.patch.set_track_in(&state.mixer.tracks, &state.mixer.input_grid, track.id, patch) {
+                    tracing::warn!(track_id = track.id, error = %e, "PUT input-patch rejected");
+                }
             }
-        }
+            Err(e) => tracing::warn!(track_id = track.id, error = %e, "PUT input-patch: malformed value"),
+        },
         _ => {}
     }
-    publish(state, &format!("amixer/{}/channel/{}/{param}", state.mixer_id, track.id), current_track_value(track, param));
+    publish(state, &format!("amixer/{}/channel/{}/{param}", state.mixer_id, track.id), current_track_value(state, track, param));
 }
 
-fn apply_bus_param(bus: &Bus, param: &str, value: &serde_json::Value) {
+fn apply_bus_param(state: &WsState, bus: &Bus, param: &str, value: &serde_json::Value) {
     match param {
         "fader" => {
             if let Some(v) = value.as_f64() {
@@ -148,25 +152,39 @@ fn apply_bus_param(bus: &Bus, param: &str, value: &serde_json::Value) {
                 bus.mute.store(v, Ordering::Relaxed);
             }
         }
+        // Same idea as the track side's "input-patch", but summing (bus-in is an *additional* feed
+        // alongside the existing, unchanged `bus_assign` mechanism -- see patch.rs module docs):
+        // each channel is an *array* of `{"source",...,"channel"}` objects, not a single one.
+        "input-patch" => match crate::patch::PatchState::parse_bus_in(value) {
+            Ok(patch) => {
+                if let Err(e) = state.mixer.patch.set_bus_in(&state.mixer.tracks, &state.mixer.input_grid, bus.id, bus.channels, patch)
+                {
+                    tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch rejected");
+                }
+            }
+            Err(e) => tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch: malformed value"),
+        },
         _ => {}
     }
 }
 
-fn current_track_value(track: &Track, param: &str) -> serde_json::Value {
+fn current_track_value(state: &WsState, track: &Track, param: &str) -> serde_json::Value {
     match param {
         "gain" => serde_json::json!(*track.gain_db.lock().unwrap()),
         "fader" => serde_json::json!(*track.fader_db.lock().unwrap()),
         "mute" => serde_json::json!(track.mute.load(Ordering::Relaxed)),
         "solo" => serde_json::json!(track.solo.load(Ordering::Relaxed)),
         "bus-assign" => serde_json::json!(track.bus_assign.lock().unwrap().iter().copied().collect::<Vec<_>>()),
+        "input-patch" => state.mixer.patch.track_in_json(track.id, track.channels),
         _ => serde_json::Value::Null,
     }
 }
 
-fn current_bus_value(bus: &Bus, param: &str) -> serde_json::Value {
+fn current_bus_value(state: &WsState, bus: &Bus, param: &str) -> serde_json::Value {
     match param {
         "fader" => serde_json::json!(*bus.fader_db.lock().unwrap()),
         "mute" => serde_json::json!(bus.mute.load(Ordering::Relaxed)),
+        "input-patch" => state.mixer.patch.bus_in_json(bus.id, bus.channels),
         _ => serde_json::Value::Null,
     }
 }
@@ -192,10 +210,13 @@ fn parse_path(path: &str, expected_mixer_id: u32) -> Option<(&str, u32, &str)> {
     Some((kind, id, param))
 }
 
-/// Periodically broadcasts every track's and bus's current meter (and, once per tick, nothing
-/// else — other params are pushed immediately on change by `handle_put`, not polled here) to all
-/// connected clients. A separate tokio task, not tied to the audio engine's own period (see module
-/// docs).
+/// Periodically broadcasts every track's and bus's current meter, and the input grid's current
+/// entry list (other params are pushed immediately on change by `handle_put`, not polled here) to
+/// all connected clients. A separate tokio task, not tied to the audio engine's own period (see
+/// module docs). The input grid is folded into this same always-on tick rather than given its own
+/// change-triggered publish path -- it changes rarely, and this keeps `nmos/server.rs`'s ephemeral
+/// entry synthesis (IS-05 receiver activation) from needing any direct wiring into the WS layer to
+/// notify it of a grid change; a new/removed entry just shows up on the next tick.
 pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
     let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / hz));
     loop {
@@ -208,6 +229,7 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
             let path = format!("amixer/{}/sum/{}/peakmeter", state.mixer_id, bus.id);
             publish(&state, &path, serde_json::json!(*bus.meter_db.lock().unwrap()));
         }
+        publish(&state, &format!("amixer/{}/input-grid", state.mixer_id), state.mixer.input_grid.list_json());
     }
 }
 

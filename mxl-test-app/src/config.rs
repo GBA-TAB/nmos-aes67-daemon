@@ -53,6 +53,14 @@ pub struct Config {
     /// auto-resolved from interface_name).
     pub ip_addr: String,
 
+    /// Statically-seeded input-grid entries (`patch.rs::InputGrid`) — the pickoff-point patch
+    /// bay's pool of externally available sources a track/bus input can be patched from. Milestone
+    /// 3 of the plan replaces/augments this with NMOS registry auto-discovery; for now this is the
+    /// only way an entry gets into the pool (besides the ephemeral ones IS-05 receiver activation
+    /// synthesizes at runtime, `nmos/server.rs`).
+    #[serde(default)]
+    pub input_grid: Vec<InputGridEntryConfig>,
+
     pub tracks: Vec<TrackConfig>,
     pub buses: Vec<BusConfig>,
 }
@@ -74,15 +82,26 @@ fn default_meter_hz() -> f64 {
 }
 
 #[derive(Deserialize, Clone, Debug)]
+pub struct InputGridEntryConfig {
+    /// Stable id within the input grid's own namespace (point id `"input:<id>"`, `patch.rs`) —
+    /// distinct from any track/bus id's own numbering, this app never confuses the two since
+    /// they're different string-keyed maps.
+    pub id: String,
+    pub label: String,
+    /// Where this entry reads from — reuses `TrackSource` unchanged (it already models "resolve to
+    /// a raw MXL flow_id", exactly what an input-grid entry needs; nothing here is track-specific
+    /// despite the name).
+    pub source: TrackSource,
+    /// This entry's own channel count — defaults to `Config::channels` when unset, same convention
+    /// as `TrackConfig`/`BusConfig`.
+    #[serde(default)]
+    pub channels: Option<u32>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
 pub struct TrackConfig {
     pub id: u32,
     pub label: String,
-    /// Where this track reads from — see `TrackSource`. Omitted/absent means the track starts
-    /// with no reader (silent) until set later (not yet supported over the WS protocol in this
-    /// pass — a track's source is fixed at startup for now, matching mxl-bridge's own Phase 1
-    /// `tx_source_flow_id` manual-override precedent for testing without a full activation flow).
-    #[serde(default)]
-    pub source: Option<TrackSource>,
     /// This track's own channel count (1 = mono, 2 = stereo, ...) — defaults to `Config::channels`
     /// when unset. Independent of every other track's and bus's own count; see `mixer::mix_into`
     /// for how a mismatch against an assigned bus is handled.
@@ -96,7 +115,7 @@ pub struct TrackConfig {
     pub fader_db: f32,
 }
 
-/// Exactly one of these should be set — resolved to a raw MXL flow_id at startup (see
+/// An `InputGridEntryConfig`'s source — resolved to a raw MXL flow_id at startup (see
 /// `TrackSource::resolve`). The three `*_name`/`*_id` variants exist so a test config can
 /// reference mxl-bridge's own flows by the same name an operator used there (ids.rs), instead of
 /// needing to paste a computed UUID by hand.

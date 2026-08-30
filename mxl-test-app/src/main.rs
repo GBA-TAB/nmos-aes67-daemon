@@ -4,6 +4,7 @@ mod flow;
 mod ids;
 mod mixer;
 mod nmos;
+mod patch;
 mod ws;
 
 use std::sync::Arc;
@@ -48,14 +49,7 @@ async fn main() -> anyhow::Result<()> {
     for t in &cfg.tracks {
         let channels = t.channels.unwrap_or(cfg.channels) as usize;
         let track = Track::new(t, channels);
-        if let Some(source) = &t.source {
-            let flow_id = source.resolve();
-            match FlowReader::open(&cfg.mxl_domain, &mxl_so, &flow_id.to_string(), channels) {
-                Ok(reader) => *track.reader.lock().unwrap() = Some(reader),
-                Err(e) => tracing::warn!(track_id = t.id, %flow_id, error = %e, "failed to open configured track source at startup"),
-            }
-        }
-        tracing::info!(track_id = track.id, label = %track.label, channels, has_source = t.source.is_some(), "track ready");
+        tracing::info!(track_id = track.id, label = %track.label, channels, "track ready (unpatched -- see input_grid/input-patch)");
         tracks.push(Arc::new(track));
     }
 
@@ -77,6 +71,28 @@ async fn main() -> anyhow::Result<()> {
         let bus = Arc::new(Bus::new(b, flow_id, writer, channels));
         tracing::info!(bus_id = bus.id, label = %bus.label, %flow_id, channels, "bus MXL flow ready");
         buses.push(bus);
+    }
+
+    // The pickoff-point patch bay's input grid (patch.rs, plan §1/§4): statically config-seeded
+    // for this pass (Milestone 3 adds registry auto-discovery on top). A source that fails to open
+    // is logged and simply left out of the grid rather than aborting startup -- same "don't let one
+    // bad config entry take the whole app down" precedent the old per-track source resolution used.
+    let input_grid = patch::InputGrid::default();
+    for entry in &cfg.input_grid {
+        let channels = entry.channels.unwrap_or(cfg.channels) as usize;
+        let flow_id = entry.source.resolve();
+        match FlowReader::open(&cfg.mxl_domain, &mxl_so, &flow_id.to_string(), channels) {
+            Ok(reader) => {
+                input_grid.insert(patch::InputGridEntry {
+                    id: entry.id.clone(),
+                    label: entry.label.clone(),
+                    channels,
+                    reader: std::sync::Mutex::new(Some(reader)),
+                });
+                tracing::info!(entry_id = %entry.id, label = %entry.label, %flow_id, channels, "input grid entry ready");
+            }
+            Err(e) => tracing::warn!(entry_id = %entry.id, %flow_id, error = %e, "failed to open configured input grid entry at startup"),
+        }
     }
 
     // Warn once per incompatible track->bus channel-count pairing (see mixer::mix_into's docs for
@@ -104,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
     let mixer = Arc::new(MixerState {
         tracks,
         buses,
+        input_grid,
+        patch: patch::PatchState::default(),
         max_channels,
         period_frames: cfg.period_frames as usize,
         sample_rate: cfg.sample_rate,
@@ -123,8 +141,7 @@ async fn main() -> anyhow::Result<()> {
     nmos::spawn_registration(nmos_state.clone());
 
     let (updates_tx, _) = tokio::sync::broadcast::channel(1024);
-    let ws_state =
-        ws::WsState { mixer: mixer.clone(), mixer_id: cfg.mixer_id, mxl_domain: cfg.mxl_domain.clone(), mxl_so_path: mxl_so, updates: updates_tx };
+    let ws_state = ws::WsState { mixer: mixer.clone(), mixer_id: cfg.mixer_id, updates: updates_tx };
 
     tokio::spawn(ws::run_meter_broadcaster(ws_state.clone(), cfg.meter_hz));
 

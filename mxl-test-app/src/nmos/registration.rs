@@ -99,7 +99,7 @@ async fn register_all(client: &reqwest::Client, base: &str, state: &NmosState, i
 
     for t in &state.mixer.tracks {
         let receiver_id = state.track_receiver_ids[&t.id];
-        let active = t.reader.lock().unwrap().is_some();
+        let active = state.mixer.patch.has_track_in(t.id);
         let sender_id = t.sender_id.lock().unwrap().clone();
         register_resource(
             client,

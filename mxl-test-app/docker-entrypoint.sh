@@ -8,10 +8,11 @@
 # Verification section note on why -- MXL itself has no normalized app-management layer, this
 # follows MXL's own reference deployment pattern of plain env-var-configured containers).
 #
-# No track sources are generated here (see config.rs's TrackConfig::source docs) -- a
-# container-sized mixer's tracks start silent and get assigned a source later over the amixer
-# WebSocket protocol's `source` PUT (ws.rs), since there's no way to hand-specify N individual
-# track sources at container-start time. Buses always get a real flow at startup (Bus::new
+# No input-grid entries or track input-patches are generated here (see config.rs's
+# InputGridEntryConfig / patch.rs docs) -- a container-sized mixer's tracks start unpatched
+# (silent) and get an input-patch assigned later over the amixer WebSocket protocol's
+# `input-patch` PUT (ws.rs), since there's no way to hand-specify N individual track sources at
+# container-start time. Buses always get a real flow at startup (Bus::new
 # requires one); BUS_<n>_TARGET can pin a specific one (e.g. "packed_tx_name:testmix2" to feed a
 # specific mxl-bridge instance) — otherwise each bus gets an id derived from INSTANCE_NAME, which
 # should be set to the pod name in Kubernetes so replicas don't collide (see
