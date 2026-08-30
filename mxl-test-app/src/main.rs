@@ -175,6 +175,9 @@ async fn main() -> anyhow::Result<()> {
     // one Node API port, rather than opening a second listener).
     let nmos_state = Arc::new(nmos::NmosState::new(cfg.clone(), mxl_so.clone(), mixer.clone()));
     nmos::spawn_registration(nmos_state.clone());
+    // Milestone 3 of the pickoff-point patch bay plan: auto-discovers other MXL apps' Senders into
+    // the input grid on top of Config.input_grid's static list (nmos/discovery.rs).
+    nmos::spawn_discovery(nmos_state.clone());
 
     let (updates_tx, _) = tokio::sync::broadcast::channel(1024);
     let ws_state = ws::WsState { mixer: mixer.clone(), mixer_id: cfg.mixer_id, updates: updates_tx };

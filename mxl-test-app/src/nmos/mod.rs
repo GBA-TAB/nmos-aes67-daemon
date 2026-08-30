@@ -1,3 +1,4 @@
+pub mod discovery;
 pub mod registration;
 pub mod resources;
 pub mod server;
@@ -88,4 +89,10 @@ impl NmosState {
 pub fn spawn_registration(state: Arc<NmosState>) {
     let ip = state.cfg.ip_addr.clone();
     tokio::spawn(registration::run(state, ip));
+}
+
+/// Starts the pickoff-point patch bay's input grid discovery poller (Milestone 3, `discovery.rs`)
+/// — a no-op background task if `nmos_registry_address` isn't configured, same as registration.
+pub fn spawn_discovery(state: Arc<NmosState>) {
+    tokio::spawn(discovery::run(state));
 }
