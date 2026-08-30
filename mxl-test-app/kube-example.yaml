@@ -5,14 +5,26 @@
 # PersistentVolumeClaim, nothing MXL-specific beyond the shared domain mount). Assumes the
 # `domain-pv`/`domain-pvc` (and the `mxl-domain-volume-lifecycle-controller` that creates the
 # actual tmpfs mount on the node) from that same example already exist -- apply that manifest
-# first, or adapt the volume section below to however your cluster provisions the shared MXL
+# first, or adapt the `domain` volume below to however your cluster provisions the shared MXL
 # domain. `nodeSelector` is required for the same reason it is there: the MXL domain lives on a
 # node-local tmpfs, so every pod that touches it has to land on that specific node.
+#
+# StatefulSet, not a plain Deployment (the difference from MXL's own reference example, and from
+# an earlier version of this file) -- this is specifically what redundancy/state-resume
+# (persistence.rs) needs: a Deployment's pods get a new, random name every time one is replaced, so
+# a STATE_PATH keyed off that name (the ids::instance_bus_flow_id / config.rs `instance_name`
+# convention this app already uses) would never find its predecessor's state -- the replacement
+# would be looking under a name that never existed. A StatefulSet gives each replica a stable
+# ordinal identity (mxl-test-app-0, mxl-test-app-1, ...) *and*, via volumeClaimTemplates below, its
+# own dedicated PVC that Kubernetes reattaches to that same ordinal on every replacement, wherever
+# it lands. If you don't need state resume, a plain Deployment (drop volumeClaimTemplates, the
+# `state` volume, and STATE_PATH) is simpler and works exactly as before.
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: mxl-test-app
 spec:
+  serviceName: mxl-test-app # pairs with the headless Service below -- required for a StatefulSet
   replicas: 2 # "more than one container" -- each replica is a fully independent MXL app instance
   selector:
     matchLabels:
@@ -24,6 +36,12 @@ spec:
     spec:
       nodeSelector:
         kubernetes.io/hostname: __HOSTNAME__ # !! CHANGEME, same convention as mxl's own example
+      # Kubernetes sends SIGTERM directly to the container's PID 1 (docker-entrypoint.sh execs the
+      # binary, so no signal-forwarding wrapper sits in between) and waits out this many seconds
+      # before SIGKILL -- that's the window persistence.rs's SIGTERM handler uses to write one
+      # final, fully up-to-date state save. The default (30s) is already generous for a small JSON
+      # file; shortened here since there's no real work to wait on beyond that one write.
+      terminationGracePeriodSeconds: 15
       volumes:
         - name: domain
           persistentVolumeClaim:
@@ -35,6 +53,8 @@ spec:
           volumeMounts:
             - name: domain
               mountPath: /home/mxl/domain
+            - name: state
+              mountPath: /data
           env:
             - name: MXL_DOMAIN
               value: /home/mxl/domain
@@ -52,10 +72,17 @@ spec:
               value: "2"
             - name: WS_PORT
               value: "9090"
+            # Live runtime state (gain/fader/sends/DSP params/patches) persists to this replica's
+            # own dedicated volume (volumeClaimTemplates below) and resumes from it automatically
+            # on the next start -- see persistence.rs and docker-entrypoint.sh's STATE_PATH docs.
+            - name: STATE_PATH
+              value: /data/state.json
             # Each replica's own pod name -- keeps bus flow ids distinct per replica without any
             # per-replica config authoring (see ids::instance_bus_flow_id / config.rs's
             # `instance_name` docs). Kubernetes' downward API is the normalized way to get a pod
-            # its own identity from inside itself.
+            # its own identity from inside itself. Stable across replacement here specifically
+            # *because* this is a StatefulSet (mxl-test-app-0 is always mxl-test-app-0) -- a plain
+            # Deployment's pod names are random and would defeat both this and STATE_PATH above.
             - name: INSTANCE_NAME
               valueFrom:
                 fieldRef:
@@ -63,18 +90,41 @@ spec:
           ports:
             - containerPort: 9090
               name: amixer-ws
+          # What actually decides "this container needs a replacement" -- see main.rs's /healthz
+          # docs. readinessProbe failing pulls the pod out of the headless Service's DNS/endpoints
+          # (a controller mid-connection won't get routed to a broken replica); livenessProbe
+          # failing is what triggers Kubernetes to send the SIGTERM above and start a replacement.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: amixer-ws
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: amixer-ws
+            periodSeconds: 10
+            failureThreshold: 3
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Mi # a per-track/bus JSON snapshot, not audio data -- this is generous
 ---
-# Caveat: with replicas > 1, a plain load-balanced Service like this sends each new WebSocket
-# connection to an arbitrary replica -- fine if a client just needs "some mixer instance" (e.g.
-# smoke-testing that instances come up healthy), wrong if a controller needs to reach one
-# *specific* replica by name (the normal case for actually driving one mixer's tracks/buses).
-# For that, address pods directly -- e.g. a headless Service (`clusterIP: None`) and DNS names of
-# the form `<pod-name>.mxl-test-app.<namespace>.svc.cluster.local` -- rather than this one.
+# Headless (clusterIP: None) -- required to pair with the StatefulSet's `serviceName` above, and
+# also the right choice on its own merits: gives each replica a stable DNS name
+# (<pod-name>.mxl-test-app.<namespace>.svc.cluster.local), which is what a controller actually
+# needs to reach one *specific* replica's tracks/buses rather than an arbitrary one a plain
+# load-balanced Service would route to.
 apiVersion: v1
 kind: Service
 metadata:
   name: mxl-test-app
 spec:
+  clusterIP: None
   selector:
     app.kubernetes.io/name: mxl-test-app
   ports:

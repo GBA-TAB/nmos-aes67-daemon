@@ -37,6 +37,16 @@ pub struct Config {
     #[serde(default = "default_instance_name")]
     pub instance_name: String,
 
+    /// Where live runtime state (gain/fader/mute/solo/sends, DSP stage params, patches -- see
+    /// persistence.rs) is saved to and, if it already exists, loaded from at startup. `None`
+    /// (the default) disables persistence entirely -- every start is config-only, same as before
+    /// this existed. Set this to a path on a mounted PersistentVolumeClaim for a container
+    /// restart/reschedule to resume the same live state rather than just the static config --
+    /// *where* that volume comes from is an orchestration decision (see kube-example.yaml), not
+    /// something this app has an opinion about beyond "give me a writable path".
+    #[serde(default)]
+    pub state_path: Option<String>,
+
     // ---- NMOS (IS-04 Node API / IS-05 Connection API) — makes this a real NMOS Node, one Sender
     // per bus and one Receiver per track, served on the same `ws_port` as the amixer WebSocket
     // (matching mxl-bridge's own pattern of merging IS-08 into its one Node API port rather than

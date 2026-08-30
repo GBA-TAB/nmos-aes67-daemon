@@ -159,3 +159,42 @@ string, not numeric)
 - **Processing chain**: `dsp.rs` — `filter`/`eq`/`dyn1`/`dyn2`/`phase`/`delay`, `Option<Stage>` on
   both `Track` and `Bus`, gated by the new `ChannelTemplate` (`Simple`/`FullChannel`) — structural
   placeholders (no signal effect yet), confirmed with the user before building rather than assumed.
+- **Live-state persistence**: `persistence.rs` — see §6 below.
+
+## 6. Persistence and redundancy
+
+`Config` only ever describes the *shape* of a deployment (which tracks/buses exist, their
+template, initial sends) — everything mutated afterward via a WS PUT (gain/fader/mute/solo/sends,
+DSP stage params, `track-in`/`bus-in` patches) lives only in memory unless `Config.state_path` is
+set. `persistence.rs` captures/applies that live state by reusing `ws.rs`'s own per-field JSON
+builders/appliers directly (`sends_json`, `apply_filter`, `patch.track_in_json`, ...) rather than a
+second, parallel (de)serialization — those already are the tested, authoritative mapping between
+live state and JSON.
+
+- **On startup**: if `state_path` is set and a file already exists there, it's loaded and applied
+  on top of the config-built tracks/buses, before the engine thread starts. A brand-new deployment
+  (no file yet) just proceeds with config defaults, silently.
+- **While running**: saved every 5s (bounds staleness if the process is ever killed
+  ungracefully) and once more, synchronously, on receiving SIGTERM — which is what Kubernetes sends
+  (and waits `terminationGracePeriodSeconds` before SIGKILL) when a `livenessProbe` failure
+  triggers a pod replacement, closing the staleness window to ~zero for the case that actually
+  matters.
+- **`/healthz`**: a minimal liveness/readiness target (`main.rs`) — deliberately just "is the HTTP
+  server answering," not deep engine-thread/flow health, for now.
+- **Why this needs a StatefulSet, not the Deployment the rest of this app's container-sizing story
+  otherwise uses**: state resume requires the *same* replica (stable identity, stable volume) to
+  come back after a replacement — a plain Deployment's pods get a new random name each time one is
+  replaced, which would leave `STATE_PATH`/`INSTANCE_NAME` pointing nowhere useful. See
+  `kube-example.yaml`'s own comments for the full reasoning.
+- **What this is not**: BCP-008 (`NcReceiverMonitor`/`NcSenderMonitor`, IS-12) defines *stream
+  connection* health — link/connection/sync/essence status for NMOS Receivers/Senders — nothing
+  for MXL resources specifically, and nothing at the container/process level. "Should this
+  container be replaced" is answered by Kubernetes' own liveness probe, not by anything in the
+  NMOS/BCP-008 layer. A future BCP-008-01/02 implementation on this app's own mirrored bus-Senders/
+  track-Receivers (mirroring the sibling `aes67-linux-daemon`'s existing precedent) would be a
+  useful, narrower signal — "is this specific patch/send connected and clean" — layered on top of,
+  not instead of, the container-health mechanism above.
+- **What this is not (yet)**: active-active hot failover (two replicas live simultaneously, an
+  instant handoff with no resume delay) needs a shared external store (etcd/Redis) with real
+  conflict resolution between concurrent writers — a materially bigger architecture than the
+  PVC-backed restart-resume model here, and not something this app has taken on.

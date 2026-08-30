@@ -48,6 +48,11 @@ INTERFACE_NAME="${INTERFACE_NAME:-eth0}"
 # -- Kubernetes' downward API exposes this as $(POD_IP) (fieldRef: status.podIP); falls back to
 # resolving this container's own hostname for docker-compose/plain `docker run` use.
 IP_ADDR="${IP_ADDR:-$(hostname -i 2>/dev/null | awk '{print $1}')}"
+# Live runtime state (gain/fader/mute/sends/DSP params/patches -- persistence.rs) is saved here and
+# resumed from here on the next start, if a file already exists. Unset (the default) disables
+# persistence entirely. Point this at a path on a mounted PersistentVolumeClaim (see
+# kube-example.yaml) for a pod restart/reschedule to resume live state, not just static config.
+STATE_PATH="${STATE_PATH:-}"
 
 CONFIG_PATH="${CONFIG_PATH:-/tmp/mxl-test-app.conf}"
 
@@ -92,6 +97,7 @@ cat > "$CONFIG_PATH" <<EOF
   "mixer_id": ${MIXER_ID},
   "meter_hz": ${METER_HZ},
   "instance_name": "${INSTANCE_NAME}",
+  "state_path": $([ -n "$STATE_PATH" ] && printf '"%s"' "$STATE_PATH" || printf 'null'),
   "nmos_label": "${NMOS_LABEL}",
   "nmos_registry_address": $([ -n "$NMOS_REGISTRY_ADDRESS" ] && printf '"%s"' "$NMOS_REGISTRY_ADDRESS" || printf 'null'),
   "nmos_registry_port": ${NMOS_REGISTRY_PORT},

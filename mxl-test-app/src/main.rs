@@ -6,6 +6,7 @@ mod ids;
 mod mixer;
 mod nmos;
 mod patch;
+mod persistence;
 mod ws;
 
 use std::sync::Arc;
@@ -164,9 +165,58 @@ async fn main() -> anyhow::Result<()> {
         sample_rate: cfg.sample_rate,
     });
 
+    // Resume a previous run's live state (gain/fader/sends/patches/DSP params -- see
+    // persistence.rs), if one was ever saved to this path -- before the engine thread starts, so
+    // there's no window where it could read half-applied state. A brand-new deployment (no file
+    // yet) just proceeds with the config-only defaults already built above, silently.
+    if let Some(state_path) = &cfg.state_path {
+        match persistence::load_and_apply(&mixer, state_path) {
+            Ok(true) => tracing::info!(state_path, "resumed live state from previous run"),
+            Ok(false) => tracing::info!(state_path, "no previous state file found, starting from config defaults"),
+            Err(e) => tracing::warn!(state_path, error = %e, "failed to load previous state, starting from config defaults"),
+        }
+    }
+
     {
         let mixer = mixer.clone();
         std::thread::spawn(move || engine::run(mixer));
+    }
+
+    // Periodic save (the redundancy story's steady-state half -- bounds how stale a resumed state
+    // can be if the process is ever killed ungracefully) plus a SIGTERM handler that does one
+    // final synchronous save before exiting (the graceful half -- Kubernetes sends SIGTERM and
+    // waits out terminationGracePeriodSeconds before SIGKILL on a liveness-probe-triggered
+    // replacement, so this is what actually closes the staleness window to ~zero for the case that
+    // matters). Both are no-ops if state_path isn't configured.
+    if let Some(state_path) = cfg.state_path.clone() {
+        let save_mixer = mixer.clone();
+        let save_path = state_path.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if let Err(e) = persistence::save(&save_mixer, &save_path) {
+                    tracing::warn!(state_path = %save_path, error = %e, "periodic state save failed");
+                }
+            }
+        });
+
+        let term_mixer = mixer.clone();
+        tokio::spawn(async move {
+            let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to install SIGTERM handler, final-save-on-shutdown disabled");
+                    return;
+                }
+            };
+            sigterm.recv().await;
+            tracing::info!("received SIGTERM, saving final state before exit");
+            if let Err(e) = persistence::save(&term_mixer, &state_path) {
+                tracing::error!(state_path, error = %e, "final state save on SIGTERM failed");
+            }
+            std::process::exit(0);
+        });
     }
 
     // NMOS (IS-04 Node API / IS-05 Connection API) makes this a real NMOS Node -- one Sender per
@@ -185,7 +235,15 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(ws::run_meter_broadcaster(ws_state.clone(), cfg.meter_hz));
 
-    let app = nmos::server::router(nmos_state).merge(ws::router(ws_state));
+    // Liveness/readiness probe target for a container orchestrator (Kubernetes) -- deliberately
+    // minimal (just "is the HTTP server itself answering"), since deeper health semantics (is the
+    // audio engine thread still ticking, is a specific flow readable) aren't yet worth the
+    // complexity for a test app; see the redundancy design note in kube-example.yaml for what this
+    // is actually for -- the probe that decides "this container needs replacing", which is what a
+    // SIGTERM-triggered final state save (above) then has a chance to react to.
+    let app = nmos::server::router(nmos_state)
+        .merge(ws::router(ws_state))
+        .route("/healthz", axum::routing::get(|| async { "ok" }));
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", cfg.ws_port))
         .await
         .map_err(|e| anyhow::anyhow!("binding HTTP server to 0.0.0.0:{}: {e}", cfg.ws_port))?;

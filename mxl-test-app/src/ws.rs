@@ -81,7 +81,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
 
 /// Every bus's `(id, channels)`, for `patch.rs`'s validation calls — those only need a channel
 /// count per bus, not a full `Bus` reference (see `PatchState::set_bus_in`'s docs).
-fn bus_channels(state: &WsState) -> Vec<(u32, usize)> {
+pub(crate) fn bus_channels(state: &WsState) -> Vec<(u32, usize)> {
     state.mixer.buses.iter().map(|b| (b.id, b.channels)).collect()
 }
 
@@ -253,7 +253,7 @@ fn reject_if_err(result: Result<(), &'static str>, kind: &str, id: u32, param: &
     }
 }
 
-fn apply_filter(stage: &Option<crate::dsp::FilterStage>, value: &serde_json::Value) -> Result<(), &'static str> {
+pub(crate) fn apply_filter(stage: &Option<crate::dsp::FilterStage>, value: &serde_json::Value) -> Result<(), &'static str> {
     let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
     if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
         s.on.store(v, Ordering::Relaxed);
@@ -267,7 +267,7 @@ fn apply_filter(stage: &Option<crate::dsp::FilterStage>, value: &serde_json::Val
     Ok(())
 }
 
-fn filter_json(stage: &Option<crate::dsp::FilterStage>) -> serde_json::Value {
+pub(crate) fn filter_json(stage: &Option<crate::dsp::FilterStage>) -> serde_json::Value {
     match stage {
         Some(s) => serde_json::json!({
             "on": s.on.load(Ordering::Relaxed),
@@ -278,7 +278,7 @@ fn filter_json(stage: &Option<crate::dsp::FilterStage>) -> serde_json::Value {
     }
 }
 
-fn apply_eq(stage: &Option<crate::dsp::EqStage>, value: &serde_json::Value) -> Result<(), &'static str> {
+pub(crate) fn apply_eq(stage: &Option<crate::dsp::EqStage>, value: &serde_json::Value) -> Result<(), &'static str> {
     let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
     if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
         s.on.store(v, Ordering::Relaxed);
@@ -301,7 +301,7 @@ fn apply_eq(stage: &Option<crate::dsp::EqStage>, value: &serde_json::Value) -> R
     Ok(())
 }
 
-fn eq_json(stage: &Option<crate::dsp::EqStage>) -> serde_json::Value {
+pub(crate) fn eq_json(stage: &Option<crate::dsp::EqStage>) -> serde_json::Value {
     match stage {
         Some(s) => serde_json::json!({
             "on": s.on.load(Ordering::Relaxed),
@@ -313,7 +313,7 @@ fn eq_json(stage: &Option<crate::dsp::EqStage>) -> serde_json::Value {
     }
 }
 
-fn apply_dynamics(stage: &Option<crate::dsp::DynamicsStage>, value: &serde_json::Value) -> Result<(), &'static str> {
+pub(crate) fn apply_dynamics(stage: &Option<crate::dsp::DynamicsStage>, value: &serde_json::Value) -> Result<(), &'static str> {
     let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
     if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
         s.on.store(v, Ordering::Relaxed);
@@ -336,7 +336,7 @@ fn apply_dynamics(stage: &Option<crate::dsp::DynamicsStage>, value: &serde_json:
     Ok(())
 }
 
-fn dynamics_json(stage: &Option<crate::dsp::DynamicsStage>) -> serde_json::Value {
+pub(crate) fn dynamics_json(stage: &Option<crate::dsp::DynamicsStage>) -> serde_json::Value {
     match stage {
         Some(s) => serde_json::json!({
             "on": s.on.load(Ordering::Relaxed),
@@ -350,7 +350,7 @@ fn dynamics_json(stage: &Option<crate::dsp::DynamicsStage>) -> serde_json::Value
     }
 }
 
-fn apply_phase(stage: &Option<crate::dsp::PhaseStage>, value: &serde_json::Value) -> Result<(), &'static str> {
+pub(crate) fn apply_phase(stage: &Option<crate::dsp::PhaseStage>, value: &serde_json::Value) -> Result<(), &'static str> {
     let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
     if let Some(v) = value.get("invert").and_then(|v| v.as_bool()) {
         s.invert.store(v, Ordering::Relaxed);
@@ -358,14 +358,14 @@ fn apply_phase(stage: &Option<crate::dsp::PhaseStage>, value: &serde_json::Value
     Ok(())
 }
 
-fn phase_json(stage: &Option<crate::dsp::PhaseStage>) -> serde_json::Value {
+pub(crate) fn phase_json(stage: &Option<crate::dsp::PhaseStage>) -> serde_json::Value {
     match stage {
         Some(s) => serde_json::json!({ "invert": s.invert.load(Ordering::Relaxed) }),
         None => serde_json::Value::Null,
     }
 }
 
-fn apply_delay(stage: &Option<crate::dsp::DelayStage>, value: &serde_json::Value) -> Result<(), &'static str> {
+pub(crate) fn apply_delay(stage: &Option<crate::dsp::DelayStage>, value: &serde_json::Value) -> Result<(), &'static str> {
     let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
     if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
         s.on.store(v, Ordering::Relaxed);
@@ -376,7 +376,7 @@ fn apply_delay(stage: &Option<crate::dsp::DelayStage>, value: &serde_json::Value
     Ok(())
 }
 
-fn delay_json(stage: &Option<crate::dsp::DelayStage>) -> serde_json::Value {
+pub(crate) fn delay_json(stage: &Option<crate::dsp::DelayStage>) -> serde_json::Value {
     match stage {
         Some(s) => serde_json::json!({ "on": s.on.load(Ordering::Relaxed), "delay_ms": *s.delay_ms.lock().unwrap() }),
         None => serde_json::Value::Null,
@@ -397,7 +397,7 @@ fn parse_pickoff(v: &serde_json::Value) -> crate::mixer::PickoffPoint {
     }
 }
 
-fn sends_json(track: &Track) -> serde_json::Value {
+pub(crate) fn sends_json(track: &Track) -> serde_json::Value {
     let sends = track.sends.lock().unwrap();
     serde_json::json!(sends
         .iter()
@@ -410,7 +410,7 @@ fn sends_json(track: &Track) -> serde_json::Value {
         .collect::<Vec<_>>())
 }
 
-fn parse_sends(value: &serde_json::Value) -> Result<Vec<crate::mixer::Send>, String> {
+pub(crate) fn parse_sends(value: &serde_json::Value) -> Result<Vec<crate::mixer::Send>, String> {
     let arr = value.as_array().ok_or("sends must be an array")?;
     arr.iter()
         .map(|entry| {
