@@ -113,12 +113,61 @@ pub struct TrackConfig {
     /// for how a mismatch against an assigned bus is handled.
     #[serde(default)]
     pub channels: Option<u32>,
+    /// This track's own sends (`SendConfig`) — replaces the old flat `bus_assign: Vec<u32>`; a
+    /// plain `{"bus_id": 0}` entry (all other fields defaulted) behaves exactly like the old
+    /// bus-assign did (see `mixer::Send`'s docs on why a fixed-0dB send *is* a bus assignment, not
+    /// a different mechanism).
     #[serde(default)]
-    pub bus_assign: Vec<u32>,
+    pub sends: Vec<SendConfig>,
     #[serde(default)]
     pub gain_db: f32,
     #[serde(default)]
     pub fader_db: f32,
+}
+
+/// One `TrackConfig`'s send — see `mixer::Send`'s docs for what each field means and why this one
+/// mechanism covers both a plain bus assignment and an AUX-style variable send.
+#[derive(Deserialize, Clone, Debug)]
+pub struct SendConfig {
+    pub bus_id: u32,
+    #[serde(default = "default_send_on")]
+    pub on: bool,
+    #[serde(default)]
+    pub level_db: f32,
+    #[serde(default)]
+    pub pickoff: PickoffPointConfig,
+}
+
+fn default_send_on() -> bool {
+    true
+}
+
+impl SendConfig {
+    pub fn to_send(&self) -> crate::mixer::Send {
+        crate::mixer::Send {
+            bus_id: self.bus_id,
+            pickoff: self.pickoff.into(),
+            on: std::sync::atomic::AtomicBool::new(self.on),
+            level_db: std::sync::Mutex::new(self.level_db),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PickoffPointConfig {
+    PreFader,
+    #[default]
+    PostFader,
+}
+
+impl From<PickoffPointConfig> for crate::mixer::PickoffPoint {
+    fn from(p: PickoffPointConfig) -> Self {
+        match p {
+            PickoffPointConfig::PreFader => crate::mixer::PickoffPoint::PreFader,
+            PickoffPointConfig::PostFader => crate::mixer::PickoffPoint::PostFader,
+        }
+    }
 }
 
 /// An `InputGridEntryConfig`'s source — resolved to a raw MXL flow_id at startup (see
@@ -249,8 +298,8 @@ mod entrypoint_tests {
             "interface_name": "eth0",
             "ip_addr": "127.0.0.1",
             "tracks": [
-                {"id": 0, "label": "Track 1", "bus_assign": []},
-                {"id": 1, "label": "Track 2", "bus_assign": []}
+                {"id": 0, "label": "Track 1", "sends": []},
+                {"id": 1, "label": "Track 2", "sends": [{"bus_id": 0}]}
             ],
             "buses": [
                 {"id": 0, "label": "Bus 1", "target": {"packed_tx_name": "testmix2"}},

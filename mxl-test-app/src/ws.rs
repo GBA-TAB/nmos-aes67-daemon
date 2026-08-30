@@ -146,12 +146,18 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, value: &serde_
                 track.solo.store(v, Ordering::Relaxed);
             }
         }
-        "bus-assign" => {
-            if let Some(arr) = value.as_array() {
-                let set: std::collections::HashSet<u32> = arr.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect();
-                *track.bus_assign.lock().unwrap() = set;
-            }
-        }
+        // Full replace of this track's own sends (`mixer::Send`) -- one console-standard "channel
+        // to mix" send per entry: `{"bus_id","on","level_db","pickoff":"pre_fader"|"post_fader"}`.
+        // Replaces the old flat "bus-assign" (array of bus ids) -- a plain bus assignment is now
+        // just a send left at its default `level_db: 0.0`/`pickoff: "post_fader"` (see mixer.rs's
+        // `Send` docs for why this is one mechanism, not two). This is deliberately *not* part of
+        // the pickoff-point patch bay (patch.rs) -- a send lives on the track object itself and is
+        // presented on the track's own channel strip, not the separate patch/grid page; see the
+        // plan at ~/.claude/plans/snug-painting-elephant.md.
+        "sends" => match parse_sends(value) {
+            Ok(sends) => *track.sends.lock().unwrap() = sends,
+            Err(e) => tracing::warn!(track_id = track.id, error = %e, "PUT sends: malformed value"),
+        },
         // The pickoff-point patch bay's per-track input-patch (patch.rs, plan §1/§5) -- one entry
         // per track channel, `null` or `{"source":"input:<id>"|"track-out:<id>","channel":n}`
         // (exclusive: a channel accepts at most one source). Replaces the old whole-track raw-
@@ -184,8 +190,8 @@ fn apply_bus_param(state: &WsState, bus: &Bus, param: &str, value: &serde_json::
             }
         }
         // Same idea as the track side's "input-patch", but summing (bus-in is an *additional* feed
-        // alongside the existing, unchanged `bus_assign` mechanism -- see patch.rs module docs):
-        // each channel is an *array* of `{"source",...,"channel"}` objects, not a single one.
+        // alongside tracks' own `sends` -- see patch.rs module docs): each channel is an *array*
+        // of `{"source",...,"channel"}` objects, not a single one.
         "input-patch" => match crate::patch::PatchState::parse_bus_in(value) {
             Ok(patch) => {
                 if let Err(e) = state.mixer.patch.set_bus_in(
@@ -211,10 +217,50 @@ fn current_track_value(state: &WsState, track: &Track, param: &str) -> serde_jso
         "fader" => serde_json::json!(*track.fader_db.lock().unwrap()),
         "mute" => serde_json::json!(track.mute.load(Ordering::Relaxed)),
         "solo" => serde_json::json!(track.solo.load(Ordering::Relaxed)),
-        "bus-assign" => serde_json::json!(track.bus_assign.lock().unwrap().iter().copied().collect::<Vec<_>>()),
+        "sends" => sends_json(track),
         "input-patch" => state.mixer.patch.track_in_json(track.id, track.channels),
         _ => serde_json::Value::Null,
     }
+}
+
+fn pickoff_wire(p: crate::mixer::PickoffPoint) -> &'static str {
+    match p {
+        crate::mixer::PickoffPoint::PreFader => "pre_fader",
+        crate::mixer::PickoffPoint::PostFader => "post_fader",
+    }
+}
+
+fn parse_pickoff(v: &serde_json::Value) -> crate::mixer::PickoffPoint {
+    match v.as_str() {
+        Some("pre_fader") => crate::mixer::PickoffPoint::PreFader,
+        _ => crate::mixer::PickoffPoint::PostFader,
+    }
+}
+
+fn sends_json(track: &Track) -> serde_json::Value {
+    let sends = track.sends.lock().unwrap();
+    serde_json::json!(sends
+        .iter()
+        .map(|s| serde_json::json!({
+            "bus_id": s.bus_id,
+            "on": s.on.load(Ordering::Relaxed),
+            "level_db": *s.level_db.lock().unwrap(),
+            "pickoff": pickoff_wire(s.pickoff),
+        }))
+        .collect::<Vec<_>>())
+}
+
+fn parse_sends(value: &serde_json::Value) -> Result<Vec<crate::mixer::Send>, String> {
+    let arr = value.as_array().ok_or("sends must be an array")?;
+    arr.iter()
+        .map(|entry| {
+            let bus_id = entry.get("bus_id").and_then(|v| v.as_u64()).ok_or("send entry missing 'bus_id'")? as u32;
+            let on = entry.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
+            let level_db = entry.get("level_db").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let pickoff = entry.get("pickoff").map(parse_pickoff).unwrap_or(crate::mixer::PickoffPoint::PostFader);
+            Ok(crate::mixer::Send { bus_id, pickoff, on: std::sync::atomic::AtomicBool::new(on), level_db: std::sync::Mutex::new(level_db) })
+        })
+        .collect()
 }
 
 fn current_bus_value(state: &WsState, bus: &Bus, param: &str) -> serde_json::Value {

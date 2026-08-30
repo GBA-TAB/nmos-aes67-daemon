@@ -48,7 +48,7 @@ CONFIG_PATH="${CONFIG_PATH:-/tmp/mxl-test-app.conf}"
 tracks_json=""
 i=0
 while [ "$i" -lt "$TRACK_COUNT" ]; do
-    entry=$(printf '{"id":%d,"label":"Track %d","bus_assign":[]}' "$i" "$((i + 1))")
+    entry=$(printf '{"id":%d,"label":"Track %d","sends":[]}' "$i" "$((i + 1))")
     if [ -z "$tracks_json" ]; then tracks_json="$entry"; else tracks_json="$tracks_json,$entry"; fi
     i=$((i + 1))
 done

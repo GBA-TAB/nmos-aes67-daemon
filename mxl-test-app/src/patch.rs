@@ -10,10 +10,11 @@
 //!
 //! `track-in` destinations are *exclusive* (one source per channel, like a real patch cable — a
 //! new PUT simply replaces whatever was there). `bus-in` destinations are *summing* (any number of
-//! sources may land on one channel, added together) — the existing `bus_assign` mechanism (a
-//! track's post-fader signal summed into its assigned buses, `mixer.rs`) is untouched by this
-//! module entirely; `bus-in` is a second, independent way to feed the same bus, for things that
-//! aren't a track.
+//! sources may land on one channel, added together) — tracks' own `Send`s (`mixer.rs`, a
+//! console-standard "channel to mix" send, *not* a `patch.rs` grid object — see the plan at
+//! `~/.claude/plans/snug-painting-elephant.md` for why that distinction matters) are untouched by
+//! this module entirely; `bus-in` is a second, independent way to feed the same bus, for things
+//! that aren't a track.
 //!
 //! The output grid (Milestone 2): `output:<id>` destinations, each a receiver-capacity-sized
 //! transmit slot with its own real MXL flow (`OutputGridEntry`/`OutputGrid`), patchable from any
@@ -347,7 +348,7 @@ impl PatchState {
     }
 
     /// Sums this bus's current input patch into `dst` (an already-in-progress accumulator — runs
-    /// alongside the existing `bus_assign` sum, not instead of it, per module docs). Same
+    /// alongside tracks' own `Send`s, not instead of them, per module docs). Same
     /// previous/this-period split as `resolve_track_in`: `track_out_this_period` is safe to use
     /// live (track processing already ran by this point), `bus_out_prev` is not (this bus's own
     /// output, and every other bus's, is computed *after* this resolution step runs).
@@ -442,7 +443,7 @@ mod tests {
             .enumerate()
             .map(|(i, &ch)| {
                 Arc::new(Track::new(
-                    &TrackConfig { id: i as u32, label: format!("T{i}"), channels: None, bus_assign: vec![], gain_db: 0.0, fader_db: 0.0 },
+                    &TrackConfig { id: i as u32, label: format!("T{i}"), channels: None, sends: vec![], gain_db: 0.0, fader_db: 0.0 },
                     ch,
                 ))
             })

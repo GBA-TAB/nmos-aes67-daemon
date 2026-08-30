@@ -129,15 +129,15 @@ async fn main() -> anyhow::Result<()> {
     // exactly which combinations it can handle) rather than let the engine silently no-op forever
     // at audio rate for a mismatch nobody flagged.
     for t in &tracks {
-        for &bus_id in t.bus_assign.lock().unwrap().iter() {
-            if let Some(bus) = buses.iter().find(|b| b.id == bus_id) {
+        for send in t.sends.lock().unwrap().iter() {
+            if let Some(bus) = buses.iter().find(|b| b.id == send.bus_id) {
                 if !mixer::channels_compatible(t.channels, bus.channels) {
                     tracing::warn!(
                         track_id = t.id,
                         track_channels = t.channels,
                         bus_id = bus.id,
                         bus_channels = bus.channels,
-                        "track's channel count is not compatible with assigned bus's -- this pairing will be silently dropped by the mixer engine every period"
+                        "track's channel count is not compatible with a bus it sends to -- this send will be silently dropped by the mixer engine every period"
                     );
                 }
             }

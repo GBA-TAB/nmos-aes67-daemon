@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::mixer::{db_to_linear, is_muted, is_soloed, mix_into, peak_to_db, Bus, Track};
+use crate::mixer::{db_to_linear, is_muted, is_on, is_soloed, mix_into_scaled, peak_to_db, Bus, PickoffPoint, Track};
 use crate::patch::{InputGrid, OutputGrid, PatchState};
 
 pub struct MixerState {
@@ -46,13 +46,16 @@ pub struct MixerState {
 ///    *previous* period's `track-out`/`bus-out` snapshots (this period's own track/bus processing
 ///    hasn't run yet at this point — using the previous period here is what makes a cross-
 ///    track/cross-bus patch never need cycle detection/topological sort).
-/// 3. Process each track (gain → fader → mute/solo, unchanged) into its post-fader signal — this
+/// 3. Process each track: apply gain to get its `PreFader` pickoff value, then fader + mute/solo
+///    on top of that to get its `PostFader` pickoff value (see `mixer::PickoffPoint`) — the latter
 ///    *is* `track-out:<id>`'s value for this period; snapshot it into `Track.direct_out_prev` for
-///    the next period's step 2, and keep it locally for this period's own steps 4 and 6.
-/// 4. Resolve every bus's `bus-in` patch (summing, from this period's input-grid buffers and
-///    track-out — no delay needed for those, step 3 already ran — plus the *previous* period's
-///    bus-out, same reasoning as step 2) into the bus-summing accumulator, alongside the existing,
-///    unchanged `bus_assign` sum.
+///    the next period's step 2, and keep both locally for this period's own steps 4 and 6.
+/// 4. For each bus, sum every track `Send` targeting it (`Track.sends` — a console-standard
+///    "channel to mix" send, see `mixer::Send`'s docs: reads from that send's own pickoff point,
+///    at that send's own level, gated by that send's own on/off, *not* a hardcoded bus-assignment
+///    field) into the bus-summing accumulator, then resolve the bus's `bus-in` patch (summing, from
+///    this period's input-grid buffers and track-out — no delay needed for those, step 3 already
+///    ran — plus the *previous* period's bus-out, same reasoning as step 2) alongside it.
 /// 5. Apply the bus's fader (unchanged) → this is `bus-out:<id>`'s value; write it to the bus's own
 ///    MXL flow (unchanged), snapshot it into `Bus.output_prev` for the *next* period's steps 2/4,
 ///    and keep it locally for this period's own step 6.
@@ -72,7 +75,7 @@ pub struct MixerState {
 ///
 /// Runs on its own OS thread — same `std::sync::Mutex` + blocking-from-a-plain-thread reasoning as
 /// mxl-bridge's RX/TX threads (see mixer.rs's field docs), since the WebSocket/IS-05 handlers that
-/// mutate gain/fader/mute/solo/bus-assign/patches run on tokio tasks concurrently with this loop.
+/// mutate gain/fader/mute/solo/sends/patches run on tokio tasks concurrently with this loop.
 pub fn run(state: Arc<MixerState>) {
     let period = state.period_frames;
     let read_timeout = Duration::from_secs_f64(2.0 * period as f64 / state.sample_rate as f64);
@@ -88,10 +91,12 @@ pub fn run(state: Arc<MixerState>) {
         "starting mixer engine"
     );
 
-    // Reused across periods: one scratch buffer per track, each sized to *that track's own*
-    // channel count once at startup (a track's channel count never changes after startup, so this
-    // sizing is done once here, not re-derived every period).
-    let mut track_signal: Vec<Vec<Vec<f32>>> = state.tracks.iter().map(|t| vec![Vec::new(); t.channels]).collect();
+    // Reused across periods: two scratch buffers per track (one per `PickoffPoint` a `Send` can
+    // reference — see `mixer::Send`'s docs), each sized to *that track's own* channel count once
+    // at startup (a track's channel count never changes after startup, so this sizing is done once
+    // here, not re-derived every period).
+    let mut track_pre_fader: Vec<Vec<Vec<f32>>> = state.tracks.iter().map(|t| vec![Vec::new(); t.channels]).collect();
+    let mut track_post_fader: Vec<Vec<Vec<f32>>> = state.tracks.iter().map(|t| vec![Vec::new(); t.channels]).collect();
     // One shared scratch buffer sized to `max_channels` (the widest track, bus, *or* output-grid
     // entry), reused (and only partially filled, via `[..resource.channels]`) for every bus in
     // turn (step 4/5) and then, sequentially after the bus loop completes, every output-grid entry
@@ -129,33 +134,40 @@ pub fn run(state: Arc<MixerState>) {
         let mut track_out_this_period: HashMap<u32, Vec<Vec<f32>>> = HashMap::with_capacity(state.tracks.len());
 
         for (i, track) in state.tracks.iter().enumerate() {
-            let signal = &mut track_signal[i];
-            for ch in signal.iter_mut() {
+            let pre = &mut track_pre_fader[i];
+            for ch in pre.iter_mut() {
                 ch.clear();
                 ch.resize(period, 0.0);
             }
 
             // --- Step 2: resolve this track's input-patch. ---
-            state.patch.resolve_track_in(track.id, &input_bufs, &track_out_prev, &bus_out_prev, signal);
+            state.patch.resolve_track_in(track.id, &input_bufs, &track_out_prev, &bus_out_prev, pre);
 
-            // --- Step 3: gain -> fader -> mute/solo, in place. ---
+            // --- Step 3: gain -> PreFader pickoff value, then fader + mute/solo -> PostFader. ---
             let gain = db_to_linear(*track.gain_db.lock().unwrap());
+            for ch in pre.iter_mut() {
+                for s in ch.iter_mut() {
+                    *s *= gain;
+                }
+            }
+
             let fader = db_to_linear(*track.fader_db.lock().unwrap());
             let audible = !is_muted(&track.mute) && (!any_solo || is_soloed(&track.solo));
-            let scale = if audible { gain * fader } else { 0.0 };
+            let post_scale = if audible { fader } else { 0.0 };
 
+            let post = &mut track_post_fader[i];
             let mut meters = Vec::with_capacity(track.channels);
-            for ch in signal.iter_mut() {
-                for s in ch.iter_mut() {
-                    *s *= scale;
-                }
-                let peak = ch.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            for (ch, pre_ch) in pre.iter().enumerate() {
+                let post_ch = &mut post[ch];
+                post_ch.clear();
+                post_ch.extend(pre_ch.iter().map(|&s| s * post_scale));
+                let peak = post_ch.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
                 meters.push(peak_to_db(peak));
             }
             *track.meter_db.lock().unwrap() = meters;
 
-            *track.direct_out_prev.lock().unwrap() = signal.clone();
-            track_out_this_period.insert(track.id, signal.clone());
+            *track.direct_out_prev.lock().unwrap() = post.clone();
+            track_out_this_period.insert(track.id, post.clone());
         }
 
         let mut bus_out_this_period: HashMap<u32, Vec<Vec<f32>>> = HashMap::with_capacity(state.buses.len());
@@ -167,14 +179,22 @@ pub fn run(state: Arc<MixerState>) {
                 ch.resize(period, 0.0);
             }
             for (i, track) in state.tracks.iter().enumerate() {
-                if !track.bus_assign.lock().unwrap().contains(&bus.id) {
-                    continue;
+                for send in track.sends.lock().unwrap().iter() {
+                    if send.bus_id != bus.id || !is_on(&send.on) {
+                        continue;
+                    }
+                    let src = match send.pickoff {
+                        PickoffPoint::PreFader => &track_pre_fader[i],
+                        PickoffPoint::PostFader => &track_post_fader[i],
+                    };
+                    let level = db_to_linear(*send.level_db.lock().unwrap());
+                    // Startup validation (main.rs) already warned about any incompatible
+                    // track/bus channel-count pairing -- mix_into_scaled itself just quietly
+                    // no-ops for one, doesn't need to log here too.
+                    mix_into_scaled(src, dst, period, level);
                 }
-                // Startup validation (main.rs) already warned about any incompatible pairing --
-                // mix_into itself just quietly no-ops for one, doesn't need to log here too.
-                mix_into(&track_signal[i], dst, period);
             }
-            // --- Step 4: resolve this bus's input-patch (summing, alongside bus_assign above). ---
+            // --- Step 4: resolve this bus's input-patch (summing, alongside the sends above). ---
             state.patch.resolve_bus_in(bus.id, &input_bufs, &track_out_this_period, &bus_out_prev, dst);
 
             // --- Step 5: bus fader, write to the bus's own MXL flow, snapshot bus-out. ---
