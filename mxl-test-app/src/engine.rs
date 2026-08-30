@@ -3,19 +3,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::mixer::{db_to_linear, is_muted, is_soloed, mix_into, peak_to_db, Bus, Track};
-use crate::patch::{InputGrid, PatchState};
+use crate::patch::{InputGrid, OutputGrid, PatchState};
 
 pub struct MixerState {
     pub tracks: Vec<Arc<Track>>,
     pub buses: Vec<Arc<Bus>>,
-    /// The pickoff-point patch bay's pool of externally available sources (`patch.rs`) — Milestone
-    /// 1 of the plan at `~/.claude/plans/snug-painting-elephant.md`.
+    /// The pickoff-point patch bay's pool of externally available sources (`patch.rs`).
     pub input_grid: InputGrid,
-    /// The crosspoint itself: which source feeds each `track-in`/`bus-in` destination channel.
+    /// The pickoff-point patch bay's pool of receiver-capacity-sized transmit slots (Milestone 2,
+    /// `patch.rs`) — empty (no output grid configured) is a perfectly normal, common case; a
+    /// deployment that only needs buses' own always-on flows doesn't need any.
+    pub output_grid: OutputGrid,
+    /// The crosspoint itself: which source feeds each `track-in`/`bus-in`/`output` destination
+    /// channel.
     pub patch: PatchState,
-    /// The widest channel count across every track and bus — sizes shared scratch buffers, which
-    /// each period's work then only uses the first `resource.channels` entries of (see `run`).
-    /// Not a uniform width every track/bus has to match — each has its own `channels` (mixer.rs).
+    /// The widest channel count across every track, bus, and output-grid entry — sizes shared
+    /// scratch buffers, which each period's work then only uses the first `resource.channels`
+    /// entries of (see `run`). Not a uniform width every resource has to match — each has its own
+    /// `channels` (mixer.rs/patch.rs).
     pub max_channels: usize,
     pub period_frames: usize,
     pub sample_rate: u32,
@@ -33,30 +38,37 @@ pub struct MixerState {
 /// whatever the previous iteration's processing actually cost, the same class of fix mxl's own
 /// `get_duration_until_index`/`sleep_for` example pattern exists for.
 ///
-/// Each period runs the pickoff-point patch bay's fixed pipeline (`patch.rs` module docs, plan §3):
+/// Each period runs the pickoff-point patch bay's fixed pipeline (`patch.rs` module docs, plan §3,
+/// extended for Milestone 2's output grid):
 ///
 /// 1. Read every input-grid entry's MXL reader (silence on no-reader/error).
-/// 2. Resolve every track's `track-in` patch from this period's input-grid buffers or the *other*
-///    tracks' *previous* period `track-out` snapshot (this period's own track processing hasn't
-///    run yet at this point — using the previous period here is what makes a cross-track patch
-///    never need cycle detection/topological sort).
+/// 2. Resolve every track's `track-in` patch from this period's input-grid buffers, or the
+///    *previous* period's `track-out`/`bus-out` snapshots (this period's own track/bus processing
+///    hasn't run yet at this point — using the previous period here is what makes a cross-
+///    track/cross-bus patch never need cycle detection/topological sort).
 /// 3. Process each track (gain → fader → mute/solo, unchanged) into its post-fader signal — this
 ///    *is* `track-out:<id>`'s value for this period; snapshot it into `Track.direct_out_prev` for
-///    the next period's step 2, and keep it locally for this period's own step 4.
-/// 4. Resolve every bus's `bus-in` patch (summing, from this period's input-grid buffers or this
-///    period's own just-computed track-out — no delay needed here, step 3 already ran) into the
-///    bus-summing accumulator, alongside the existing, unchanged `bus_assign` sum.
+///    the next period's step 2, and keep it locally for this period's own steps 4 and 6.
+/// 4. Resolve every bus's `bus-in` patch (summing, from this period's input-grid buffers and
+///    track-out — no delay needed for those, step 3 already ran — plus the *previous* period's
+///    bus-out, same reasoning as step 2) into the bus-summing accumulator, alongside the existing,
+///    unchanged `bus_assign` sum.
 /// 5. Apply the bus's fader (unchanged) → this is `bus-out:<id>`'s value; write it to the bus's own
-///    MXL flow (unchanged) and snapshot it into `Bus.output_prev`.
+///    MXL flow (unchanged), snapshot it into `Bus.output_prev` for the *next* period's steps 2/4,
+///    and keep it locally for this period's own step 6.
+/// 6. Resolve every output-grid entry's patch — the pipeline's terminal stage, so *this* period's
+///    track-out and bus-out (both already computed by steps 3 and 5) are used directly, no delay
+///    needed — and write it to that entry's own MXL flow.
 ///
-/// Every destination buffer (`track-in`, the bus-summing accumulator) is pre-sized to `period`
-/// frames and zero-filled *before* any patch is applied, every period, unconditionally — so an
-/// unpatched channel, a disconnected input-grid reader, or a read error all resolve to continuous
-/// silence rather than skipping a period or leaving a buffer short. This also fixes a real bug the
-/// previous, non-patch-bay version of this loop had: clearing a track's scratch buffer to length 0
-/// (not `period`-length silence) on a missing/failed read, then unconditionally reading `period`
-/// samples out of it in the bus-summing pass if that track happened to be bus-assigned — an
-/// out-of-bounds panic on the very first period a track with no source was also bus-assigned.
+/// Every destination buffer (`track-in`, the bus-summing accumulator, an output-grid entry's
+/// buffer) is pre-sized to `period` frames and zero-filled *before* any patch is applied, every
+/// period, unconditionally — so an unpatched channel, a disconnected input-grid reader, or a read
+/// error all resolve to continuous silence rather than skipping a period or leaving a buffer short.
+/// This also fixes a real bug the original, non-patch-bay version of this loop had: clearing a
+/// track's scratch buffer to length 0 (not `period`-length silence) on a missing/failed read, then
+/// unconditionally reading `period` samples out of it in the bus-summing pass if that track
+/// happened to be bus-assigned — an out-of-bounds panic on the very first period a track with no
+/// source was also bus-assigned.
 ///
 /// Runs on its own OS thread — same `std::sync::Mutex` + blocking-from-a-plain-thread reasoning as
 /// mxl-bridge's RX/TX threads (see mixer.rs's field docs), since the WebSocket/IS-05 handlers that
@@ -70,6 +82,7 @@ pub fn run(state: Arc<MixerState>) {
     tracing::info!(
         tracks = state.tracks.len(),
         buses = state.buses.len(),
+        output_grid = state.output_grid.snapshot().len(),
         max_channels = state.max_channels,
         period,
         "starting mixer engine"
@@ -79,9 +92,11 @@ pub fn run(state: Arc<MixerState>) {
     // channel count once at startup (a track's channel count never changes after startup, so this
     // sizing is done once here, not re-derived every period).
     let mut track_signal: Vec<Vec<Vec<f32>>> = state.tracks.iter().map(|t| vec![Vec::new(); t.channels]).collect();
-    // One shared scratch buffer sized to the widest bus, reused (and only partially filled, via
-    // `[..bus.channels]`) for every bus in turn each period.
-    let mut bus_sum: Vec<Vec<f32>> = vec![Vec::new(); state.max_channels];
+    // One shared scratch buffer sized to `max_channels` (the widest track, bus, *or* output-grid
+    // entry), reused (and only partially filled, via `[..resource.channels]`) for every bus in
+    // turn (step 4/5) and then, sequentially after the bus loop completes, every output-grid entry
+    // in turn (step 6) -- the two uses never overlap within a period, so one buffer covers both.
+    let mut mix_scratch: Vec<Vec<f32>> = vec![Vec::new(); state.max_channels];
 
     loop {
         // --- Step 1: read every input-grid entry for this period. ---
@@ -102,10 +117,13 @@ pub fn run(state: Arc<MixerState>) {
             }
         }
 
-        // --- Step 2 preamble: snapshot every track's *previous* period track-out for step 2's
-        // cross-track patch resolution (this period's own track-out doesn't exist until step 3). ---
+        // --- Step 2 preamble: snapshot every track's/bus's *previous* period track-out/bus-out for
+        // step 2's (and step 4's, for bus-out) cross-resource patch resolution -- this period's own
+        // track-out doesn't exist until step 3, bus-out not until step 5. ---
         let track_out_prev: HashMap<u32, Vec<Vec<f32>>> =
             state.tracks.iter().map(|t| (t.id, t.direct_out_prev.lock().unwrap().clone())).collect();
+        let bus_out_prev: HashMap<u32, Vec<Vec<f32>>> =
+            state.buses.iter().map(|b| (b.id, b.output_prev.lock().unwrap().clone())).collect();
 
         let any_solo = state.tracks.iter().any(|t| is_soloed(&t.solo));
         let mut track_out_this_period: HashMap<u32, Vec<Vec<f32>>> = HashMap::with_capacity(state.tracks.len());
@@ -118,7 +136,7 @@ pub fn run(state: Arc<MixerState>) {
             }
 
             // --- Step 2: resolve this track's input-patch. ---
-            state.patch.resolve_track_in(track.id, &input_bufs, &track_out_prev, signal);
+            state.patch.resolve_track_in(track.id, &input_bufs, &track_out_prev, &bus_out_prev, signal);
 
             // --- Step 3: gain -> fader -> mute/solo, in place. ---
             let gain = db_to_linear(*track.gain_db.lock().unwrap());
@@ -140,8 +158,10 @@ pub fn run(state: Arc<MixerState>) {
             track_out_this_period.insert(track.id, signal.clone());
         }
 
+        let mut bus_out_this_period: HashMap<u32, Vec<Vec<f32>>> = HashMap::with_capacity(state.buses.len());
+
         for bus in &state.buses {
-            let dst = &mut bus_sum[..bus.channels];
+            let dst = &mut mix_scratch[..bus.channels];
             for ch in dst.iter_mut() {
                 ch.clear();
                 ch.resize(period, 0.0);
@@ -155,7 +175,7 @@ pub fn run(state: Arc<MixerState>) {
                 mix_into(&track_signal[i], dst, period);
             }
             // --- Step 4: resolve this bus's input-patch (summing, alongside bus_assign above). ---
-            state.patch.resolve_bus_in(bus.id, &input_bufs, &track_out_this_period, dst);
+            state.patch.resolve_bus_in(bus.id, &input_bufs, &track_out_this_period, &bus_out_prev, dst);
 
             // --- Step 5: bus fader, write to the bus's own MXL flow, snapshot bus-out. ---
             let fader = if is_muted(&bus.mute) { 0.0 } else { db_to_linear(*bus.fader_db.lock().unwrap()) };
@@ -170,9 +190,23 @@ pub fn run(state: Arc<MixerState>) {
             }
             *bus.meter_db.lock().unwrap() = meters;
             *bus.output_prev.lock().unwrap() = dst.to_vec();
+            bus_out_this_period.insert(bus.id, dst.to_vec());
 
             if let Err(e) = bus.writer.lock().unwrap().write_next(dst) {
                 tracing::error!(bus_id = bus.id, error = %e, "failed to write samples into bus MXL flow");
+            }
+        }
+
+        // --- Step 6: resolve + write every output-grid entry (Milestone 2). ---
+        for entry in state.output_grid.snapshot() {
+            let dst = &mut mix_scratch[..entry.channels];
+            for ch in dst.iter_mut() {
+                ch.clear();
+                ch.resize(period, 0.0);
+            }
+            state.patch.resolve_output(&entry.id, &input_bufs, &track_out_this_period, &bus_out_this_period, dst);
+            if let Err(e) = entry.writer.lock().unwrap().write_next(dst) {
+                tracing::error!(output_id = %entry.id, error = %e, "failed to write samples into output grid entry's MXL flow");
             }
         }
 

@@ -65,6 +65,15 @@ pub fn instance_bus_flow_id(instance_name: &str, bus_id: u32) -> uuid::Uuid {
 pub fn instance_bus_source_id(instance_name: &str, bus_id: u32) -> uuid::Uuid {
     stable_id(&format!("mxl-test-app-instance-bus-source:{instance_name}:{bus_id}"))
 }
+/// An output-grid entry's flow_id when no explicit target is configured — same idea as
+/// `instance_bus_flow_id`, keyed by the entry's own string id (the output grid's own namespace,
+/// `patch.rs`) instead of a bus's numeric one.
+pub fn instance_output_flow_id(instance_name: &str, output_id: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-test-app-instance-output-flow:{instance_name}:{output_id}"))
+}
+pub fn instance_output_source_id(instance_name: &str, output_id: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-test-app-instance-output-source:{instance_name}:{output_id}"))
+}
 
 #[cfg(test)]
 mod tests {

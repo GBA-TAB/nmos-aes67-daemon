@@ -264,6 +264,7 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
         return not_found();
     };
     let entry_id = format!("recv:{}", track.id);
+    let bus_channels: Vec<(u32, usize)> = state.mixer.buses.iter().map(|b| (b.id, b.channels)).collect();
 
     let sender_id = body.get("sender_id").and_then(|v| v.as_str()).map(str::to_string);
     let master_enable = body.get("master_enable").and_then(|v| v.as_bool());
@@ -271,7 +272,7 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
 
     if !active {
         let empty_patch = vec![None; track.channels];
-        let _ = state.mixer.patch.set_track_in(&state.mixer.tracks, &state.mixer.input_grid, track.id, empty_patch);
+        let _ = state.mixer.patch.set_track_in(&state.mixer.tracks, &bus_channels, &state.mixer.input_grid, track.id, empty_patch);
         state.mixer.input_grid.remove(&entry_id);
         *track.sender_id.lock().unwrap() = None;
         return receiver_staged(State(state), Path(id)).await;
@@ -323,7 +324,7 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
 
     let whole_track_patch: Vec<Option<crate::patch::SourceRef>> =
         (0..track.channels).map(|ch| Some(crate::patch::SourceRef::Input { entry_id: entry_id.clone(), channel: ch })).collect();
-    if let Err(e) = state.mixer.patch.set_track_in(&state.mixer.tracks, &state.mixer.input_grid, track.id, whole_track_patch) {
+    if let Err(e) = state.mixer.patch.set_track_in(&state.mixer.tracks, &bus_channels, &state.mixer.input_grid, track.id, whole_track_patch) {
         state.mixer.input_grid.remove(&entry_id);
         tracing::error!(error = %e, "receiver activation failed to apply input-patch");
         return (

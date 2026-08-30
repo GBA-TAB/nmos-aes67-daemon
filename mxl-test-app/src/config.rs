@@ -60,6 +60,12 @@ pub struct Config {
     /// synthesizes at runtime, `nmos/server.rs`).
     #[serde(default)]
     pub input_grid: Vec<InputGridEntryConfig>,
+    /// Output-grid entries (Milestone 2, `OutputGridEntryConfig`) -- receiver-capacity-sized
+    /// transmit slots patched from tracks/buses/input-grid entries, each with its own real MXL
+    /// flow. Empty by default (no output grid) -- a deployment that only needs buses' own always-on
+    /// flows doesn't need to configure any.
+    #[serde(default)]
+    pub output_grid: Vec<OutputGridEntryConfig>,
 
     pub tracks: Vec<TrackConfig>,
     pub buses: Vec<BusConfig>,
@@ -177,6 +183,38 @@ impl BusConfig {
             Some(BusTarget::FlowId(s)) => s.parse().unwrap_or_else(|e| panic!("invalid flow_id '{s}': {e}")),
             Some(BusTarget::PackedTxName(name)) => crate::ids::packed_tx_flow_id(name),
             None => crate::ids::instance_bus_flow_id(instance_name, self.id),
+        }
+    }
+}
+
+/// One output-grid entry (Milestone 2 of the pickoff-point patch bay plan) -- a receiver-capacity-
+/// sized transmit slot (an AES67/SDI/2110-stream-sized block, in the terms the feature was asked
+/// for) with its own real MXL flow, fed by whatever the crosspoint (`patch.rs`) currently patches
+/// into it. Reuses `BusTarget` unchanged -- an output-grid entry's own flow is created exactly the
+/// same way a bus's is (`BusConfig::resolve_flow_id`'s sibling below).
+#[derive(Deserialize, Clone, Debug)]
+pub struct OutputGridEntryConfig {
+    /// Stable id within the output grid's own namespace (point id `"output:<id>"`, `patch.rs`) --
+    /// distinct from track/bus ids, same convention as `InputGridEntryConfig::id`.
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub target: Option<BusTarget>,
+    /// This entry's own channel count -- defaults to `Config::channels` when unset. The "receiver
+    /// capacity" sizing (8 for AES67, 16 for SDI, etc.) is just whatever value an operator puts
+    /// here; nothing in this app enforces a specific block size.
+    #[serde(default)]
+    pub channels: Option<u32>,
+}
+
+impl OutputGridEntryConfig {
+    /// Resolves this entry's real MXL flow_id -- identical shape to `BusConfig::resolve_flow_id`,
+    /// just keyed by this entry's own string id via `ids::instance_output_flow_id`.
+    pub fn resolve_flow_id(&self, instance_name: &str) -> uuid::Uuid {
+        match &self.target {
+            Some(BusTarget::FlowId(s)) => s.parse().unwrap_or_else(|e| panic!("invalid flow_id '{s}': {e}")),
+            Some(BusTarget::PackedTxName(name)) => crate::ids::packed_tx_flow_id(name),
+            None => crate::ids::instance_output_flow_id(instance_name, &self.id),
         }
     }
 }

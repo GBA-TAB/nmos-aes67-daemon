@@ -1,21 +1,23 @@
 //! The `amixer` WebSocket protocol, matching the `AudioMixerDashboard` control app exactly (op:
 //! WATCH/PUT from the client, plain `{path, value}` pushed from this server) so that existing
 //! dashboard can drive this app with no changes: paths are `amixer/{mixerId}/{trackKind}/{id}/
-//! {param}` with `trackKind` "channel" for tracks and "sum" for buses (the only two kinds this
-//! app's topology has — see mixer.rs; the dashboard also knows "vca"/"aux"/"reverb"/"group" but
-//! this app never populates those, so it simply shows no cards for them, not an error).
+//! {param}` with `trackKind` "channel" for tracks, "sum" for buses, and "output" for the pickoff-
+//! point patch bay's output grid (Milestone 2 — `id` there is a string, not numeric; see
+//! `parse_path`'s docs) — the dashboard also knows "vca"/"aux"/"reverb"/"group" but this app never
+//! populates those, so it simply shows no cards for them, not an error.
 //!
 //! Meter pushes are on their own timer (`meter_hz`), decoupled from the audio engine's own period
 //! rate (engine.rs) — a real mixer's meter *display* doesn't need updating at audio-block rate
 //! (10ms/100Hz for a typical period), that's just wasted WebSocket traffic to every client; 20-30Hz
 //! matches what a human eye actually resolves and what the dashboard's own README already assumes
-//! ("Real-time (30+ FPS)"). The pickoff-point patch bay's `input-grid` listing (patch.rs) rides
-//! this same timer rather than a separate change-triggered path — see `run_meter_broadcaster`.
+//! ("Real-time (30+ FPS)"). The pickoff-point patch bay's `input-grid`/`output-grid` listings
+//! (patch.rs) ride this same timer rather than a separate change-triggered path — see
+//! `run_meter_broadcaster`.
 //!
-//! `input-patch` (both "channel" and "sum") is the pickoff-point patch bay's own param (patch.rs,
-//! plan §1/§5) — not a plain scalar/bool value like the others, but a per-channel array of source
-//! references (`null`/one object for a track's exclusive input, an array of objects per channel for
-//! a bus's summing input).
+//! `input-patch` (both "channel" and "sum") and "output"'s "patch" param are the pickoff-point
+//! patch bay's own params (patch.rs) — not a plain scalar/bool value like the others, but a
+//! per-channel array of source references (`null`/one object for an exclusive input, an array of
+//! objects per channel for a bus's summing input).
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -77,19 +79,46 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     forward.abort();
 }
 
+/// Every bus's `(id, channels)`, for `patch.rs`'s validation calls — those only need a channel
+/// count per bus, not a full `Bus` reference (see `PatchState::set_bus_in`'s docs).
+fn bus_channels(state: &WsState) -> Vec<(u32, usize)> {
+    state.mixer.buses.iter().map(|b| (b.id, b.channels)).collect()
+}
+
 fn handle_put(state: &WsState, path: &str, value: Option<&serde_json::Value>) {
     let Some(value) = value else { return };
     let Some((kind, id, param)) = parse_path(path, state.mixer_id) else { return };
 
     match kind {
         "channel" => {
+            let Ok(id) = id.parse::<u32>() else { return };
             let Some(track) = state.mixer.tracks.iter().find(|t| t.id == id) else { return };
             apply_track_param(state, track, param, value);
         }
         "sum" => {
+            let Ok(id) = id.parse::<u32>() else { return };
             let Some(bus) = state.mixer.buses.iter().find(|b| b.id == id) else { return };
             apply_bus_param(state, bus, param, value);
             publish(state, path, current_bus_value(state, bus, param));
+        }
+        // The pickoff-point patch bay's output grid (Milestone 2) -- `id` here is the output
+        // grid's own string namespace (`patch.rs`), not a numeric track/bus id.
+        "output" => {
+            let Some(entry) = state.mixer.output_grid.get(id) else { return };
+            if param != "patch" {
+                return;
+            }
+            match crate::patch::PatchState::parse_track_in(value) {
+                Ok(patch) => {
+                    if let Err(e) =
+                        state.mixer.patch.set_output(&state.mixer.tracks, &bus_channels(state), &state.mixer.input_grid, &entry.id, entry.channels, patch)
+                    {
+                        tracing::warn!(output_id = %entry.id, error = %e, "PUT output patch rejected");
+                    }
+                }
+                Err(e) => tracing::warn!(output_id = %entry.id, error = %e, "PUT output patch: malformed value"),
+            }
+            publish(state, path, state.mixer.patch.output_json(&entry.id, entry.channels));
         }
         _ => (),
     }
@@ -129,7 +158,9 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, value: &serde_
         // flow_id `source` PUT this app used before the patch bay existed.
         "input-patch" => match crate::patch::PatchState::parse_track_in(value) {
             Ok(patch) => {
-                if let Err(e) = state.mixer.patch.set_track_in(&state.mixer.tracks, &state.mixer.input_grid, track.id, patch) {
+                if let Err(e) =
+                    state.mixer.patch.set_track_in(&state.mixer.tracks, &bus_channels(state), &state.mixer.input_grid, track.id, patch)
+                {
                     tracing::warn!(track_id = track.id, error = %e, "PUT input-patch rejected");
                 }
             }
@@ -157,8 +188,14 @@ fn apply_bus_param(state: &WsState, bus: &Bus, param: &str, value: &serde_json::
         // each channel is an *array* of `{"source",...,"channel"}` objects, not a single one.
         "input-patch" => match crate::patch::PatchState::parse_bus_in(value) {
             Ok(patch) => {
-                if let Err(e) = state.mixer.patch.set_bus_in(&state.mixer.tracks, &state.mixer.input_grid, bus.id, bus.channels, patch)
-                {
+                if let Err(e) = state.mixer.patch.set_bus_in(
+                    &state.mixer.tracks,
+                    &bus_channels(state),
+                    &state.mixer.input_grid,
+                    bus.id,
+                    bus.channels,
+                    patch,
+                ) {
                     tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch rejected");
                 }
             }
@@ -195,8 +232,11 @@ fn publish(state: &WsState, path: &str, value: serde_json::Value) {
 
 /// Parses `amixer/{mixerId}/{trackKind}/{id}/{param}`, rejecting anything for a different
 /// `mixerId` (this app only ever has one mixer, id `expected_mixer_id`, matching the dashboard's
-/// own single-`MixerId`-per-instance config model).
-fn parse_path(path: &str, expected_mixer_id: u32) -> Option<(&str, u32, &str)> {
+/// own single-`MixerId`-per-instance config model). `id` is returned as a raw string slice, not
+/// parsed as a number here — "channel"/"sum" ids are numeric (parsed by their own `handle_put`
+/// branch), but "output" (grid) ids are the output grid's own string namespace (`patch.rs`), so
+/// this can't uniformly parse one type for every kind.
+fn parse_path(path: &str, expected_mixer_id: u32) -> Option<(&str, &str, &str)> {
     let mut parts = path.split('/');
     if parts.next()? != "amixer" {
         return None;
@@ -205,7 +245,7 @@ fn parse_path(path: &str, expected_mixer_id: u32) -> Option<(&str, u32, &str)> {
         return None;
     }
     let kind = parts.next()?;
-    let id: u32 = parts.next()?.parse().ok()?;
+    let id = parts.next()?;
     let param = parts.next()?;
     Some((kind, id, param))
 }
@@ -230,6 +270,7 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
             publish(&state, &path, serde_json::json!(*bus.meter_db.lock().unwrap()));
         }
         publish(&state, &format!("amixer/{}/input-grid", state.mixer_id), state.mixer.input_grid.list_json());
+        publish(&state, &format!("amixer/{}/output-grid", state.mixer_id), state.mixer.output_grid.list_json());
     }
 }
 

@@ -40,7 +40,14 @@ async fn main() -> anyhow::Result<()> {
 
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "mxl-test-app.conf".to_string());
     let cfg = Config::load(&config_path)?;
-    tracing::info!(tracks = cfg.tracks.len(), buses = cfg.buses.len(), channels = cfg.channels, "loaded config");
+    tracing::info!(
+        tracks = cfg.tracks.len(),
+        buses = cfg.buses.len(),
+        input_grid = cfg.input_grid.len(),
+        output_grid = cfg.output_grid.len(),
+        channels = cfg.channels,
+        "loaded config"
+    );
 
     let mxl_so = find_mxl_so()?;
     tracing::info!(?mxl_so, "resolved libmxl.so");
@@ -95,6 +102,29 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // The pickoff-point patch bay's output grid (Milestone 2, patch.rs): each entry gets its own
+    // real MXL flow at startup, exactly like a bus's -- written unconditionally every period
+    // (silence when unpatched), never lazily created the way mxl-bridge's Sinks are, since (like
+    // buses) there's no signal here for "does anything actually want this yet" to gate on.
+    let output_grid = patch::OutputGrid::default();
+    for entry in &cfg.output_grid {
+        let channels = entry.channels.unwrap_or(cfg.channels) as usize;
+        let flow_id = entry.resolve_flow_id(&cfg.instance_name);
+        let writer = FlowWriter::create(
+            &cfg.mxl_domain,
+            &mxl_so,
+            cfg.sample_rate,
+            flow_id,
+            ids::instance_output_source_id(&cfg.instance_name, &entry.id),
+            ids::device_id(&cfg.instance_name),
+            &entry.label,
+            channels as u32,
+        )
+        .map_err(|e| anyhow::anyhow!("creating output grid entry {} ('{}') flow {flow_id}: {e}", entry.id, entry.label))?;
+        output_grid.insert(patch::OutputGridEntry { id: entry.id.clone(), label: entry.label.clone(), channels, writer: std::sync::Mutex::new(writer) });
+        tracing::info!(output_id = %entry.id, label = %entry.label, %flow_id, channels, "output grid entry MXL flow ready");
+    }
+
     // Warn once per incompatible track->bus channel-count pairing (see mixer::mix_into's docs for
     // exactly which combinations it can handle) rather than let the engine silently no-op forever
     // at audio rate for a mismatch nobody flagged.
@@ -114,13 +144,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let max_channels =
-        tracks.iter().map(|t| t.channels).chain(buses.iter().map(|b| b.channels)).max().unwrap_or(cfg.channels as usize);
+    let max_channels = tracks
+        .iter()
+        .map(|t| t.channels)
+        .chain(buses.iter().map(|b| b.channels))
+        .chain(output_grid.snapshot().iter().map(|e| e.channels))
+        .max()
+        .unwrap_or(cfg.channels as usize);
 
     let mixer = Arc::new(MixerState {
         tracks,
         buses,
         input_grid,
+        output_grid,
         patch: patch::PatchState::default(),
         max_channels,
         period_frames: cfg.period_frames as usize,
