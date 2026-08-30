@@ -172,6 +172,15 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, value: &serde_
             }
             Err(e) => tracing::warn!(track_id = track.id, error = %e, "PUT input-patch: malformed value"),
         },
+        // Processing-chain stages (dsp.rs) -- structural placeholders (see dsp.rs's module docs),
+        // present only if this track's ChannelTemplate includes them; a PUT against an absent one
+        // is rejected with a warning, not silently accepted or a crash.
+        "filter" => reject_if_err(apply_filter(&track.filter, value), "track", track.id, "filter"),
+        "eq" => reject_if_err(apply_eq(&track.eq, value), "track", track.id, "eq"),
+        "dyn1" => reject_if_err(apply_dynamics(&track.dyn1, value), "track", track.id, "dyn1"),
+        "dyn2" => reject_if_err(apply_dynamics(&track.dyn2, value), "track", track.id, "dyn2"),
+        "phase" => reject_if_err(apply_phase(&track.phase, value), "track", track.id, "phase"),
+        "delay" => reject_if_err(apply_delay(&track.delay, value), "track", track.id, "delay"),
         _ => {}
     }
     publish(state, &format!("amixer/{}/channel/{}/{param}", state.mixer_id, track.id), current_track_value(state, track, param));
@@ -207,6 +216,12 @@ fn apply_bus_param(state: &WsState, bus: &Bus, param: &str, value: &serde_json::
             }
             Err(e) => tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch: malformed value"),
         },
+        "filter" => reject_if_err(apply_filter(&bus.filter, value), "bus", bus.id, "filter"),
+        "eq" => reject_if_err(apply_eq(&bus.eq, value), "bus", bus.id, "eq"),
+        "dyn1" => reject_if_err(apply_dynamics(&bus.dyn1, value), "bus", bus.id, "dyn1"),
+        "dyn2" => reject_if_err(apply_dynamics(&bus.dyn2, value), "bus", bus.id, "dyn2"),
+        "phase" => reject_if_err(apply_phase(&bus.phase, value), "bus", bus.id, "phase"),
+        "delay" => reject_if_err(apply_delay(&bus.delay, value), "bus", bus.id, "delay"),
         _ => {}
     }
 }
@@ -219,7 +234,152 @@ fn current_track_value(state: &WsState, track: &Track, param: &str) -> serde_jso
         "solo" => serde_json::json!(track.solo.load(Ordering::Relaxed)),
         "sends" => sends_json(track),
         "input-patch" => state.mixer.patch.track_in_json(track.id, track.channels),
+        "filter" => filter_json(&track.filter),
+        "eq" => eq_json(&track.eq),
+        "dyn1" => dynamics_json(&track.dyn1),
+        "dyn2" => dynamics_json(&track.dyn2),
+        "phase" => phase_json(&track.phase),
+        "delay" => delay_json(&track.delay),
         _ => serde_json::Value::Null,
+    }
+}
+
+/// Logs a rejection for a processing-stage PUT against a resource whose `ChannelTemplate` doesn't
+/// include that stage (`Err("not present...")`, from `apply_filter`/etc. below) or that failed to
+/// parse -- shared by both the track and bus match arms in `apply_track_param`/`apply_bus_param`.
+fn reject_if_err(result: Result<(), &'static str>, kind: &str, id: u32, param: &str) {
+    if let Err(e) = result {
+        tracing::warn!(kind, id, param, error = e, "PUT rejected");
+    }
+}
+
+fn apply_filter(stage: &Option<crate::dsp::FilterStage>, value: &serde_json::Value) -> Result<(), &'static str> {
+    let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
+    if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
+        s.on.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = value.get("hp_hz").and_then(|v| v.as_f64()) {
+        *s.hp_hz.lock().unwrap() = v as f32;
+    }
+    if let Some(v) = value.get("lp_hz").and_then(|v| v.as_f64()) {
+        *s.lp_hz.lock().unwrap() = v as f32;
+    }
+    Ok(())
+}
+
+fn filter_json(stage: &Option<crate::dsp::FilterStage>) -> serde_json::Value {
+    match stage {
+        Some(s) => serde_json::json!({
+            "on": s.on.load(Ordering::Relaxed),
+            "hp_hz": *s.hp_hz.lock().unwrap(),
+            "lp_hz": *s.lp_hz.lock().unwrap(),
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn apply_eq(stage: &Option<crate::dsp::EqStage>, value: &serde_json::Value) -> Result<(), &'static str> {
+    let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
+    if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
+        s.on.store(v, Ordering::Relaxed);
+    }
+    // Full replacement of the band list, same "whole-array PUT" convention as patch.rs's
+    // crosspoint entries -- absent/malformed bands leaves the existing list untouched.
+    if let Some(arr) = value.get("bands").and_then(|v| v.as_array()) {
+        let bands: Vec<crate::dsp::EqBand> = arr
+            .iter()
+            .filter_map(|b| {
+                Some(crate::dsp::EqBand {
+                    freq_hz: b.get("freq_hz")?.as_f64()? as f32,
+                    gain_db: b.get("gain_db")?.as_f64()? as f32,
+                    q: b.get("q")?.as_f64()? as f32,
+                })
+            })
+            .collect();
+        *s.bands.lock().unwrap() = bands;
+    }
+    Ok(())
+}
+
+fn eq_json(stage: &Option<crate::dsp::EqStage>) -> serde_json::Value {
+    match stage {
+        Some(s) => serde_json::json!({
+            "on": s.on.load(Ordering::Relaxed),
+            "bands": s.bands.lock().unwrap().iter().map(|b| serde_json::json!({
+                "freq_hz": b.freq_hz, "gain_db": b.gain_db, "q": b.q,
+            })).collect::<Vec<_>>(),
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn apply_dynamics(stage: &Option<crate::dsp::DynamicsStage>, value: &serde_json::Value) -> Result<(), &'static str> {
+    let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
+    if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
+        s.on.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = value.get("threshold_db").and_then(|v| v.as_f64()) {
+        *s.threshold_db.lock().unwrap() = v as f32;
+    }
+    if let Some(v) = value.get("ratio").and_then(|v| v.as_f64()) {
+        *s.ratio.lock().unwrap() = v as f32;
+    }
+    if let Some(v) = value.get("attack_ms").and_then(|v| v.as_f64()) {
+        *s.attack_ms.lock().unwrap() = v as f32;
+    }
+    if let Some(v) = value.get("release_ms").and_then(|v| v.as_f64()) {
+        *s.release_ms.lock().unwrap() = v as f32;
+    }
+    if let Some(v) = value.get("makeup_db").and_then(|v| v.as_f64()) {
+        *s.makeup_db.lock().unwrap() = v as f32;
+    }
+    Ok(())
+}
+
+fn dynamics_json(stage: &Option<crate::dsp::DynamicsStage>) -> serde_json::Value {
+    match stage {
+        Some(s) => serde_json::json!({
+            "on": s.on.load(Ordering::Relaxed),
+            "threshold_db": *s.threshold_db.lock().unwrap(),
+            "ratio": *s.ratio.lock().unwrap(),
+            "attack_ms": *s.attack_ms.lock().unwrap(),
+            "release_ms": *s.release_ms.lock().unwrap(),
+            "makeup_db": *s.makeup_db.lock().unwrap(),
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn apply_phase(stage: &Option<crate::dsp::PhaseStage>, value: &serde_json::Value) -> Result<(), &'static str> {
+    let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
+    if let Some(v) = value.get("invert").and_then(|v| v.as_bool()) {
+        s.invert.store(v, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+fn phase_json(stage: &Option<crate::dsp::PhaseStage>) -> serde_json::Value {
+    match stage {
+        Some(s) => serde_json::json!({ "invert": s.invert.load(Ordering::Relaxed) }),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn apply_delay(stage: &Option<crate::dsp::DelayStage>, value: &serde_json::Value) -> Result<(), &'static str> {
+    let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
+    if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
+        s.on.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = value.get("delay_ms").and_then(|v| v.as_f64()) {
+        *s.delay_ms.lock().unwrap() = v as f32;
+    }
+    Ok(())
+}
+
+fn delay_json(stage: &Option<crate::dsp::DelayStage>) -> serde_json::Value {
+    match stage {
+        Some(s) => serde_json::json!({ "on": s.on.load(Ordering::Relaxed), "delay_ms": *s.delay_ms.lock().unwrap() }),
+        None => serde_json::Value::Null,
     }
 }
 
@@ -268,6 +428,12 @@ fn current_bus_value(state: &WsState, bus: &Bus, param: &str) -> serde_json::Val
         "fader" => serde_json::json!(*bus.fader_db.lock().unwrap()),
         "mute" => serde_json::json!(bus.mute.load(Ordering::Relaxed)),
         "input-patch" => state.mixer.patch.bus_in_json(bus.id, bus.channels),
+        "filter" => filter_json(&bus.filter),
+        "eq" => eq_json(&bus.eq),
+        "dyn1" => dynamics_json(&bus.dyn1),
+        "dyn2" => dynamics_json(&bus.dyn2),
+        "phase" => phase_json(&bus.phase),
+        "delay" => delay_json(&bus.delay),
         _ => serde_json::Value::Null,
     }
 }

@@ -22,6 +22,12 @@ set -eu
 
 TRACK_COUNT="${TRACK_COUNT:-8}"
 BUS_COUNT="${BUS_COUNT:-2}"
+# "simple" (default, today's gain->fader->mute/solo chain) or "full_channel" (adds every
+# processing stage in dsp.rs -- filter, EQ, both dynamics stages, phase, delay -- to every
+# generated track/bus, as structural placeholders; see config.rs's ChannelTemplate docs). One
+# value applied uniformly to every generated track/bus -- per-resource template mixes aren't
+# expressible from env vars alone, hand-author a config.json for that.
+CHANNEL_TEMPLATE="${CHANNEL_TEMPLATE:-simple}"
 MXL_DOMAIN="${MXL_DOMAIN:?MXL_DOMAIN must be set (the shared MXL domain mount, e.g. /home/mxl/domain)}"
 SAMPLE_RATE="${SAMPLE_RATE:-48000}"
 PERIOD_FRAMES="${PERIOD_FRAMES:-480}"
@@ -48,7 +54,7 @@ CONFIG_PATH="${CONFIG_PATH:-/tmp/mxl-test-app.conf}"
 tracks_json=""
 i=0
 while [ "$i" -lt "$TRACK_COUNT" ]; do
-    entry=$(printf '{"id":%d,"label":"Track %d","sends":[]}' "$i" "$((i + 1))")
+    entry=$(printf '{"id":%d,"label":"Track %d","sends":[],"template":"%s"}' "$i" "$((i + 1))" "$CHANNEL_TEMPLATE")
     if [ -z "$tracks_json" ]; then tracks_json="$entry"; else tracks_json="$tracks_json,$entry"; fi
     i=$((i + 1))
 done
@@ -68,9 +74,9 @@ while [ "$i" -lt "$BUS_COUNT" ]; do
         target_json=""
     fi
     if [ -n "$target_json" ]; then
-        entry=$(printf '{"id":%d,"label":"Bus %d",%s}' "$i" "$((i + 1))" "$target_json")
+        entry=$(printf '{"id":%d,"label":"Bus %d",%s,"template":"%s"}' "$i" "$((i + 1))" "$target_json" "$CHANNEL_TEMPLATE")
     else
-        entry=$(printf '{"id":%d,"label":"Bus %d"}' "$i" "$((i + 1))")
+        entry=$(printf '{"id":%d,"label":"Bus %d","template":"%s"}' "$i" "$((i + 1))" "$CHANNEL_TEMPLATE")
     fi
     if [ -z "$buses_json" ]; then buses_json="$entry"; else buses_json="$buses_json,$entry"; fi
     i=$((i + 1))
@@ -96,5 +102,5 @@ cat > "$CONFIG_PATH" <<EOF
 }
 EOF
 
-echo "generated ${CONFIG_PATH} (${TRACK_COUNT} tracks, ${BUS_COUNT} buses, instance '${INSTANCE_NAME}')" >&2
+echo "generated ${CONFIG_PATH} (${TRACK_COUNT} tracks, ${BUS_COUNT} buses, template '${CHANNEL_TEMPLATE}', instance '${INSTANCE_NAME}')" >&2
 exec /app/mxl-test-app "$CONFIG_PATH"

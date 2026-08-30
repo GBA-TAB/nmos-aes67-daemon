@@ -443,7 +443,15 @@ mod tests {
             .enumerate()
             .map(|(i, &ch)| {
                 Arc::new(Track::new(
-                    &TrackConfig { id: i as u32, label: format!("T{i}"), channels: None, sends: vec![], gain_db: 0.0, fader_db: 0.0 },
+                    &TrackConfig {
+                        id: i as u32,
+                        label: format!("T{i}"),
+                        channels: None,
+                        sends: vec![],
+                        gain_db: 0.0,
+                        fader_db: 0.0,
+                        template: crate::config::ChannelTemplate::Simple,
+                    },
                     ch,
                 ))
             })

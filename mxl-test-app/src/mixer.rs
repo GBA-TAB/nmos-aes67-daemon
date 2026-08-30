@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use crate::config::{BusConfig, TrackConfig};
+use crate::config::{BusConfig, ChannelTemplate, TrackConfig};
+use crate::dsp::{DelayStage, DynamicsStage, EqStage, FilterStage, PhaseStage};
 
 /// Where in a track's own chain a `Send` taps its signal from. Real consoles (see
 /// `~/DEV/yam bus.png`, a Yamaha "CH to MIX" send diagram) offer taps before/after several
@@ -67,10 +68,20 @@ pub struct Track {
     /// `std::sync::Mutex` for the same plain-OS-thread-engine reasoning as `mixer.rs`'s other
     /// per-period-written fields.
     pub direct_out_prev: Mutex<Vec<Vec<f32>>>,
+    /// Processing-chain stages (`dsp.rs`) — `None` unless this track's `ChannelTemplate` includes
+    /// them; see `dsp.rs`'s module docs for why an absent stage is `None`, not a present-but-off
+    /// one, and why none of them affect the signal yet (structural placeholders, not real DSP).
+    pub filter: Option<FilterStage>,
+    pub eq: Option<EqStage>,
+    pub dyn1: Option<DynamicsStage>,
+    pub dyn2: Option<DynamicsStage>,
+    pub phase: Option<PhaseStage>,
+    pub delay: Option<DelayStage>,
 }
 
 impl Track {
     pub fn new(cfg: &TrackConfig, channels: usize) -> Self {
+        let full = cfg.template == ChannelTemplate::FullChannel;
         Self {
             id: cfg.id,
             label: cfg.label.clone(),
@@ -83,6 +94,12 @@ impl Track {
             sender_id: Mutex::new(None),
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             direct_out_prev: Mutex::new(vec![Vec::new(); channels]),
+            filter: full.then(FilterStage::default_on),
+            eq: full.then(EqStage::default_on),
+            dyn1: full.then(DynamicsStage::default_on),
+            dyn2: full.then(DynamicsStage::default_on),
+            phase: full.then(PhaseStage::default_on),
+            delay: full.then(DelayStage::default_on),
         }
     }
 }
@@ -110,10 +127,19 @@ pub struct Bus {
     /// pickoff point (`patch.rs`). Not consumed by anything in this pass (Milestone 2's output grid
     /// is the first consumer) — established now for symmetry with `Track.direct_out_prev`.
     pub output_prev: Mutex<Vec<Vec<f32>>>,
+    /// Processing-chain stages (`dsp.rs`) — see `Track`'s own fields of the same names for what
+    /// each means; a bus/master insert on a real console carries the same stage types.
+    pub filter: Option<FilterStage>,
+    pub eq: Option<EqStage>,
+    pub dyn1: Option<DynamicsStage>,
+    pub dyn2: Option<DynamicsStage>,
+    pub phase: Option<PhaseStage>,
+    pub delay: Option<DelayStage>,
 }
 
 impl Bus {
     pub fn new(cfg: &BusConfig, flow_id: uuid::Uuid, writer: crate::flow::FlowWriter, channels: usize) -> Self {
+        let full = cfg.template == ChannelTemplate::FullChannel;
         Self {
             id: cfg.id,
             label: cfg.label.clone(),
@@ -125,6 +151,12 @@ impl Bus {
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             receiver_id: Mutex::new(None),
             output_prev: Mutex::new(vec![Vec::new(); channels]),
+            filter: full.then(FilterStage::default_on),
+            eq: full.then(EqStage::default_on),
+            dyn1: full.then(DynamicsStage::default_on),
+            dyn2: full.then(DynamicsStage::default_on),
+            phase: full.then(PhaseStage::default_on),
+            delay: full.then(DelayStage::default_on),
         }
     }
 }

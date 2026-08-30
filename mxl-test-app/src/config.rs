@@ -123,6 +123,23 @@ pub struct TrackConfig {
     pub gain_db: f32,
     #[serde(default)]
     pub fader_db: f32,
+    /// Which processing stages this track's chain actually has — see `ChannelTemplate`'s docs.
+    #[serde(default)]
+    pub template: ChannelTemplate,
+}
+
+/// Which processing stages a `Track`/`Bus` chain actually has (`dsp.rs`) — chosen per-resource in
+/// config, or in bulk for a container-sized deployment via `docker-entrypoint.sh`'s
+/// `CHANNEL_TEMPLATE` env var. `Simple` (the default) is today's chain: gain -> fader -> mute/solo
+/// only, matching every track/bus before this was added. `FullChannel` adds every stage in
+/// `dsp.rs` (filter, EQ, both dynamics stages, phase, delay) — as structural placeholders (see
+/// `dsp.rs`'s own docs), not real DSP yet.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelTemplate {
+    #[default]
+    Simple,
+    FullChannel,
 }
 
 /// One `TrackConfig`'s send — see `mixer::Send`'s docs for what each field means and why this one
@@ -211,6 +228,11 @@ pub struct BusConfig {
     pub channels: Option<u32>,
     #[serde(default)]
     pub fader_db: f32,
+    /// Which processing stages this bus's chain actually has — see `ChannelTemplate`'s docs
+    /// (`TrackConfig::template`'s sibling; the same stage types apply equally to a bus/master
+    /// insert on a real console).
+    #[serde(default)]
+    pub template: ChannelTemplate,
 }
 
 #[derive(Deserialize, Clone, Debug)]

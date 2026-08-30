@@ -1,4 +1,5 @@
 mod config;
+mod dsp;
 mod engine;
 mod flow;
 mod ids;
