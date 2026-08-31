@@ -6,7 +6,7 @@
 //! passed in.
 
 use crate::config::Config;
-use crate::mixer::{Bus, Track};
+use crate::patch::{InputGridEntry, OutputGridEntry};
 
 /// mxl-bridge's own private-use transport type for MXL-backed resources (see its mxl_flow.rs) —
 /// reused here rather than inventing a second one, since interoperating with mxl-bridge is this
@@ -80,12 +80,12 @@ fn channels_json(count: u32) -> serde_json::Value {
     (0..count).map(|i| serde_json::json!({ "label": format!("Channel {}", i + 1) })).collect()
 }
 
-pub fn source_json(cfg: &Config, device_id: uuid::Uuid, bus: &Bus, source_id: uuid::Uuid, version: &str) -> serde_json::Value {
+pub fn source_json(cfg: &Config, device_id: uuid::Uuid, entry: &OutputGridEntry, source_id: uuid::Uuid, version: &str) -> serde_json::Value {
     serde_json::json!({
         "id": source_id.to_string(),
         "version": version,
-        "label": bus.label,
-        "description": format!("mxl-test-app bus {} output", bus.id),
+        "label": entry.label,
+        "description": format!("mxl-test-app output grid entry '{}'", entry.id),
         "tags": {},
         "device_id": device_id.to_string(),
         "parents": [],
@@ -93,14 +93,14 @@ pub fn source_json(cfg: &Config, device_id: uuid::Uuid, bus: &Bus, source_id: uu
         "grain_rate": { "numerator": cfg.sample_rate, "denominator": 1 },
         "caps": {},
         "format": "urn:x-nmos:format:audio",
-        "channels": channels_json(bus.channels as u32)
+        "channels": channels_json(entry.channels as u32)
     })
 }
 
 pub fn flow_json(
     cfg: &Config,
     device_id: uuid::Uuid,
-    bus: &Bus,
+    entry: &OutputGridEntry,
     source_id: uuid::Uuid,
     flow_id: uuid::Uuid,
     version: &str,
@@ -108,7 +108,7 @@ pub fn flow_json(
     serde_json::json!({
         "id": flow_id.to_string(),
         "version": version,
-        "label": bus.label,
+        "label": entry.label,
         "description": "",
         "tags": {},
         "grain_rate": { "numerator": cfg.sample_rate, "denominator": 1 },
@@ -119,20 +119,20 @@ pub fn flow_json(
         "media_type": "audio/float32",
         "sample_rate": { "numerator": cfg.sample_rate, "denominator": 1 },
         "bit_depth": 32,
-        "channels": channels_json(bus.channels as u32)
+        "channels": channels_json(entry.channels as u32)
     })
 }
 
-/// A bus's Sender is reported `active: true` unconditionally: unlike mxl-bridge's Sinks (lazily
-/// activated, §1 of the Phase 2 plan), a bus's MXL flow is created once at startup and written
-/// every period for the process's whole lifetime (engine.rs) — there's no lazy-creation state for
-/// `master_enable` to gate here, so `receiver_id` is the only part of `subscription` that's
-/// actually meaningful (purely informational, tracks what a controller last PATCHed it to).
+/// An output-grid entry's Sender is reported `active: true` unconditionally: unlike mxl-bridge's
+/// Sinks (lazily activated, §1 of the Phase 2 plan), its MXL flow is created once at startup and
+/// written every period for the process's whole lifetime (engine.rs) — there's no lazy-creation
+/// state for `master_enable` to gate here, so `receiver_id` is the only part of `subscription`
+/// that's actually meaningful (purely informational, tracks what a controller last PATCHed it to).
 pub fn sender_json(
     cfg: &Config,
     ip: &str,
     device_id: uuid::Uuid,
-    bus: &Bus,
+    entry: &OutputGridEntry,
     sender_id: uuid::Uuid,
     flow_id: uuid::Uuid,
     receiver_id: Option<String>,
@@ -142,7 +142,7 @@ pub fn sender_json(
     serde_json::json!({
         "id": sender_id.to_string(),
         "version": version,
-        "label": bus.label,
+        "label": entry.label,
         "description": "",
         "tags": {},
         "flow_id": flow_id.to_string(),
@@ -157,7 +157,7 @@ pub fn sender_json(
 pub fn receiver_json(
     cfg: &Config,
     device_id: uuid::Uuid,
-    track: &Track,
+    entry: &InputGridEntry,
     receiver_id: uuid::Uuid,
     active: bool,
     sender_id: Option<String>,
@@ -166,8 +166,8 @@ pub fn receiver_json(
     serde_json::json!({
         "id": receiver_id.to_string(),
         "version": version,
-        "label": track.label,
-        "description": format!("mxl-test-app track {} input", track.id),
+        "label": entry.label,
+        "description": format!("mxl-test-app input grid entry '{}'", entry.id),
         "tags": {},
         "device_id": device_id.to_string(),
         "transport": TRANSPORT_TYPE,

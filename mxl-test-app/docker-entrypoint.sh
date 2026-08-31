@@ -1,32 +1,48 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
 #
-# Generates a config.json for an arbitrary track/bus count from environment variables, then execs
-# the binary against it -- this is the "sizing" knob for a containerized deployment (Kubernetes
-# Deployment env vars, docker-compose environment:, etc.): sizing is a startup-time parameter, not
-# something baked into the image or a custom app-manager concept (see the Phase 2 plan's
-# Verification section note on why -- MXL itself has no normalized app-management layer, this
-# follows MXL's own reference deployment pattern of plain env-var-configured containers).
+# Generates a config.json for an arbitrary track/bus/master count from environment variables, then
+# execs the binary against it -- this is the "sizing" knob for a containerized deployment
+# (Kubernetes Deployment env vars, docker-compose environment:, etc.): sizing is a startup-time
+# parameter, not something baked into the image or a custom app-manager concept (MXL itself has no
+# normalized app-management layer, this follows MXL's own reference deployment pattern of plain
+# env-var-configured containers).
 #
-# No input-grid entries or track input-patches are generated here (see config.rs's
-# InputGridEntryConfig / patch.rs docs) -- a container-sized mixer's tracks start unpatched
-# (silent) and get an input-patch assigned later over the amixer WebSocket protocol's
-# `input-patch` PUT (ws.rs), since there's no way to hand-specify N individual track sources at
-# container-start time. Buses always get a real flow at startup (Bus::new
-# requires one); BUS_<n>_TARGET can pin a specific one (e.g. "packed_tx_name:testmix2" to feed a
-# specific mxl-bridge instance) — otherwise each bus gets an id derived from INSTANCE_NAME, which
-# should be set to the pod name in Kubernetes so replicas don't collide (see
-# ids::instance_bus_flow_id).
+# No track input-patches are generated here (see patch.rs docs) -- a container-sized mixer's
+# tracks start unpatched (silent) and get an input-patch assigned later over the amixer WebSocket
+# protocol's `input-patch` PUT (ws.rs), since there's no way to hand-specify N individual track
+# sources at container-start time.
+#
+# Bus/master decorrelation (see ~/.claude/plans/snug-painting-elephant.md): a bus is a pure summer
+# now, owns no flow. MASTER_COUNT unset (the default) gives every generated bus a paired master via
+# "auto_master" -- reproduces the old fused bus/master behavior with zero extra authoring, and
+# BUS_<n>_TARGET still pins that master's own output-grid target the same way it always did. Set
+# MASTER_COUNT to a real (possibly decorrelated-from-BUS_COUNT) value for a bigger system: that
+# many *unpatched* masters are generated instead, no bus gets auto_master, and buses/masters get
+# wired together explicitly over the WS protocol after startup.
+#
+# input/output grid sizing (plan §14, the *only* NMOS-facing surface -- neither tracks nor
+# buses/masters have NMOS presence of their own): INPUT_GRID_COUNT/OUTPUT_GRID_COUNT generate that
+# many empty, IS-05-activatable/patchable slots, decorrelated from TRACK_COUNT/BUS_COUNT/
+# MASTER_COUNT, since "how much this device can receive/send over NMOS" is a deployment/capacity
+# decision, not a mixing-topology one. OUTPUT_<n>_TARGET pins a specific output-grid entry's flow
+# the same way BUS_<n>_TARGET used to.
 
 set -eu
 
 TRACK_COUNT="${TRACK_COUNT:-8}"
 BUS_COUNT="${BUS_COUNT:-2}"
+# Unset (default): every generated bus gets "auto_master":{} -- a 1:1 paired master per bus. Set to
+# an explicit count for a bigger, decorrelated system -- see the header comment above.
+MASTER_COUNT="${MASTER_COUNT:-}"
+INPUT_GRID_COUNT="${INPUT_GRID_COUNT:-0}"
+OUTPUT_GRID_COUNT="${OUTPUT_GRID_COUNT:-0}"
 # "simple" (default, today's gain->fader->mute/solo chain) or "full_channel" (adds every
 # processing stage in dsp.rs -- filter, EQ, both dynamics stages, phase, delay -- to every
-# generated track/bus, as structural placeholders; see config.rs's ChannelTemplate docs). One
-# value applied uniformly to every generated track/bus -- per-resource template mixes aren't
-# expressible from env vars alone, hand-author a config.json for that.
+# generated track/master, as structural placeholders; see config.rs's ChannelTemplate docs). One
+# value applied uniformly to every generated track/master -- per-resource template mixes aren't
+# expressible from env vars alone, hand-author a config.json for that. Buses have no template of
+# their own (pure summers).
 CHANNEL_TEMPLATE="${CHANNEL_TEMPLATE:-simple}"
 MXL_DOMAIN="${MXL_DOMAIN:?MXL_DOMAIN must be set (the shared MXL domain mount, e.g. /home/mxl/domain)}"
 SAMPLE_RATE="${SAMPLE_RATE:-48000}"
@@ -37,8 +53,8 @@ MIXER_ID="${MIXER_ID:-0}"
 METER_HZ="${METER_HZ:-25}"
 # Kubernetes' downward API exposes the pod's own name as $(POD_NAME) when wired into the
 # Deployment's env (fieldRef: metadata.name) -- falls back to the hostname (a container's own
-# hostname is its short container id by default) for docker-compose/plain `docker run` use, so bus
-# flow ids are still deterministic-per-container without extra config there either.
+# hostname is its short container id by default) for docker-compose/plain `docker run` use, so
+# output-grid flow ids are still deterministic-per-container without extra config there either.
 INSTANCE_NAME="${INSTANCE_NAME:-$(hostname)}"
 NMOS_LABEL="${NMOS_LABEL:-mxl-test-app ${INSTANCE_NAME}}"
 NMOS_REGISTRY_ADDRESS="${NMOS_REGISTRY_ADDRESS:-}"
@@ -56,6 +72,18 @@ STATE_PATH="${STATE_PATH:-}"
 
 CONFIG_PATH="${CONFIG_PATH:-/tmp/mxl-test-app.conf}"
 
+# Splits a "key:value" target spec (e.g. "packed_tx_name:testmix2" or "flow_id:<uuid>") into a
+# `"target":{"key":"value"}` JSON fragment, or the empty string if $1 is unset/empty -- shared by
+# the bus (via auto_master), master, and output-grid generation loops below.
+target_json_fragment() {
+    target_value="$1"
+    if [ -n "$target_value" ]; then
+        key="${target_value%%:*}"
+        value="${target_value#*:}"
+        printf '"target":{"%s":"%s"}' "$key" "$value"
+    fi
+}
+
 tracks_json=""
 i=0
 while [ "$i" -lt "$TRACK_COUNT" ]; do
@@ -65,25 +93,63 @@ while [ "$i" -lt "$TRACK_COUNT" ]; do
 done
 
 buses_json=""
+masters_json=""
 i=0
 while [ "$i" -lt "$BUS_COUNT" ]; do
-    target_var="BUS_${i}_TARGET"
-    eval "target_value=\${$target_var:-}"
-    if [ -n "$target_value" ]; then
-        # $target_value is e.g. "packed_tx_name:testmix2" or "flow_id:<uuid>" -- split on the
-        # first ':' into a target object matching config.rs's BusTarget externally-tagged shape.
-        key="${target_value%%:*}"
-        value="${target_value#*:}"
-        target_json=$(printf '"target":{"%s":"%s"}' "$key" "$value")
+    if [ -z "$MASTER_COUNT" ]; then
+        # Small-mixer default: this bus gets a paired master, carrying the template/target that
+        # used to live on the bus itself.
+        target_var="BUS_${i}_TARGET"
+        eval "target_value=\${$target_var:-}"
+        target_json=$(target_json_fragment "$target_value")
+        if [ -n "$target_json" ]; then
+            auto_master_json=$(printf '"auto_master":{%s,"template":"%s"}' "$target_json" "$CHANNEL_TEMPLATE")
+        else
+            auto_master_json=$(printf '"auto_master":{"template":"%s"}' "$CHANNEL_TEMPLATE")
+        fi
+        entry=$(printf '{"id":%d,"label":"Bus %d",%s}' "$i" "$((i + 1))" "$auto_master_json")
     else
-        target_json=""
-    fi
-    if [ -n "$target_json" ]; then
-        entry=$(printf '{"id":%d,"label":"Bus %d",%s,"template":"%s"}' "$i" "$((i + 1))" "$target_json" "$CHANNEL_TEMPLATE")
-    else
-        entry=$(printf '{"id":%d,"label":"Bus %d","template":"%s"}' "$i" "$((i + 1))" "$CHANNEL_TEMPLATE")
+        # Decorrelated mode: a plain pure-summer bus, no paired master -- wire it to a master
+        # explicitly over the WS protocol after startup.
+        entry=$(printf '{"id":%d,"label":"Bus %d"}' "$i" "$((i + 1))")
     fi
     if [ -z "$buses_json" ]; then buses_json="$entry"; else buses_json="$buses_json,$entry"; fi
+    i=$((i + 1))
+done
+
+if [ -n "$MASTER_COUNT" ]; then
+    # No target here -- a master owns no flow at all (see the plan's §14); external visibility, if
+    # wanted, comes from patching master-out:<id> into an output-grid entry (which does carry a
+    # target, below) after startup.
+    i=0
+    while [ "$i" -lt "$MASTER_COUNT" ]; do
+        entry=$(printf '{"id":%d,"label":"Master %d","template":"%s"}' "$i" "$((i + 1))" "$CHANNEL_TEMPLATE")
+        if [ -z "$masters_json" ]; then masters_json="$entry"; else masters_json="$masters_json,$entry"; fi
+        i=$((i + 1))
+    done
+fi
+
+input_grid_json=""
+i=0
+while [ "$i" -lt "$INPUT_GRID_COUNT" ]; do
+    # No "source" -- starts empty, waiting for IS-05 receiver activation (nmos/server.rs).
+    entry=$(printf '{"id":"nmos-in-%d","label":"NMOS Input %d"}' "$i" "$((i + 1))")
+    if [ -z "$input_grid_json" ]; then input_grid_json="$entry"; else input_grid_json="$input_grid_json,$entry"; fi
+    i=$((i + 1))
+done
+
+output_grid_json=""
+i=0
+while [ "$i" -lt "$OUTPUT_GRID_COUNT" ]; do
+    target_var="OUTPUT_${i}_TARGET"
+    eval "target_value=\${$target_var:-}"
+    target_json=$(target_json_fragment "$target_value")
+    if [ -n "$target_json" ]; then
+        entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d",%s}' "$i" "$((i + 1))" "$target_json")
+    else
+        entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d"}' "$i" "$((i + 1))")
+    fi
+    if [ -z "$output_grid_json" ]; then output_grid_json="$entry"; else output_grid_json="$output_grid_json,$entry"; fi
     i=$((i + 1))
 done
 
@@ -103,10 +169,13 @@ cat > "$CONFIG_PATH" <<EOF
   "nmos_registry_port": ${NMOS_REGISTRY_PORT},
   "interface_name": "${INTERFACE_NAME}",
   "ip_addr": "${IP_ADDR}",
+  "input_grid": [${input_grid_json}],
+  "output_grid": [${output_grid_json}],
   "tracks": [${tracks_json}],
-  "buses": [${buses_json}]
+  "buses": [${buses_json}],
+  "masters": [${masters_json}]
 }
 EOF
 
-echo "generated ${CONFIG_PATH} (${TRACK_COUNT} tracks, ${BUS_COUNT} buses, template '${CHANNEL_TEMPLATE}', instance '${INSTANCE_NAME}')" >&2
+echo "generated ${CONFIG_PATH} (${TRACK_COUNT} tracks, ${BUS_COUNT} buses, masters '${MASTER_COUNT:-auto-paired}', ${INPUT_GRID_COUNT} input-grid, ${OUTPUT_GRID_COUNT} output-grid, template '${CHANNEL_TEMPLATE}', instance '${INSTANCE_NAME}')" >&2
 exec /app/mxl-test-app "$CONFIG_PATH"

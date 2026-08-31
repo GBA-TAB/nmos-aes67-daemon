@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use crate::config::{BusConfig, ChannelTemplate, TrackConfig};
+use crate::config::{BusConfig, ChannelTemplate, MasterTrackConfig, TrackConfig};
 use crate::dsp::{DelayStage, DynamicsStage, EqStage, FilterStage, PhaseStage};
 
 /// Where in a track's own chain a `Send` taps its signal from. Real consoles (see
@@ -53,14 +53,16 @@ pub struct Track {
     pub mute: AtomicBool,
     pub solo: AtomicBool,
     pub sends: Mutex<Vec<Send>>,
-    /// The `sender_id` this track's Receiver was last activated against, for IS-05's
-    /// `subscription.sender_id` — purely informational, set by `nmos/server.rs`'s `receiver_patch`
-    /// alongside the ephemeral input-grid entry + track-in patch it synthesizes for the activation
-    /// (see `patch.rs` module docs).
-    pub sender_id: Mutex<Option<String>>,
     /// Post-fader peak, one value per channel, in dBFS (`f32::NEG_INFINITY` for silence) — written
     /// by the engine once per period, read by the WebSocket broadcaster.
     pub meter_db: Mutex<Vec<f32>>,
+    /// Pre-gain peak — the `track-in:<id>` pickoff point's own signal, measured right after
+    /// `patch.rs::resolve_track_in` fills the engine's scratch buffer and *before* gain is applied.
+    /// Deliberately a separate field from `meter_db` (post-fader): they measure different points in
+    /// the same chain, so a track that's patched but faded/muted down still shows a real value here
+    /// even though `meter_db` reads silence — exactly the "is anything actually arriving" signal a
+    /// patch-grid view needs, independent of how the channel strip is currently set.
+    pub input_meter_db: Mutex<Vec<f32>>,
     /// This track's post-fader signal from the *previous* period — the `track-out:<id>` pickoff
     /// point (`patch.rs`) other tracks' `track-in` patches read from. Necessarily one period stale
     /// when consumed that way (this period's own track processing hasn't run yet at the point
@@ -77,10 +79,25 @@ pub struct Track {
     pub dyn2: Option<DynamicsStage>,
     pub phase: Option<PhaseStage>,
     pub delay: Option<DelayStage>,
+    /// Which `ChannelTemplate` this track was built with — stored explicitly (not derived from
+    /// `filter.is_some()`) so persistence's topology capture (`persistence.rs`, `topology.rs`)
+    /// stays correct even if a future `dsp.rs` change ever lets stages move independently of each
+    /// other; right now they always move together as one `full` bool (see `Track::new`), but that's
+    /// an implementation detail this field doesn't want to depend on.
+    pub template: ChannelTemplate,
+    /// `true` for a track created at runtime via the `CREATE` WS op (`ws.rs`/`topology.rs`), `false`
+    /// for anything built from `Config` at startup. Lets `persistence.rs::capture` know which
+    /// tracks need their full topology (not just live values) saved so they can be reconstructed on
+    /// the next restart -- see the plan at ~/.claude/plans/snug-painting-elephant.md §5.
+    pub dynamically_created: bool,
 }
 
 impl Track {
     pub fn new(cfg: &TrackConfig, channels: usize) -> Self {
+        Self::new_with_origin(cfg, channels, false)
+    }
+
+    pub fn new_with_origin(cfg: &TrackConfig, channels: usize, dynamically_created: bool) -> Self {
         let full = cfg.template == ChannelTemplate::FullChannel;
         Self {
             id: cfg.id,
@@ -91,8 +108,8 @@ impl Track {
             mute: AtomicBool::new(false),
             solo: AtomicBool::new(false),
             sends: Mutex::new(cfg.sends.iter().map(|s| s.to_send()).collect()),
-            sender_id: Mutex::new(None),
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
+            input_meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             direct_out_prev: Mutex::new(vec![Vec::new(); channels]),
             filter: full.then(FilterStage::default_on),
             eq: full.then(EqStage::default_on),
@@ -100,56 +117,126 @@ impl Track {
             dyn2: full.then(DynamicsStage::default_on),
             phase: full.then(PhaseStage::default_on),
             delay: full.then(DelayStage::default_on),
+            template: cfg.template,
+            dynamically_created,
         }
     }
 }
 
-/// One output strip: sums every track assigned to it (respecting mute/solo), applies its own
-/// fader, writes the result to its own real MXL flow.
+/// One summing point: sums every track `Send` targeting it, plus its own `bus-in` patch feed
+/// (patch.rs) — nothing else. A bus is deliberately *not* a controllable channel strip: it has no
+/// fader, no mute, no processing chain, and owns no real MXL flow or NMOS presence of its own (see
+/// the plan at ~/.claude/plans/snug-painting-elephant.md §1/§14 for why that's the more consistent
+/// answer than keeping one "for debugging" — patch `bus-out:<id>` into an output-grid entry
+/// instead, on demand, if a raw tap is ever actually wanted, or into a `MasterTrack`'s `master-in`
+/// for a controllable strip downstream of the sum). Every bus's summed output (`bus-out:<id>`) is
+/// always a valid patch.rs grid *source* regardless of whether anything is currently listening to
+/// it — a bus with nothing patched downstream just sums silently into `output_prev`, forever, same
+/// "always produce, never stall" rule as everything else in this pipeline.
 pub struct Bus {
     pub id: u32,
     pub label: String,
-    /// This bus's own real MXL flow_id (resolved once at startup — see `BusConfig::resolve_flow_id`)
-    /// — also the NMOS Flow.id its mirrored Flow/Sender advertise (nmos/resources.rs), kept here so
-    /// the NMOS layer doesn't need to re-derive or separately track it.
-    pub flow_id: uuid::Uuid,
     /// This bus's own channel count — see `Track::channels`'s docs, same idea.
+    pub channels: usize,
+    /// This bus's own post-sum peak, one value per channel, in dBFS — `bus-out:<id>`'s own pickoff
+    /// meter. This is the bus's only/final value (no fader stage exists to distinguish a separate
+    /// "post-fader" reading from) — it's what `output_prev` snapshots too.
+    pub meter_db: Mutex<Vec<f32>>,
+    /// The `bus-in:<id>` pickoff point's own signal — only this bus's own patched-in feed
+    /// (`patch.rs::resolve_bus_in`), measured *before* it's summed together with tracks' own
+    /// `Send`s into the bus's running accumulator. Necessarily a separate scratch/measurement from
+    /// `meter_db` (the bus's final output): once summed, "what the bus-in patch contributed" is no
+    /// longer separable from "what the tracks' sends contributed" — see `engine.rs`'s step 4 for
+    /// where this is measured before that summing happens.
+    pub input_meter_db: Mutex<Vec<f32>>,
+    /// This bus's summed output from the *most recently completed* period — the `bus-out:<id>`
+    /// pickoff point (`patch.rs`). Consumed by `master-in` (this period, since bus summing runs
+    /// before master processing) and by `track-in`/`bus-in`/`output` (previous period).
+    pub output_prev: Mutex<Vec<Vec<f32>>>,
+    /// See `Track.dynamically_created`'s own doc -- same meaning, same purpose.
+    pub dynamically_created: bool,
+}
+
+impl Bus {
+    pub fn new(cfg: &BusConfig, channels: usize) -> Self {
+        Self::new_with_origin(cfg, channels, false)
+    }
+
+    pub fn new_with_origin(cfg: &BusConfig, channels: usize, dynamically_created: bool) -> Self {
+        Self {
+            id: cfg.id,
+            label: cfg.label.clone(),
+            channels,
+            meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
+            input_meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
+            output_prev: Mutex::new(vec![Vec::new(); channels]),
+            dynamically_created,
+        }
+    }
+}
+
+/// One master track: a controllable channel strip whose *input* is the summing `master-in:<id>`
+/// grid destination (patch.rs) — fed from bus-out, another master's master-out, a track's
+/// direct-out, or an input-grid entry, any mix. Full processing chain identical in shape to a
+/// track's/pre-decorrelation bus's own (`dsp.rs`), its own fader/mute. Owns no MXL flow and has no
+/// NMOS presence of its own (see the plan at ~/.claude/plans/snug-painting-elephant.md §14) —
+/// `master-out:<id>` is just an in-process pickoff source, same as `bus-out:<id>`; patch it into an
+/// output-grid entry to make a specific master externally visible. On a small mixer, one master is
+/// auto-paired 1:1 with each bus (`BusConfig.auto_master`, config.rs) reproducing today's fused
+/// bus/master behavior with zero extra authoring; on a bigger system, master count is fully
+/// decorrelated from bus count and wired explicitly via `master-in`.
+pub struct MasterTrack {
+    pub id: u32,
+    pub label: String,
+    /// This master's own channel count — see `Track::channels`'s docs, same idea.
     pub channels: usize,
     pub fader_db: Mutex<f32>,
     pub mute: AtomicBool,
-    pub writer: Mutex<crate::flow::FlowWriter>,
+    /// Post-fader peak, one value per channel, in dBFS — this *is* `master-out:<id>`'s value.
     pub meter_db: Mutex<Vec<f32>>,
-    /// The `receiver_id` a controller last PATCHed this bus's mirrored Sender's `subscription`
-    /// to — purely informational (see nmos/resources.rs's `sender_json` docs: nothing here is
-    /// actually gated by it, unlike mxl-bridge's Sinks).
-    pub receiver_id: Mutex<Option<String>>,
-    /// This bus's post-fader signal from the *most recently completed* period — the `bus-out:<id>`
-    /// pickoff point (`patch.rs`). Not consumed by anything in this pass (Milestone 2's output grid
-    /// is the first consumer) — established now for symmetry with `Track.direct_out_prev`.
+    /// The `master-in:<id>` pickoff point's own signal — this master's *only* input mechanism (no
+    /// separate "sends"-style second contributor the way a bus has tracks' `Send`s alongside
+    /// `bus-in`, so unlike `Bus.input_meter_db` this needs no isolated scratch buffer — see
+    /// `engine.rs`'s master-loop docs), measured right after `patch.rs::resolve_master_in` fills
+    /// the engine's scratch buffer and *before* the processing chain/fader touch it.
+    pub input_meter_db: Mutex<Vec<f32>>,
+    /// This master's post-fader signal from the *most recently completed* period — the
+    /// `master-out:<id>` pickoff point (patch.rs). Read as *this* period's value by `output:`
+    /// destinations (terminal stage, runs after masters) and as the *previous* period's value by
+    /// `track-in`/`bus-in`/`master-in` (masters process after those) — this is what makes "master
+    /// into master" (arbitrary cascaded submixes, including a master feeding its own `master-in`)
+    /// never need cycle detection/topological sort, the exact same trick
+    /// `Track.direct_out_prev`/`Bus.output_prev` already rely on for track/bus.
     pub output_prev: Mutex<Vec<Vec<f32>>>,
     /// Processing-chain stages (`dsp.rs`) — see `Track`'s own fields of the same names for what
-    /// each means; a bus/master insert on a real console carries the same stage types.
+    /// each means.
     pub filter: Option<FilterStage>,
     pub eq: Option<EqStage>,
     pub dyn1: Option<DynamicsStage>,
     pub dyn2: Option<DynamicsStage>,
     pub phase: Option<PhaseStage>,
     pub delay: Option<DelayStage>,
+    /// See `Track.template`'s own doc -- same meaning, same purpose.
+    pub template: ChannelTemplate,
+    /// See `Track.dynamically_created`'s own doc -- same meaning, same purpose.
+    pub dynamically_created: bool,
 }
 
-impl Bus {
-    pub fn new(cfg: &BusConfig, flow_id: uuid::Uuid, writer: crate::flow::FlowWriter, channels: usize) -> Self {
+impl MasterTrack {
+    pub fn new(cfg: &MasterTrackConfig, channels: usize) -> Self {
+        Self::new_with_origin(cfg, channels, false)
+    }
+
+    pub fn new_with_origin(cfg: &MasterTrackConfig, channels: usize, dynamically_created: bool) -> Self {
         let full = cfg.template == ChannelTemplate::FullChannel;
         Self {
             id: cfg.id,
             label: cfg.label.clone(),
-            flow_id,
             channels,
             fader_db: Mutex::new(cfg.fader_db),
             mute: AtomicBool::new(false),
-            writer: Mutex::new(writer),
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
-            receiver_id: Mutex::new(None),
+            input_meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             output_prev: Mutex::new(vec![Vec::new(); channels]),
             filter: full.then(FilterStage::default_on),
             eq: full.then(EqStage::default_on),
@@ -157,6 +244,8 @@ impl Bus {
             dyn2: full.then(DynamicsStage::default_on),
             phase: full.then(PhaseStage::default_on),
             delay: full.then(DelayStage::default_on),
+            template: cfg.template,
+            dynamically_created,
         }
     }
 }

@@ -79,6 +79,11 @@ pub struct Config {
 
     pub tracks: Vec<TrackConfig>,
     pub buses: Vec<BusConfig>,
+    /// Master tracks (see `MasterTrackConfig`) — controllable channel strips fed from `master-in`
+    /// (patch.rs), decorrelated from bus count. Empty by default; a small mixer instead uses each
+    /// `BusConfig.auto_master` to get a paired master per bus with zero extra authoring here.
+    #[serde(default)]
+    pub masters: Vec<MasterTrackConfig>,
 }
 
 fn default_nmos_registry_port() -> u16 {
@@ -106,8 +111,11 @@ pub struct InputGridEntryConfig {
     pub label: String,
     /// Where this entry reads from — reuses `TrackSource` unchanged (it already models "resolve to
     /// a raw MXL flow_id", exactly what an input-grid entry needs; nothing here is track-specific
-    /// despite the name).
-    pub source: TrackSource,
+    /// despite the name). `None` — starts with no reader, waiting for IS-05 receiver activation
+    /// (`nmos/server.rs::receiver_patch`) to open one; every input-grid entry, fixed or empty, gets
+    /// its own NMOS Receiver either way (see the plan's §14).
+    #[serde(default)]
+    pub source: Option<TrackSource>,
     /// This entry's own channel count — defaults to `Config::channels` when unset, same convention
     /// as `TrackConfig`/`BusConfig`.
     #[serde(default)]
@@ -222,29 +230,61 @@ impl TrackSource {
     }
 }
 
+/// A bus is a pure summer now (see `mixer::Bus`'s own docs) — no flow, no fader/template, just an
+/// id/label/channel-count and, optionally, a paired master.
 #[derive(Deserialize, Clone, Debug)]
 pub struct BusConfig {
     pub id: u32,
     pub label: String,
-    /// Where this bus's own MXL flow is created — see `BusTarget`. Absent means "just give me a
-    /// standalone flow, don't care about its id" — `ids::instance_bus_flow_id` derives one from
-    /// `instance_name` + this bus's own id, so a container-sized deployment (see
-    /// docker-entrypoint.sh) doesn't need to author an explicit target per bus.
-    #[serde(default)]
-    pub target: Option<BusTarget>,
     /// This bus's own channel count — defaults to `Config::channels` when unset. See
     /// `TrackConfig::channels`'s docs.
     #[serde(default)]
     pub channels: Option<u32>,
+    /// Small-mixer convenience: when set, `main.rs` synthesizes a paired `MasterTrackConfig` with
+    /// this bus's own `id` and auto-patches `master-in:<id> <- bus-out:<id>` (channel-for-channel)
+    /// at startup, reproducing today's fused bus/master behavior with zero extra authoring. `None`
+    /// (default) — a bigger, decorrelated system just doesn't set this on any bus, and wires
+    /// buses/masters together explicitly via `master-in`/`bus-in` over the WS protocol instead.
+    /// Startup panics if a bus sets this *and* an explicitly-authored `MasterTrackConfig` with the
+    /// same `id` also exists in `Config.masters` — ambiguous which one should win.
+    #[serde(default)]
+    pub auto_master: Option<AutoMasterConfig>,
+}
+
+/// The auto-generated master's own overridable fields — everything a hand-authored
+/// `MasterTrackConfig` could set, all defaulted so `"auto_master": {}` alone is a complete,
+/// zero-config 1:1 pairing.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct AutoMasterConfig {
+    /// Defaults to the paired bus's own `label` if unset.
+    #[serde(default)]
+    pub label: Option<String>,
     #[serde(default)]
     pub fader_db: f32,
-    /// Which processing stages this bus's chain actually has — see `ChannelTemplate`'s docs
-    /// (`TrackConfig::template`'s sibling; the same stage types apply equally to a bus/master
-    /// insert on a real console).
     #[serde(default)]
     pub template: ChannelTemplate,
 }
 
+/// A master track: a controllable channel strip fed by `master-in` (patch.rs) — see `mixer::MasterTrack`'s
+/// own docs. Same fields `BusConfig` used to carry before the bus/master split, minus `target` (a
+/// master owns no flow — see the plan's §14; patch `master-out:<id>` into an output-grid entry
+/// instead if external visibility is wanted).
+#[derive(Deserialize, Clone, Debug)]
+pub struct MasterTrackConfig {
+    pub id: u32,
+    pub label: String,
+    #[serde(default)]
+    pub channels: Option<u32>,
+    #[serde(default)]
+    pub fader_db: f32,
+    #[serde(default)]
+    pub template: ChannelTemplate,
+}
+
+/// Where an output-grid entry's own MXL flow is created (`OutputGridEntryConfig::target`) — no
+/// longer used by `BusConfig`/`MasterTrackConfig` since neither owns a flow anymore (a bus is a
+/// pure summer, a master's external visibility comes from patching `master-out:<id>` into an
+/// output-grid entry — see the plan's §1/§14).
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum BusTarget {
@@ -252,20 +292,8 @@ pub enum BusTarget {
     /// need to match any other app's convention).
     FlowId(String),
     /// mxl-bridge's packed-TX flow named `packed_tx_name` (IS-08 `packed-tx:<name>`) — writing to
-    /// this bus is how this app feeds mxl-bridge's packed-TX crosspoint (Phase 2 plan §3/§4).
+    /// this output-grid entry is how this app feeds mxl-bridge's packed-TX crosspoint.
     PackedTxName(String),
-}
-
-impl BusConfig {
-    /// Resolves this bus's real MXL flow_id: its explicit `target` if given, otherwise a
-    /// standalone id derived from `instance_name` + this bus's own id (see `BusTarget`'s docs).
-    pub fn resolve_flow_id(&self, instance_name: &str) -> uuid::Uuid {
-        match &self.target {
-            Some(BusTarget::FlowId(s)) => s.parse().unwrap_or_else(|e| panic!("invalid flow_id '{s}': {e}")),
-            Some(BusTarget::PackedTxName(name)) => crate::ids::packed_tx_flow_id(name),
-            None => crate::ids::instance_bus_flow_id(instance_name, self.id),
-        }
-    }
 }
 
 /// One output-grid entry (Milestone 2 of the pickoff-point patch bay plan) -- a receiver-capacity-
@@ -334,8 +362,11 @@ mod entrypoint_tests {
                 {"id": 1, "label": "Track 2", "sends": [{"bus_id": 0}]}
             ],
             "buses": [
-                {"id": 0, "label": "Bus 1", "target": {"packed_tx_name": "testmix2"}},
-                {"id": 1, "label": "Bus 2"}
+                {"id": 0, "label": "Bus 1", "auto_master": {"fader_db": -3.0}},
+                {"id": 1, "label": "Bus 2", "auto_master": {}}
+            ],
+            "output_grid": [
+                {"id": "tx1", "label": "TX 1", "target": {"packed_tx_name": "testmix2"}}
             ]
         })
         .to_string();
@@ -343,7 +374,8 @@ mod entrypoint_tests {
         assert_eq!(cfg.tracks.len(), 2);
         assert_eq!(cfg.buses.len(), 2);
         assert_eq!(cfg.instance_name, "test-pod-1");
-        assert!(cfg.buses[0].target.is_some());
-        assert!(cfg.buses[1].target.is_none());
+        assert!(cfg.buses[0].auto_master.is_some());
+        assert!(cfg.buses[1].auto_master.is_some());
+        assert!(cfg.output_grid[0].target.is_some());
     }
 }

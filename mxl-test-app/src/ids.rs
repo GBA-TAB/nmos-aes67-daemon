@@ -43,36 +43,36 @@ pub fn node_id(instance_name: &str) -> uuid::Uuid {
 pub fn device_id(instance_name: &str) -> uuid::Uuid {
     stable_id(&format!("mxl-test-app-instance-device:{instance_name}"))
 }
-/// A bus's mirrored NMOS Sender id (the Flow's own id is `instance_bus_flow_id`, above — a
-/// Sender is a distinct resource from its Flow).
-pub fn instance_bus_sender_id(instance_name: &str, bus_id: u32) -> uuid::Uuid {
-    stable_id(&format!("mxl-test-app-instance-bus-sender:{instance_name}:{bus_id}"))
-}
-/// A track's mirrored NMOS Receiver id.
-pub fn instance_track_receiver_id(instance_name: &str, track_id: u32) -> uuid::Uuid {
-    stable_id(&format!("mxl-test-app-instance-track-receiver:{instance_name}:{track_id}"))
+
+// Neither a bus nor a master track has NMOS presence of its own (see the plan at
+// ~/.claude/plans/snug-painting-elephant.md §14) -- only grid entries do. There is deliberately no
+// "bus"/"master" id family here anymore; `instance_input_receiver_id`/`instance_output_*` below are
+// the only NMOS-facing ids this app derives.
+
+/// An input-grid entry's own stable NMOS Receiver id — keyed by the entry's own string id (the
+/// input grid's own namespace, `patch.rs`), not by any track. Every input-grid entry gets one,
+/// whether config-seeded with a fixed source or left empty for IS-05 activation.
+pub fn instance_input_receiver_id(instance_name: &str, entry_id: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-test-app-instance-input-receiver:{instance_name}:{entry_id}"))
 }
 
-/// A bus's flow_id when no explicit target is configured (`BusTarget` absent) — derived from an
+/// An output-grid entry's flow_id when no explicit target is configured — derived from an
 /// `instance_name` (e.g. the pod name, so each replica in a container/Kubernetes deployment gets
-/// distinct, but still deterministic/reproducible-across-restarts, bus flow ids) plus the bus's
-/// own id, rather than requiring every containerized instance's config to spell out an explicit
-/// UUID per bus (see docker-entrypoint.sh, which generates config for an arbitrary track/bus count
-/// without computing any ids itself).
-pub fn instance_bus_flow_id(instance_name: &str, bus_id: u32) -> uuid::Uuid {
-    stable_id(&format!("mxl-test-app-instance-bus-flow:{instance_name}:{bus_id}"))
-}
-pub fn instance_bus_source_id(instance_name: &str, bus_id: u32) -> uuid::Uuid {
-    stable_id(&format!("mxl-test-app-instance-bus-source:{instance_name}:{bus_id}"))
-}
-/// An output-grid entry's flow_id when no explicit target is configured — same idea as
-/// `instance_bus_flow_id`, keyed by the entry's own string id (the output grid's own namespace,
-/// `patch.rs`) instead of a bus's numeric one.
+/// distinct, but still deterministic/reproducible-across-restarts, flow ids) plus the entry's own
+/// string id (the output grid's own namespace, `patch.rs`), rather than requiring every
+/// containerized instance's config to spell out an explicit UUID per entry (see
+/// docker-entrypoint.sh, which generates config for an arbitrary count without computing any ids
+/// itself).
 pub fn instance_output_flow_id(instance_name: &str, output_id: &str) -> uuid::Uuid {
     stable_id(&format!("mxl-test-app-instance-output-flow:{instance_name}:{output_id}"))
 }
 pub fn instance_output_source_id(instance_name: &str, output_id: &str) -> uuid::Uuid {
     stable_id(&format!("mxl-test-app-instance-output-source:{instance_name}:{output_id}"))
+}
+/// An output-grid entry's mirrored NMOS Sender id (the Flow's own id is `instance_output_flow_id`,
+/// above — a Sender is a distinct resource from its Flow).
+pub fn instance_output_sender_id(instance_name: &str, output_id: &str) -> uuid::Uuid {
+    stable_id(&format!("mxl-test-app-instance-output-sender:{instance_name}:{output_id}"))
 }
 
 #[cfg(test)]

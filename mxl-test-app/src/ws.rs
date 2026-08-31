@@ -1,10 +1,13 @@
 //! The `amixer` WebSocket protocol, matching the `AudioMixerDashboard` control app exactly (op:
 //! WATCH/PUT from the client, plain `{path, value}` pushed from this server) so that existing
 //! dashboard can drive this app with no changes: paths are `amixer/{mixerId}/{trackKind}/{id}/
-//! {param}` with `trackKind` "channel" for tracks, "sum" for buses, and "output" for the pickoff-
-//! point patch bay's output grid (Milestone 2 — `id` there is a string, not numeric; see
-//! `parse_path`'s docs) — the dashboard also knows "vca"/"aux"/"reverb"/"group" but this app never
-//! populates those, so it simply shows no cards for them, not an error.
+//! {param}` with `trackKind` "channel" for tracks, "sum" for buses (pure summers — just
+//! `input-patch`, no fader/mute/DSP anymore, see the plan at
+//! ~/.claude/plans/snug-painting-elephant.md), "master" for master tracks (everything a bus used to
+//! carry moved here — fader/mute/DSP/`input-patch`), and "output" for the pickoff-point patch bay's
+//! output grid (`id` there is a string, not numeric; see `parse_path`'s docs) — the dashboard also
+//! knows "vca"/"aux"/"reverb"/"group" but this app never populates those, so it simply shows no
+//! cards for them, not an error.
 //!
 //! Meter pushes are on their own timer (`meter_hz`), decoupled from the audio engine's own period
 //! rate (engine.rs) — a real mixer's meter *display* doesn't need updating at audio-block rate
@@ -12,7 +15,12 @@
 //! matches what a human eye actually resolves and what the dashboard's own README already assumes
 //! ("Real-time (30+ FPS)"). The pickoff-point patch bay's `input-grid`/`output-grid` listings
 //! (patch.rs) ride this same timer rather than a separate change-triggered path — see
-//! `run_meter_broadcaster`.
+//! `run_meter_broadcaster`. Every pickoff point has a real meter as of the patch-grid metering
+//! pass (see PICKOFFS.md §4): `channel/{id}/peakmeter` (post-fader, `track-out`) and the new
+//! `channel/{id}/input-meter` (pre-gain, `track-in`); `sum/{id}/peakmeter` (post-fader, `bus-out`)
+//! and `sum/{id}/input-meter` (the bus-in patch's own contribution, distinct from what the tracks'
+//! sends bring); and the new per-entry `input/{id}/peakmeter`/`output/{id}/peakmeter` (the latter
+//! sharing its `output` kind with that entry's existing `patch` control, not a second prefix).
 //!
 //! `input-patch` (both "channel" and "sum") and "output"'s "patch" param are the pickoff-point
 //! patch bay's own params (patch.rs) — not a plain scalar/bool value like the others, but a
@@ -31,7 +39,7 @@ use axum::Router;
 use tokio::sync::broadcast;
 
 use crate::engine::MixerState;
-use crate::mixer::{Bus, Track};
+use crate::mixer::{Bus, MasterTrack, Track};
 
 #[derive(Clone)]
 pub struct WsState {
@@ -72,6 +80,15 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
             // has very few simultaneous clients) — WATCH is accepted but otherwise a no-op.
             "WATCH" => {}
             "PUT" => handle_put(&state, path, cmd.get("value")),
+            // Runtime processing-scale changes (plan at
+            // ~/.claude/plans/snug-painting-elephant.md) -- fully decorrelated from the NMOS-facing
+            // input/output grid, which this op pair never touches at all (see topology.rs's own
+            // module doc comment). Like PUT, a rejected CREATE/DELETE stays silent-with-server-log
+            // (no ack/error envelope -- this protocol has no request/response correlation id at
+            // all to hang one off of); success is still fast to observe via the immediate
+            // channel-list/sum-list/master-list re-publish inside handle_create/handle_delete.
+            "CREATE" => handle_create(&state, path, cmd.get("value")),
+            "DELETE" => handle_delete(&state, path),
             _ => {}
         }
     }
@@ -82,7 +99,12 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
 /// Every bus's `(id, channels)`, for `patch.rs`'s validation calls — those only need a channel
 /// count per bus, not a full `Bus` reference (see `PatchState::set_bus_in`'s docs).
 pub(crate) fn bus_channels(state: &WsState) -> Vec<(u32, usize)> {
-    state.mixer.buses.iter().map(|b| (b.id, b.channels)).collect()
+    state.mixer.buses_snapshot().iter().map(|b| (b.id, b.channels)).collect()
+}
+
+/// Every master's `(id, channels)` — `master_in`'s own equivalent of `bus_channels`.
+pub(crate) fn master_channels(state: &WsState) -> Vec<(u32, usize)> {
+    state.mixer.masters_snapshot().iter().map(|m| (m.id, m.channels)).collect()
 }
 
 fn handle_put(state: &WsState, path: &str, value: Option<&serde_json::Value>) {
@@ -92,17 +114,23 @@ fn handle_put(state: &WsState, path: &str, value: Option<&serde_json::Value>) {
     match kind {
         "channel" => {
             let Ok(id) = id.parse::<u32>() else { return };
-            let Some(track) = state.mixer.tracks.iter().find(|t| t.id == id) else { return };
-            apply_track_param(state, track, param, value);
+            let Some(track) = state.mixer.tracks.lock().unwrap().get(&id).cloned() else { return };
+            apply_track_param(state, &track, param, value);
         }
         "sum" => {
             let Ok(id) = id.parse::<u32>() else { return };
-            let Some(bus) = state.mixer.buses.iter().find(|b| b.id == id) else { return };
-            apply_bus_param(state, bus, param, value);
-            publish(state, path, current_bus_value(state, bus, param));
+            let Some(bus) = state.mixer.buses.lock().unwrap().get(&id).cloned() else { return };
+            apply_bus_param(state, &bus, param, value);
+            publish(state, path, current_bus_value(state, &bus, param));
         }
-        // The pickoff-point patch bay's output grid (Milestone 2) -- `id` here is the output
-        // grid's own string namespace (`patch.rs`), not a numeric track/bus id.
+        "master" => {
+            let Ok(id) = id.parse::<u32>() else { return };
+            let Some(master) = state.mixer.masters.lock().unwrap().get(&id).cloned() else { return };
+            apply_master_param(state, &master, param, value);
+            publish(state, path, current_master_value(state, &master, param));
+        }
+        // The pickoff-point patch bay's output grid -- `id` here is the output grid's own string
+        // namespace (`patch.rs`), not a numeric track/bus/master id.
         "output" => {
             let Some(entry) = state.mixer.output_grid.get(id) else { return };
             if param != "patch" {
@@ -110,9 +138,15 @@ fn handle_put(state: &WsState, path: &str, value: Option<&serde_json::Value>) {
             }
             match crate::patch::PatchState::parse_track_in(value) {
                 Ok(patch) => {
-                    if let Err(e) =
-                        state.mixer.patch.set_output(&state.mixer.tracks, &bus_channels(state), &state.mixer.input_grid, &entry.id, entry.channels, patch)
-                    {
+                    if let Err(e) = state.mixer.patch.set_output(
+                        &state.mixer.tracks_snapshot(),
+                        &bus_channels(state),
+                        &master_channels(state),
+                        &state.mixer.input_grid,
+                        &entry.id,
+                        entry.channels,
+                        patch,
+                    ) {
                         tracing::warn!(output_id = %entry.id, error = %e, "PUT output patch rejected");
                     }
                 }
@@ -122,6 +156,119 @@ fn handle_put(state: &WsState, path: &str, value: Option<&serde_json::Value>) {
         }
         _ => (),
     }
+}
+
+/// `amixer/{mixerId}/{kind}` -- CREATE's own path shape (no id yet, the id lives in the payload).
+fn parse_create_path(path: &str, expected_mixer_id: u32) -> Option<&str> {
+    let mut parts = path.split('/');
+    if parts.next()? != "amixer" {
+        return None;
+    }
+    if parts.next()?.parse::<u32>().ok()? != expected_mixer_id {
+        return None;
+    }
+    let kind = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(kind)
+}
+
+/// `amixer/{mixerId}/{kind}/{id}` -- DELETE's own path shape (no param).
+fn parse_delete_path(path: &str, expected_mixer_id: u32) -> Option<(&str, &str)> {
+    let mut parts = path.split('/');
+    if parts.next()? != "amixer" {
+        return None;
+    }
+    if parts.next()?.parse::<u32>().ok()? != expected_mixer_id {
+        return None;
+    }
+    let kind = parts.next()?;
+    let id = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((kind, id))
+}
+
+/// Creates a new track/bus/master at runtime (`topology.rs`) from a `TrackConfig`/`BusConfig`/
+/// `MasterTrackConfig`-shaped payload — deliberately the *same* struct `config.json`'s own
+/// `tracks[]`/`buses[]`/`masters[]` arrays already deserialize into, so a client CREATEs with the
+/// literal same JSON shape rather than a third, parallel schema.
+fn handle_create(state: &WsState, path: &str, value: Option<&serde_json::Value>) {
+    let Some(value) = value else { return };
+    let Some(kind) = parse_create_path(path, state.mixer_id) else { return };
+    match kind {
+        "channel" => match serde_json::from_value::<crate::config::TrackConfig>(value.clone()) {
+            Ok(cfg) => match crate::topology::create_track(&state.mixer, &cfg) {
+                Ok(_) => publish_lists(state),
+                Err(e) => tracing::warn!(error = %e, "CREATE channel rejected"),
+            },
+            Err(e) => tracing::warn!(error = %e, "CREATE channel: malformed value"),
+        },
+        "sum" => match serde_json::from_value::<crate::config::BusConfig>(value.clone()) {
+            Ok(cfg) => match crate::topology::create_bus(&state.mixer, &cfg) {
+                Ok(_) => publish_lists(state),
+                Err(e) => tracing::warn!(error = %e, "CREATE sum rejected"),
+            },
+            Err(e) => tracing::warn!(error = %e, "CREATE sum: malformed value"),
+        },
+        "master" => match serde_json::from_value::<crate::config::MasterTrackConfig>(value.clone()) {
+            Ok(cfg) => match crate::topology::create_master(&state.mixer, &cfg) {
+                Ok(_) => publish_lists(state),
+                Err(e) => tracing::warn!(error = %e, "CREATE master rejected"),
+            },
+            Err(e) => tracing::warn!(error = %e, "CREATE master: malformed value"),
+        },
+        _ => {}
+    }
+}
+
+fn handle_delete(state: &WsState, path: &str) {
+    let Some((kind, id)) = parse_delete_path(path, state.mixer_id) else { return };
+    let Ok(id) = id.parse::<u32>() else { return };
+    let removed = match kind {
+        "channel" => crate::topology::delete_track(&state.mixer, id).is_some(),
+        "sum" => crate::topology::delete_bus(&state.mixer, id).is_some(),
+        "master" => crate::topology::delete_master(&state.mixer, id).is_some(),
+        _ => false,
+    };
+    if removed {
+        publish_lists(state);
+    }
+}
+
+/// `[{"id","label","channels"}, ...]`, sorted by id — same shape/convention as
+/// `InputGrid::list_json`/`OutputGrid::list_json` (`patch.rs`). Published on `channel-list`/
+/// `sum-list`/`master-list`, both on `run_meter_broadcaster`'s regular tick and immediately after a
+/// successful CREATE/DELETE (`publish_lists`) so a client can actually discover what track/bus/
+/// master ids exist at all — no such mechanism existed before this (only `input-grid`/`output-grid`
+/// got a list broadcast).
+fn tracks_list_json(state: &WsState) -> serde_json::Value {
+    let mut list: Vec<_> =
+        state.mixer.tracks_snapshot().iter().map(|t| serde_json::json!({"id": t.id, "label": t.label, "channels": t.channels})).collect();
+    list.sort_by_key(|v| v["id"].as_u64());
+    serde_json::json!(list)
+}
+
+fn buses_list_json(state: &WsState) -> serde_json::Value {
+    let mut list: Vec<_> =
+        state.mixer.buses_snapshot().iter().map(|b| serde_json::json!({"id": b.id, "label": b.label, "channels": b.channels})).collect();
+    list.sort_by_key(|v| v["id"].as_u64());
+    serde_json::json!(list)
+}
+
+fn masters_list_json(state: &WsState) -> serde_json::Value {
+    let mut list: Vec<_> =
+        state.mixer.masters_snapshot().iter().map(|m| serde_json::json!({"id": m.id, "label": m.label, "channels": m.channels})).collect();
+    list.sort_by_key(|v| v["id"].as_u64());
+    serde_json::json!(list)
+}
+
+fn publish_lists(state: &WsState) {
+    publish(state, &format!("amixer/{}/channel-list", state.mixer_id), tracks_list_json(state));
+    publish(state, &format!("amixer/{}/sum-list", state.mixer_id), buses_list_json(state));
+    publish(state, &format!("amixer/{}/master-list", state.mixer_id), masters_list_json(state));
 }
 
 fn apply_track_param(state: &WsState, track: &Track, param: &str, value: &serde_json::Value) {
@@ -164,9 +311,14 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, value: &serde_
         // flow_id `source` PUT this app used before the patch bay existed.
         "input-patch" => match crate::patch::PatchState::parse_track_in(value) {
             Ok(patch) => {
-                if let Err(e) =
-                    state.mixer.patch.set_track_in(&state.mixer.tracks, &bus_channels(state), &state.mixer.input_grid, track.id, patch)
-                {
+                if let Err(e) = state.mixer.patch.set_track_in(
+                    &state.mixer.tracks_snapshot(),
+                    &bus_channels(state),
+                    &master_channels(state),
+                    &state.mixer.input_grid,
+                    track.id,
+                    patch,
+                ) {
                     tracing::warn!(track_id = track.id, error = %e, "PUT input-patch rejected");
                 }
             }
@@ -186,42 +338,69 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, value: &serde_
     publish(state, &format!("amixer/{}/channel/{}/{param}", state.mixer_id, track.id), current_track_value(state, track, param));
 }
 
+/// A bus is a pure summer now (see `mixer::Bus`'s own docs) -- `input-patch` (`bus-in`) is the only
+/// thing left to PUT here; fader/mute/DSP all moved to `apply_master_param`.
 fn apply_bus_param(state: &WsState, bus: &Bus, param: &str, value: &serde_json::Value) {
+    if param != "input-patch" {
+        return;
+    }
+    match crate::patch::PatchState::parse_bus_in(value) {
+        Ok(patch) => {
+            if let Err(e) = state.mixer.patch.set_bus_in(
+                &state.mixer.tracks_snapshot(),
+                &bus_channels(state),
+                &master_channels(state),
+                &state.mixer.input_grid,
+                bus.id,
+                bus.channels,
+                patch,
+            ) {
+                tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch rejected");
+            }
+        }
+        Err(e) => tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch: malformed value"),
+    }
+}
+
+/// Everything a bus used to carry before the bus/master split moved here — see `mixer::MasterTrack`'s
+/// own docs.
+fn apply_master_param(state: &WsState, master: &MasterTrack, param: &str, value: &serde_json::Value) {
     match param {
         "fader" => {
             if let Some(v) = value.as_f64() {
-                *bus.fader_db.lock().unwrap() = v as f32;
+                *master.fader_db.lock().unwrap() = v as f32;
             }
         }
         "mute" => {
             if let Some(v) = value.as_bool() {
-                bus.mute.store(v, Ordering::Relaxed);
+                master.mute.store(v, Ordering::Relaxed);
             }
         }
-        // Same idea as the track side's "input-patch", but summing (bus-in is an *additional* feed
-        // alongside tracks' own `sends` -- see patch.rs module docs): each channel is an *array*
-        // of `{"source",...,"channel"}` objects, not a single one.
-        "input-patch" => match crate::patch::PatchState::parse_bus_in(value) {
+        // Same idea as the track/bus side's "input-patch", but summing (master-in is this master's
+        // *only* input mechanism -- see patch.rs module docs): each channel is an *array* of
+        // `{"source",...,"channel"}` objects, not a single one.
+        "input-patch" => match crate::patch::PatchState::parse_master_in(value) {
             Ok(patch) => {
-                if let Err(e) = state.mixer.patch.set_bus_in(
-                    &state.mixer.tracks,
+                if let Err(e) = state.mixer.patch.set_master_in(
+                    &state.mixer.tracks_snapshot(),
                     &bus_channels(state),
+                    &master_channels(state),
                     &state.mixer.input_grid,
-                    bus.id,
-                    bus.channels,
+                    master.id,
+                    master.channels,
                     patch,
                 ) {
-                    tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch rejected");
+                    tracing::warn!(master_id = master.id, error = %e, "PUT input-patch rejected");
                 }
             }
-            Err(e) => tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch: malformed value"),
+            Err(e) => tracing::warn!(master_id = master.id, error = %e, "PUT input-patch: malformed value"),
         },
-        "filter" => reject_if_err(apply_filter(&bus.filter, value), "bus", bus.id, "filter"),
-        "eq" => reject_if_err(apply_eq(&bus.eq, value), "bus", bus.id, "eq"),
-        "dyn1" => reject_if_err(apply_dynamics(&bus.dyn1, value), "bus", bus.id, "dyn1"),
-        "dyn2" => reject_if_err(apply_dynamics(&bus.dyn2, value), "bus", bus.id, "dyn2"),
-        "phase" => reject_if_err(apply_phase(&bus.phase, value), "bus", bus.id, "phase"),
-        "delay" => reject_if_err(apply_delay(&bus.delay, value), "bus", bus.id, "delay"),
+        "filter" => reject_if_err(apply_filter(&master.filter, value), "master", master.id, "filter"),
+        "eq" => reject_if_err(apply_eq(&master.eq, value), "master", master.id, "eq"),
+        "dyn1" => reject_if_err(apply_dynamics(&master.dyn1, value), "master", master.id, "dyn1"),
+        "dyn2" => reject_if_err(apply_dynamics(&master.dyn2, value), "master", master.id, "dyn2"),
+        "phase" => reject_if_err(apply_phase(&master.phase, value), "master", master.id, "phase"),
+        "delay" => reject_if_err(apply_delay(&master.delay, value), "master", master.id, "delay"),
         _ => {}
     }
 }
@@ -425,15 +604,22 @@ pub(crate) fn parse_sends(value: &serde_json::Value) -> Result<Vec<crate::mixer:
 
 fn current_bus_value(state: &WsState, bus: &Bus, param: &str) -> serde_json::Value {
     match param {
-        "fader" => serde_json::json!(*bus.fader_db.lock().unwrap()),
-        "mute" => serde_json::json!(bus.mute.load(Ordering::Relaxed)),
         "input-patch" => state.mixer.patch.bus_in_json(bus.id, bus.channels),
-        "filter" => filter_json(&bus.filter),
-        "eq" => eq_json(&bus.eq),
-        "dyn1" => dynamics_json(&bus.dyn1),
-        "dyn2" => dynamics_json(&bus.dyn2),
-        "phase" => phase_json(&bus.phase),
-        "delay" => delay_json(&bus.delay),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn current_master_value(state: &WsState, master: &MasterTrack, param: &str) -> serde_json::Value {
+    match param {
+        "fader" => serde_json::json!(*master.fader_db.lock().unwrap()),
+        "mute" => serde_json::json!(master.mute.load(Ordering::Relaxed)),
+        "input-patch" => state.mixer.patch.master_in_json(master.id, master.channels),
+        "filter" => filter_json(&master.filter),
+        "eq" => eq_json(&master.eq),
+        "dyn1" => dynamics_json(&master.dyn1),
+        "dyn2" => dynamics_json(&master.dyn2),
+        "phase" => phase_json(&master.phase),
+        "delay" => delay_json(&master.delay),
         _ => serde_json::Value::Null,
     }
 }
@@ -479,9 +665,10 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
     let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / hz));
     loop {
         interval.tick().await;
-        for track in &state.mixer.tracks {
+        for track in &state.mixer.tracks_snapshot() {
             let base = format!("amixer/{}/channel/{}", state.mixer_id, track.id);
             publish(&state, &format!("{base}/peakmeter"), serde_json::json!(*track.meter_db.lock().unwrap()));
+            publish(&state, &format!("{base}/input-meter"), serde_json::json!(*track.input_meter_db.lock().unwrap()));
             publish(&state, &format!("{base}/sends"), sends_json(track));
             publish(&state, &format!("{base}/filter"), filter_json(&track.filter));
             publish(&state, &format!("{base}/eq"), eq_json(&track.eq));
@@ -490,18 +677,50 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
             publish(&state, &format!("{base}/phase"), phase_json(&track.phase));
             publish(&state, &format!("{base}/delay"), delay_json(&track.delay));
         }
-        for bus in &state.mixer.buses {
+        for bus in &state.mixer.buses_snapshot() {
+            // A bus is a pure summer now -- just its two meters, no fader/DSP pushes (see
+            // mixer::Bus's own docs).
             let base = format!("amixer/{}/sum/{}", state.mixer_id, bus.id);
             publish(&state, &format!("{base}/peakmeter"), serde_json::json!(*bus.meter_db.lock().unwrap()));
-            publish(&state, &format!("{base}/filter"), filter_json(&bus.filter));
-            publish(&state, &format!("{base}/eq"), eq_json(&bus.eq));
-            publish(&state, &format!("{base}/dyn1"), dynamics_json(&bus.dyn1));
-            publish(&state, &format!("{base}/dyn2"), dynamics_json(&bus.dyn2));
-            publish(&state, &format!("{base}/phase"), phase_json(&bus.phase));
-            publish(&state, &format!("{base}/delay"), delay_json(&bus.delay));
+            publish(&state, &format!("{base}/input-meter"), serde_json::json!(*bus.input_meter_db.lock().unwrap()));
         }
+        for master in &state.mixer.masters_snapshot() {
+            let base = format!("amixer/{}/master/{}", state.mixer_id, master.id);
+            publish(&state, &format!("{base}/peakmeter"), serde_json::json!(*master.meter_db.lock().unwrap()));
+            publish(&state, &format!("{base}/input-meter"), serde_json::json!(*master.input_meter_db.lock().unwrap()));
+            publish(&state, &format!("{base}/filter"), filter_json(&master.filter));
+            publish(&state, &format!("{base}/eq"), eq_json(&master.eq));
+            publish(&state, &format!("{base}/dyn1"), dynamics_json(&master.dyn1));
+            publish(&state, &format!("{base}/dyn2"), dynamics_json(&master.dyn2));
+            publish(&state, &format!("{base}/phase"), phase_json(&master.phase));
+            publish(&state, &format!("{base}/delay"), delay_json(&master.delay));
+        }
+        // channel-list/sum-list/master-list: how a client discovers what track/bus/master ids
+        // exist at all (topology.rs's CREATE/DELETE also re-publish these immediately on success,
+        // via publish_lists -- this tick is the steady-state/newly-connected-client path).
+        publish_lists(&state);
         publish(&state, &format!("amixer/{}/input-grid", state.mixer_id), state.mixer.input_grid.list_json());
         publish(&state, &format!("amixer/{}/output-grid", state.mixer_id), state.mixer.output_grid.list_json());
+        // input:<id>/output:<id>'s own pickoff meters -- namespaced per-entry the same way
+        // channel/sum meters are, rather than folded into the list_json() pushes above, since a
+        // meter updates every tick regardless of whether the entry list itself has changed. Kind
+        // "output" here matches the existing per-entry "output"/patch control exactly (not a second
+        // "output-grid" prefix for the same resources); "input" is the input-grid's own equivalent,
+        // newly introduced here since no per-entry input-grid control existed before this.
+        for entry in state.mixer.input_grid.snapshot() {
+            publish(
+                &state,
+                &format!("amixer/{}/input/{}/peakmeter", state.mixer_id, entry.id),
+                serde_json::json!(*entry.meter_db.lock().unwrap()),
+            );
+        }
+        for entry in state.mixer.output_grid.snapshot() {
+            publish(
+                &state,
+                &format!("amixer/{}/output/{}/peakmeter", state.mixer_id, entry.id),
+                serde_json::json!(*entry.meter_db.lock().unwrap()),
+            );
+        }
     }
 }
 

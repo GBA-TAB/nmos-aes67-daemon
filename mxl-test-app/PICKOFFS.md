@@ -10,12 +10,19 @@ scratch — see each section for which document informed which part.
 Two vocabularies stay deliberately separate, per the plan at
 `~/.claude/plans/snug-painting-elephant.md`:
 
-- **Pickoff point**: a position in a track's or bus's own signal chain (`mixer.rs`, `dsp.rs`) —
-  owned by that Track/Bus object, presented on its own channel strip.
+- **Pickoff point**: a position in a track's, bus's, or master's own signal chain (`mixer.rs`,
+  `dsp.rs`) — owned by that Track/Bus/MasterTrack object, presented on its own channel strip (a
+  bus has no strip of its own — see §2).
 - **Grid point**: a source or destination in the pickoff-point patch bay's crosspoint (`patch.rs`)
-  — the input grid, the output grid, `track-in`, `bus-in`. A pickoff point (`track-out`, `bus-out`)
-  can also *be* a grid source, but the grid itself is a separate object, not part of the Track/Bus
-  struct.
+  — the input grid, the output grid, `track-in`, `bus-in`, `master-in`. A pickoff point
+  (`track-out`, `bus-out`, `master-out`) can also *be* a grid source, but the grid itself is a
+  separate object, not part of the Track/Bus/MasterTrack struct.
+
+**The grid is the only NMOS-facing boundary** (bus/master-decorrelation pass, see §5): an
+`input:<id>` entry is the sole thing that gets an IS-05 Receiver, an `output:<id>` entry is the
+sole thing that gets an IS-04 Source+Flow+Sender. `Track`/`Bus`/`MasterTrack` are never themselves
+NMOS-visible — a bus's or master's own signal only reaches the outside world if/when someone
+explicitly patches it into an output-grid entry.
 
 ## 1. Track (input strip) structure
 
@@ -55,48 +62,75 @@ input-patch (track-in, grid destination)
 - A track's contribution to a bus only ever happens through its own `sends` (`mixer::Send`) —
   never automatic, always an explicit send entry.
 
-## 2. Bus (output strip) structure
+## 2. Bus (pure summer) structure
 
 ```
 sends (from any track)  +  bus-in (grid destination, summing)
+        |
+        v
+  bus-out pickoff (grid source)
+```
+
+- A bus is deliberately *not* a controllable channel strip — no fader, no mute, no processing
+  chain, no gain, no solo, and owns no real MXL flow or NMOS presence of its own. `bus-out` is
+  simply the raw sum; it's `MasterTrack` (§2b) that carries everything a bus used to (fader/DSP),
+  fed via `master-in`. See the plan at `~/.claude/plans/snug-painting-elephant.md` §1/§3 for why —
+  in short: patch `bus-out:<id>` into an output-grid entry (or a master) if a real destination is
+  ever wanted, rather than every bus permanently owning a flow whether or not anything's listening.
+- `bus-out` is the *only* bus pickoff point.
+
+## 2b. Master track (controllable output strip) structure
+
+```
+master-in (grid destination, summing — from bus-out, track-out, master-out, or input-grid)
         |
         v
    [filter] [eq] [dyn1] [dyn2] [phase] [delay]   (FullChannel template only, same as tracks)
         |
       fader
         |
-      mute  --------------------------------------> bus-out pickoff (grid source)
-        |
-  bus's own real MXL flow (always-on, unconditional write every period)
+      mute  --------------------------------------> master-out pickoff (grid source)
 ```
 
-- A bus has no `gain` and no `solo` (never did, and buses never gained processing-stage
-  entry points in `dsp.rs` — beyond the same `Option<Stage>` fields tracks got, both driven by the
-  same `ChannelTemplate`).
-- `bus-out` is the *only* bus pickoff point — there's no separate pre/post-fader distinction for
-  buses (a bus has no upstream "gain" stage the way a track does, and its own `Send`-style
-  processing-stage taps aren't modeled — everything a bus does happens after summing, in one
-  chain).
+- A master has no `gain` and no `solo` (same as a bus never did).
+- `master-out` is the *only* master pickoff point — same reasoning as `bus-out`.
+- On a small mixer, one master is auto-paired 1:1 with each bus (`BusConfig.auto_master`,
+  config.rs) — `master-in` is pre-patched to that bus's own `bus-out`, channel-for-channel,
+  reproducing the fused bus/master behavior this app had before the decorrelation pass. On a bigger
+  system, master count is fully decorrelated from bus count (more buses than masters, more masters
+  than buses, one master fed by several buses, or masters cascaded into each other — all patched
+  explicitly via `master-in`).
+- A master owns no MXL flow or NMOS presence of its own either (§1) — patch `master-out:<id>` into
+  an output-grid entry to make a specific master's signal externally visible.
 
 ## 3. Grid points (the pickoff-point patch bay, `patch.rs`)
 
 | Grid point | Kind | Wire id | Present when |
 |---|---|---|---|
-| Input grid entry | source | `input:<entry_id>` | Always (config-seeded, `Config.input_grid`) or discovered (Milestone 3, `nmos/discovery.rs`, id `registry:<sender_id>`) or IS-05-synthesized (`nmos/server.rs`, id `recv:<track_id>`) |
+| Input grid entry | source | `input:<entry_id>` | Always (config-seeded, `Config.input_grid`, or `INPUT_GRID_COUNT`-generated) or discovered (`nmos/discovery.rs`, id `registry:<sender_id>`) |
 | Track direct-out | source | `track-out:<track_id>` | Every track, always (`Track.direct_out_prev`) |
 | Bus output | source | `bus-out:<bus_id>` | Every bus, always (`Bus.output_prev`) |
+| Master output | source | `master-out:<master_id>` | Every master, always (`MasterTrack.output_prev`) |
 | Track input | destination, exclusive | `track-in:<track_id>` (implicit — addressed by the track's own `input-patch` param, not a wire id of its own) | Every track, always |
 | Bus input | destination, summing | `bus-in:<bus_id>` (implicit — addressed by the bus's own `input-patch` param) | Every bus, always |
-| Output grid entry | destination, exclusive | `output:<entry_id>` (implicit — addressed by that entry's own `patch` param) | Only if `Config.output_grid` configures it (Milestone 2) |
+| Master input | destination, summing | `master-in:<master_id>` (implicit — addressed by the master's own `input-patch` param) | Every master, always |
+| Output grid entry | destination, exclusive | `output:<entry_id>` (implicit — addressed by that entry's own `patch` param) | Config-seeded (`Config.output_grid`) or `OUTPUT_GRID_COUNT`-generated |
 
 Self-loop rule: a track cannot patch its own `track-out:<id>` into its own `track-in:<id>`
-(rejected). A bus patching its own `bus-out:<id>` into its own `bus-in:<id>` is allowed (a benign
-one-period-delayed loop, not a same-period cycle — see `engine.rs`'s pipeline docs).
+(rejected — the one exclusive-destination case this applies to). A bus patching its own
+`bus-out:<id>` into its own `bus-in:<id>`, or a master patching its own `master-out:<id>` into its
+own `master-in:<id>`, is allowed (a benign one-period-delayed loop, not a same-period cycle — see
+`engine.rs`'s pipeline docs) — both are summing destinations, where a same-resource self-feed
+behaves like patching a real console insert-return into its own insert-send, which real patchbays
+don't prevent either.
 
-Evaluation order (why nothing here ever needs cycle detection): `track-in`/`bus-in` always resolve
-a `track-out`/`bus-out` source from the *previous* period; `output:` (the pipeline's terminal
-stage) always resolves *this* period's values. See `engine.rs`'s module doc for the exact 6-step
-per-period order.
+Evaluation order (why nothing here ever needs cycle detection): `track-in`/`bus-in`/`master-in`
+always resolve a `track-out`/`bus-out`/`master-out` source from the *previous* period when that
+source is itself a track/bus/master processed later in the same period's pipeline (concretely:
+`master-in` may read *this* period's `track-out`/`bus-out` since tracks/buses finish earlier, but
+always the *previous* period's `master-out`, even for another master processed earlier in the same
+loop); `output:` (the pipeline's terminal stage) always resolves *this* period's values for all
+three. See `engine.rs`'s module doc for the exact per-period order.
 
 ## 4. Generated WebSocket control surface (`amixer/{mixerId}/...`, `ws.rs`)
 
@@ -106,6 +140,15 @@ per-period order.
 |---|---|---|
 | `input-grid` | push only | `[{"id","label","channels"}, ...]` |
 | `output-grid` | push only | `[{"id","label","channels"}, ...]` |
+| `channel-list` | push only | `[{"id","label","channels"}, ...]`, sorted by id — every track that currently exists (see the `CREATE`/`DELETE` section below) |
+| `sum-list` | push only | same shape, every bus |
+| `master-list` | push only | same shape, every master |
+
+### `input/<entry_id>/...` (per input-grid entry — `entry_id` is a string)
+
+| Param | Value shape | Notes |
+|---|---|---|
+| `peakmeter` | `[number\|null, ...]` | push only (`meter_hz`) — `input:<id>`'s own pickoff meter, one entry per that entry's channel. No PUT-able param exists here over the WS protocol — an entry's own reader is opened/closed via its NMOS Receiver (IS-05 `PATCH .../receivers/<id>/staged`, `nmos/server.rs::receiver_patch`), not a WS param; routing an active entry to a track/bus/master is a separate step, over the ordinary `input-patch` params below. |
 
 ### `channel/<track_id>/...` (every track)
 
@@ -115,7 +158,8 @@ per-period order.
 | `fader` | number (dB) | |
 | `mute` | bool | |
 | `solo` | bool | |
-| `peakmeter` | `[number\|null, ...]` | push only (`meter_hz`), one entry per track channel |
+| `peakmeter` | `[number\|null, ...]` | push only (`meter_hz`), one entry per track channel — post-fader, `track-out:<id>`'s own pickoff meter |
+| `input-meter` | `[number\|null, ...]` | push only — pre-gain, `track-in:<id>`'s own pickoff meter (what this track's own input-patch actually delivered this period, independent of gain/fader/mute) |
 | `sends` | `[{"bus_id","on","level_db","pickoff":"pre_fader"\|"post_fader"}, ...]` | full-array replace |
 | `input-patch` | `[{"source","channel"}\|null, ...]` | one entry per track channel, exclusive |
 | `filter` | `{"on","hp_hz","lp_hz"}` or `null` | `null`/rejected if template is `Simple` |
@@ -124,24 +168,65 @@ per-period order.
 | `phase` | `{"invert"}` or `null` | same |
 | `delay` | `{"on","delay_ms"}` or `null` | same |
 
-### `sum/<bus_id>/...` (every bus)
+### `sum/<bus_id>/...` (every bus — a pure summer, see §2)
+
+| Param | Value shape | Notes |
+|---|---|---|
+| `peakmeter` | `[number\|null, ...]` | push only — `bus-out:<id>`'s own pickoff meter, the raw sum (no fader exists to distinguish a separate "post-fader" reading from) |
+| `input-meter` | `[number\|null, ...]` | push only — this bus's `bus-in:<id>` patch's own contribution *only*, measured before it's summed with tracks' own `sends` (see `engine.rs` step 4); not the same signal `peakmeter` reports |
+| `input-patch` | `[[{"source","channel"}, ...], ...]` | one array per bus channel, summing |
+
+No `gain`, no `solo`, no `fader`, no `mute`, no DSP stages — a bus carries none of those (see §2);
+everything that used to live here moved to `master/<master_id>/...`, below.
+
+### `master/<master_id>/...` (every master track — see §2b)
 
 | Param | Value shape | Notes |
 |---|---|---|
 | `fader` | number (dB) | |
 | `mute` | bool | |
-| `peakmeter` | `[number\|null, ...]` | push only |
-| `input-patch` | `[[{"source","channel"}, ...], ...]` | one array per bus channel, summing |
+| `peakmeter` | `[number\|null, ...]` | push only — post-fader, `master-out:<id>`'s own pickoff meter |
+| `input-meter` | `[number\|null, ...]` | push only — `master-in:<id>`'s own pickoff meter (this master's only input mechanism, no separate "sends"-style second contributor the way a bus has) |
+| `input-patch` | `[[{"source","channel"}, ...], ...]` | one array per master channel, summing |
 | `filter`, `eq`, `dyn1`, `dyn2`, `phase`, `delay` | same shapes as tracks | `null`/rejected if template is `Simple` |
 
-No `gain`, no `solo` — buses never had either.
+No `gain`, no `solo` — a master never had either (same as a bus never did).
 
-### `output/<output_id>/...` (only if `Config.output_grid` configures entries — `output_id` is a
-string, not numeric)
+### `output/<output_id>/...` (config-seeded, `Config.output_grid`, or `OUTPUT_GRID_COUNT`-generated
+— `output_id` is a string, not numeric — see §1: the *only* thing that gets a real NMOS
+Source+Flow+Sender)
 
-| Param | Value shape |
-|---|---|
-| `patch` | `[{"source","channel"}\|null, ...]`, one entry per output-grid entry's channel, exclusive |
+| Param | Value shape | Notes |
+|---|---|---|
+| `patch` | `[{"source","channel"}\|null, ...]` | one entry per output-grid entry's channel, exclusive |
+| `peakmeter` | `[number\|null, ...]` | push only (`meter_hz`) — `output:<id>`'s own pickoff meter |
+
+### Runtime topology: `CREATE`/`DELETE` (tracks/buses/masters only — never the grid)
+
+New `op` values alongside `WATCH`/`PUT`, for changing the mixer's *processing scale* live while it's
+running — deliberately decorrelated from the input/output grid's own sizing (`INPUT_GRID_COUNT`/
+`OUTPUT_GRID_COUNT`, still config/env-only, still fixed for the process's lifetime — see §1). Full
+design rationale: `~/.claude/plans/snug-painting-elephant.md`; see §5's own bullet below for a
+summary.
+
+| op | Path | Value | Notes |
+|---|---|---|---|
+| `CREATE` | `amixer/{mixerId}/channel`, `/sum`, or `/master` | `TrackConfig`\|`BusConfig`\|`MasterTrackConfig`-shaped | id is client-supplied, inside the payload — reuses the *exact* JSON shape `config.json`'s own `tracks[]`/`buses[]`/`masters[]` arrays already use, not a third schema |
+| `DELETE` | `amixer/{mixerId}/channel/{id}`, `/sum/{id}`, or `/master/{id}` | none | — |
+
+Both silent-on-failure, server-log only — same convention as every existing `PUT`, no new ack/error
+envelope (this protocol has no request/response correlation id to hang one off of). Both re-publish
+`channel-list`/`sum-list`/`master-list` immediately on success, on top of those lists' own regular
+`meter_hz` tick — success is fast to observe without a new mechanism.
+
+`CREATE` rejects only an id already in use or a payload that fails to deserialize; a track's `sends`
+referencing an incompatible-channel or nonexistent bus *warns*, matching `main.rs`'s own existing
+startup-time behavior rather than introducing a stricter runtime-only rule. `DELETE` actively scrubs
+every other resource's dangling reference to the deleted id (`patch.rs`'s `scrub_*_references`) —
+not required for crash-safety (a reference to a permanently-gone id already resolves to silence
+forever) but required because `DELETE` makes **id reuse** a new, live event: without scrubbing, a
+stale `Send`/patch entry left over from before the delete could silently "reconnect" to an unrelated
+new resource later `CREATE`d with the same client-chosen id.
 
 ## 5. Iteration history
 
@@ -160,6 +245,55 @@ string, not numeric)
   both `Track` and `Bus`, gated by the new `ChannelTemplate` (`Simple`/`FullChannel`) — structural
   placeholders (no signal effect yet), confirmed with the user before building rather than assumed.
 - **Live-state persistence**: `persistence.rs` — see §6 below.
+- **Pickoff metering completeness**: before this pass, only `track-out`/`bus-out` had a real meter
+  (`Track.meter_db`/`Bus.meter_db`, reused from before the patch bay existed at all). The other 4 of
+  6 pickoff kinds had none — driven by the patch-grid view's own design needing a live signal
+  reading on every source/destination it presents, not just the two that happened to have one
+  already. Added: `InputGridEntry.meter_db` (`input:<id>`, peaked in `engine.rs` step 1 where each
+  entry is read), `Track.input_meter_db` (`track-in:<id>`, peaked in step 3 right after
+  `resolve_track_in`, before gain), `Bus.input_meter_db` (`bus-in:<id>`, the one structural change —
+  `resolve_bus_in` now resolves into its own scratch buffer in step 4, peaked there, *then* mixed
+  into the shared sends accumulator, since once summed the two contributions aren't separable), and
+  `OutputGridEntry.meter_db` (`output:<id>`, peaked in step 6 right after `resolve_output`). All four
+  ride the same `meter_hz` broadcaster tick as the existing meters (`channel/<id>/input-meter`,
+  `sum/<id>/input-meter`, `input/<id>/peakmeter`, `output/<id>/peakmeter` — see §4).
+- **Bus/master decorrelation** (`~/.claude/plans/snug-painting-elephant.md`): split the old fused
+  `Bus` (summer + controllable strip + its own MXL flow + NMOS Sender) into a pure-summer `Bus`
+  (§2) and a new `MasterTrack` (§2b, everything `Bus` lost) — decorrelates bus count from
+  "controllable master strip" count (more buses than masters, more masters than buses, a master fed
+  by several buses, masters cascaded into each other). New `master-in`/`master-out` grid kinds
+  (§3), new `master/<id>/...` WS surface (§4). Alongside this, the input/output grid became the
+  *only* NMOS-facing surface (§1): `Track`'s old per-track Receiver and the ephemeral
+  `"recv:<track_id>"` input-grid-entry-synthesis-on-activation mechanism are both gone, replaced by
+  every input-grid entry carrying its own stable Receiver from the start (`INPUT_GRID_COUNT`/
+  config-sized, decorrelated from track count), and the output grid gaining real IS-04/IS-05
+  mirroring it never had before (`OUTPUT_GRID_COUNT`-sized, decorrelated from bus/master count).
+  IS-05 receiver activation (`nmos/server.rs::receiver_patch`) no longer touches any patch as a
+  side effect — activating an input and routing it to a track/bus/master are now two fully
+  independent steps.
+- **Runtime topology `CREATE`/`DELETE`** (`~/.claude/plans/snug-painting-elephant.md`): before this,
+  the mixer's own processing scale (track/bus/master count) was fixed at startup from `Config`,
+  requiring a full process restart to change — decorrelated in principle from the input/output
+  grid's own sizing, but in practice just as static. Added live `CREATE`/`DELETE` (§4) backed by an
+  engine rework: `MixerState.tracks`/`buses`/`masters` changed from immutable `Vec<Arc<T>>` to
+  `Mutex<HashMap<u32, Arc<T>>>` (the same shape `patch::InputGrid`/`OutputGrid` already used, already
+  proven safe for concurrent runtime mutation via `nmos/discovery.rs`'s own insert/remove). The
+  real-time engine loop (`engine.rs::run`) splits into two tiers: id→`Arc<T>` snapshots refresh every
+  period unconditionally (cheap `Arc` clones, matching the grid's own `.snapshot()` pattern already
+  in the loop), while the `f32` sample scratch buffers — the allocations actually worth not paying
+  every period — are keyed by id (not position) and only rebuilt when a new `topology_generation`
+  counter (bumped on every create/delete) has changed since the scratch was last checked, tolerating
+  a changing track/bus/master count without a per-period allocation. `Track`/`Bus`/`MasterTrack`
+  gained `dynamically_created`/`template` fields so persistence (§6) can tell a `CREATE`d resource
+  apart from a config-authored one and reconstruct it faithfully on restart. New `channel-list`/
+  `sum-list`/`master-list` broadcasts close a real pre-existing gap: there was previously no way for
+  a client to discover what track/bus/master ids exist at all.
+- **Gatherer** (deferred — design sketch only, see the plan's §15, not implemented): a *separate*
+  future app, not a change to this one, for bundling several independently-produced narrow MXL
+  flows into one wide flow (SMPTE 2110-30-style stream consolidation) — reads N existing flows,
+  writes one new flow it alone owns, needing no new capability in `flow.rs`. Ties into the existing
+  `PackedTxName`/`packed_tx_flow_id` convention already in `config.rs`/`ids.rs`: the gatherer would
+  be what actually *produces* a well-known `packed-tx:<name>` flow from several sources.
 
 ## 6. Persistence and redundancy
 
@@ -174,6 +308,15 @@ live state and JSON.
 - **On startup**: if `state_path` is set and a file already exists there, it's loaded and applied
   on top of the config-built tracks/buses, before the engine thread starts. A brand-new deployment
   (no file yet) just proceeds with config defaults, silently.
+- **Runtime-`CREATE`d topology**: the saved file also carries a `"topology"` section — enough of
+  each `dynamically_created` track/bus/master (id/label/channels/template/sends/current values) to
+  reconstruct it via the same `TrackConfig`/`BusConfig`/`MasterTrackConfig` shape `CREATE`'s own
+  payload uses. On startup this is applied *before* the ordinary value-resume step above — a
+  resource has to already exist in the live collection for a resumed value to have anywhere to go,
+  so reversing that order would silently strand every `CREATE`d id's resumed values with zero
+  compiler signal (a dedicated regression test protects this ordering, `persistence.rs`).
+  Config-authored tracks/buses/masters are never written here — only ones that didn't come from
+  `Config` in the first place.
 - **While running**: saved every 5s (bounds staleness if the process is ever killed
   ungracefully) and once more, synchronously, on receiving SIGTERM — which is what Kubernetes sends
   (and waits `terminationGracePeriodSeconds` before SIGKILL) when a `livenessProbe` failure
@@ -190,10 +333,11 @@ live state and JSON.
   connection* health — link/connection/sync/essence status for NMOS Receivers/Senders — nothing
   for MXL resources specifically, and nothing at the container/process level. "Should this
   container be replaced" is answered by Kubernetes' own liveness probe, not by anything in the
-  NMOS/BCP-008 layer. A future BCP-008-01/02 implementation on this app's own mirrored bus-Senders/
-  track-Receivers (mirroring the sibling `aes67-linux-daemon`'s existing precedent) would be a
-  useful, narrower signal — "is this specific patch/send connected and clean" — layered on top of,
-  not instead of, the container-health mechanism above.
+  NMOS/BCP-008 layer. A future BCP-008-01/02 implementation on this app's own mirrored output-grid
+  Senders/input-grid Receivers (the only NMOS-visible resources — see §1; mirroring the sibling
+  `aes67-linux-daemon`'s existing precedent) would be a useful, narrower signal — "is this specific
+  patch/send connected and clean" — layered on top of, not instead of, the container-health
+  mechanism above.
 - **What this is not (yet)**: active-active hot failover (two replicas live simultaneously, an
   instant handoff with no resume delay) needs a shared external store (etcd/Redis) with real
   conflict resolution between concurrent writers — a materially bigger architecture than the

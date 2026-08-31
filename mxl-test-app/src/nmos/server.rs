@@ -61,10 +61,10 @@ async fn node_self(State(state): State<S>) -> Json<serde_json::Value> {
 }
 
 fn all_sender_ids(state: &NmosState) -> Vec<uuid::Uuid> {
-    state.bus_ids.values().map(|b| b.sender_id).collect()
+    state.output_ids.values().map(|o| o.sender_id).collect()
 }
 fn all_receiver_ids(state: &NmosState) -> Vec<uuid::Uuid> {
-    state.track_receiver_ids.values().copied().collect()
+    state.mixer.input_grid.snapshot().iter().map(|e| e.receiver_id).collect()
 }
 
 async fn devices_list(State(state): State<S>) -> Json<serde_json::Value> {
@@ -99,17 +99,18 @@ async fn device_get(State(state): State<S>, Path(id): Path<String>) -> axum::res
 async fn sources_list(State(state): State<S>) -> Json<serde_json::Value> {
     let list: Vec<_> = state
         .mixer
-        .buses
+        .output_grid
+        .snapshot()
         .iter()
-        .map(|b| resources::source_json(&state.cfg, state.device_id, b, state.bus_ids[&b.id].source_id, &state.version()))
+        .map(|e| resources::source_json(&state.cfg, state.device_id, e, state.output_ids[&e.id].source_id, &state.version()))
         .collect();
     Json(serde_json::json!(list))
 }
 
 async fn source_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    match state.mixer.buses.iter().find(|b| state.bus_ids[&b.id].source_id.to_string() == id) {
-        Some(b) => {
-            Json(resources::source_json(&state.cfg, state.device_id, b, state.bus_ids[&b.id].source_id, &state.version()))
+    match state.mixer.output_grid.snapshot().into_iter().find(|e| state.output_ids[&e.id].source_id.to_string() == id) {
+        Some(e) => {
+            Json(resources::source_json(&state.cfg, state.device_id, &e, state.output_ids[&e.id].source_id, &state.version()))
                 .into_response()
         }
         None => not_found(),
@@ -119,16 +120,17 @@ async fn source_get(State(state): State<S>, Path(id): Path<String>) -> axum::res
 async fn flows_list(State(state): State<S>) -> Json<serde_json::Value> {
     let list: Vec<_> = state
         .mixer
-        .buses
+        .output_grid
+        .snapshot()
         .iter()
-        .map(|b| resources::flow_json(&state.cfg, state.device_id, b, state.bus_ids[&b.id].source_id, b.flow_id, &state.version()))
+        .map(|e| resources::flow_json(&state.cfg, state.device_id, e, state.output_ids[&e.id].source_id, e.flow_id, &state.version()))
         .collect();
     Json(serde_json::json!(list))
 }
 
 async fn flow_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    match state.mixer.buses.iter().find(|b| b.flow_id.to_string() == id) {
-        Some(b) => Json(resources::flow_json(&state.cfg, state.device_id, b, state.bus_ids[&b.id].source_id, b.flow_id, &state.version()))
+    match state.mixer.output_grid.snapshot().into_iter().find(|e| e.flow_id.to_string() == id) {
+        Some(e) => Json(resources::flow_json(&state.cfg, state.device_id, &e, state.output_ids[&e.id].source_id, e.flow_id, &state.version()))
             .into_response(),
         None => not_found(),
     }
@@ -138,22 +140,22 @@ async fn sender_ids(State(state): State<S>) -> Json<serde_json::Value> {
     Json(serde_json::json!(all_sender_ids(&state).iter().map(|id| format!("{id}/")).collect::<Vec<_>>()))
 }
 
-fn sender_json_for(state: &NmosState, ip: &str, b: &crate::mixer::Bus) -> serde_json::Value {
-    let ids = &state.bus_ids[&b.id];
-    let receiver_id = b.receiver_id.lock().unwrap().clone();
-    resources::sender_json(&state.cfg, ip, state.device_id, b, ids.sender_id, b.flow_id, receiver_id, &state.version())
+fn sender_json_for(state: &NmosState, ip: &str, entry: &crate::patch::OutputGridEntry) -> serde_json::Value {
+    let ids = &state.output_ids[&entry.id];
+    let receiver_id = entry.receiver_id.lock().unwrap().clone();
+    resources::sender_json(&state.cfg, ip, state.device_id, entry, ids.sender_id, entry.flow_id, receiver_id, &state.version())
 }
 
 async fn senders_list(State(state): State<S>) -> Json<serde_json::Value> {
     let ip = client_ip(&state);
-    let list: Vec<_> = state.mixer.buses.iter().map(|b| sender_json_for(&state, &ip, b)).collect();
+    let list: Vec<_> = state.mixer.output_grid.snapshot().iter().map(|e| sender_json_for(&state, &ip, e)).collect();
     Json(serde_json::json!(list))
 }
 
 async fn sender_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
     let ip = client_ip(&state);
-    match state.mixer.buses.iter().find(|b| state.bus_ids[&b.id].sender_id.to_string() == id) {
-        Some(b) => Json(sender_json_for(&state, &ip, b)).into_response(),
+    match state.mixer.output_grid.snapshot().into_iter().find(|e| state.output_ids[&e.id].sender_id.to_string() == id) {
+        Some(e) => Json(sender_json_for(&state, &ip, &e)).into_response(),
         None => not_found(),
     }
 }
@@ -162,27 +164,29 @@ async fn receiver_ids(State(state): State<S>) -> Json<serde_json::Value> {
     Json(serde_json::json!(all_receiver_ids(&state).iter().map(|id| format!("{id}/")).collect::<Vec<_>>()))
 }
 
-fn receiver_json_for(state: &NmosState, t: &crate::mixer::Track) -> serde_json::Value {
-    let receiver_id = state.track_receiver_ids[&t.id];
-    let active = state.mixer.patch.has_track_in(t.id);
-    let sender_id = t.sender_id.lock().unwrap().clone();
-    resources::receiver_json(&state.cfg, state.device_id, t, receiver_id, active, sender_id, &state.version())
+fn receiver_json_for(state: &NmosState, entry: &crate::patch::InputGridEntry) -> serde_json::Value {
+    // "active" for an input-grid entry's own Receiver is exactly "does it currently have an open
+    // reader" -- unlike before this pass, this is no longer about whether some track happens to be
+    // patched from it (routing is now a fully separate concern -- see the plan's §14).
+    let active = entry.reader.lock().unwrap().is_some();
+    let sender_id = entry.subscribed_sender_id.lock().unwrap().clone();
+    resources::receiver_json(&state.cfg, state.device_id, entry, entry.receiver_id, active, sender_id, &state.version())
 }
 
 async fn receivers_list(State(state): State<S>) -> Json<serde_json::Value> {
-    let list: Vec<_> = state.mixer.tracks.iter().map(|t| receiver_json_for(&state, t)).collect();
+    let list: Vec<_> = state.mixer.input_grid.snapshot().iter().map(|e| receiver_json_for(&state, e)).collect();
     Json(serde_json::json!(list))
 }
 
 async fn receiver_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    match state.mixer.tracks.iter().find(|t| state.track_receiver_ids[&t.id].to_string() == id) {
-        Some(t) => Json(receiver_json_for(&state, t)).into_response(),
+    match state.mixer.input_grid.snapshot().into_iter().find(|e| e.receiver_id.to_string() == id) {
+        Some(e) => Json(receiver_json_for(&state, &e)).into_response(),
         None => not_found(),
     }
 }
 
 // ---------------------------------------------------------------------------
-// IS-05 Connection API — sender side (buses)
+// IS-05 Connection API — sender side (output grid — see the plan's §14)
 // ---------------------------------------------------------------------------
 
 async fn sender_constraints(Path(_id): Path<String>) -> Json<serde_json::Value> {
@@ -201,11 +205,11 @@ async fn sender_transportfile(Path(_id): Path<String>) -> impl IntoResponse {
 }
 
 async fn sender_staged(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    match state.mixer.buses.iter().find(|b| state.bus_ids[&b.id].sender_id.to_string() == id) {
-        Some(b) => Json(serde_json::json!({
+    match state.mixer.output_grid.snapshot().into_iter().find(|e| state.output_ids[&e.id].sender_id.to_string() == id) {
+        Some(e) => Json(serde_json::json!({
             "master_enable": true,
             "activation": { "mode": null, "requested_time": null, "activation_time": null },
-            "receiver_id": *b.receiver_id.lock().unwrap(),
+            "receiver_id": *e.receiver_id.lock().unwrap(),
             "transport_params": [{}]
         }))
         .into_response(),
@@ -213,20 +217,20 @@ async fn sender_staged(State(state): State<S>, Path(id): Path<String>) -> axum::
     }
 }
 
-/// A bus's Sender is always on (see resources.rs's `sender_json` docs) — this only records
-/// `receiver_id` for informational reporting, `master_enable` is accepted but has no effect.
+/// An output-grid entry's Sender is always on (see resources.rs's `sender_json` docs) — this only
+/// records `receiver_id` for informational reporting, `master_enable` is accepted but has no effect.
 async fn sender_patch(State(state): State<S>, Path(id): Path<String>, Json(body): Json<serde_json::Value>) -> axum::response::Response {
-    let Some(b) = state.mixer.buses.iter().find(|b| state.bus_ids[&b.id].sender_id.to_string() == id) else {
+    let Some(entry) = state.mixer.output_grid.snapshot().into_iter().find(|e| state.output_ids[&e.id].sender_id.to_string() == id) else {
         return not_found();
     };
     if let Some(v) = body.get("receiver_id") {
-        *b.receiver_id.lock().unwrap() = v.as_str().map(str::to_string);
+        *entry.receiver_id.lock().unwrap() = v.as_str().map(str::to_string);
     }
     sender_staged(State(state), Path(id)).await
 }
 
 // ---------------------------------------------------------------------------
-// IS-05 Connection API — receiver side (tracks)
+// IS-05 Connection API — receiver side (input grid — see the plan's §14)
 // ---------------------------------------------------------------------------
 
 async fn receiver_constraints(Path(_id): Path<String>) -> Json<serde_json::Value> {
@@ -238,11 +242,11 @@ async fn receiver_transporttype(Path(_id): Path<String>) -> Json<serde_json::Val
 }
 
 async fn receiver_staged(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    match state.mixer.tracks.iter().find(|t| state.track_receiver_ids[&t.id].to_string() == id) {
-        Some(t) => Json(serde_json::json!({
-            "master_enable": state.mixer.patch.has_track_in(t.id),
+    match state.mixer.input_grid.snapshot().into_iter().find(|e| e.receiver_id.to_string() == id) {
+        Some(entry) => Json(serde_json::json!({
+            "master_enable": entry.reader.lock().unwrap().is_some(),
             "activation": { "mode": null, "requested_time": null, "activation_time": null },
-            "sender_id": *t.sender_id.lock().unwrap(),
+            "sender_id": *entry.subscribed_sender_id.lock().unwrap(),
             "transport_file": { "data": null, "type": null },
             "transport_params": [{}]
         }))
@@ -251,30 +255,28 @@ async fn receiver_staged(State(state): State<S>, Path(id): Path<String>) -> axum
     }
 }
 
-/// Resolves sender_id -> flow_id (a local lookup if it names one of this app's own bus Senders,
-/// otherwise the registry), synthesizes/refreshes an ephemeral input-grid entry
-/// (`"recv:<track_id>"`, patch.rs) backed by that flow, and applies an exclusive whole-track
-/// `track-in` patch pointing this track's channels 0..N at that entry's channels 0..N — the
-/// pickoff-point patch bay's one bridge between IS-05 activation and the WS-only patch protocol
-/// (plan §Files-to-touch flagged this as the one place the two models actually meet). Same
+/// Activates (or deactivates) an input-grid entry's own Receiver directly — resolves `sender_id` ->
+/// flow_id (a local lookup if it names one of this app's own output-grid Senders, otherwise the
+/// registry) and opens a reader into that entry's own `reader` slot. Deliberately does **not**
+/// touch any `track-in`/`bus-in`/`master-in` patch, and does **not** create/remove any grid entry —
+/// every input-grid entry has a stable identity from startup (config-seeded or
+/// `INPUT_GRID_COUNT`-generated), unlike before this pass' now-removed `"recv:<track_id>"`
+/// ephemeral-entry synthesis. Routing the now-active entry to a track/bus/master is a fully
+/// separate, explicit step over the ordinary WS patch protocol — see the plan's §14. Same
 /// Milestone-2-era scope note as mxl-bridge's own receiver_patch: only `activate_immediate` is
 /// really handled, anything else is just applied immediately as well.
 async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(body): Json<serde_json::Value>) -> axum::response::Response {
-    let Some(track) = state.mixer.tracks.iter().find(|t| state.track_receiver_ids[&t.id].to_string() == id) else {
+    let Some(entry) = state.mixer.input_grid.snapshot().into_iter().find(|e| e.receiver_id.to_string() == id) else {
         return not_found();
     };
-    let entry_id = format!("recv:{}", track.id);
-    let bus_channels: Vec<(u32, usize)> = state.mixer.buses.iter().map(|b| (b.id, b.channels)).collect();
 
     let sender_id = body.get("sender_id").and_then(|v| v.as_str()).map(str::to_string);
     let master_enable = body.get("master_enable").and_then(|v| v.as_bool());
     let active = master_enable.unwrap_or(sender_id.is_some());
 
     if !active {
-        let empty_patch = vec![None; track.channels];
-        let _ = state.mixer.patch.set_track_in(&state.mixer.tracks, &bus_channels, &state.mixer.input_grid, track.id, empty_patch);
-        state.mixer.input_grid.remove(&entry_id);
-        *track.sender_id.lock().unwrap() = None;
+        *entry.reader.lock().unwrap() = None;
+        *entry.subscribed_sender_id.lock().unwrap() = None;
         return receiver_staged(State(state), Path(id)).await;
     }
 
@@ -286,7 +288,8 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
             .into_response();
     };
 
-    let own_flow_id = state.mixer.buses.iter().find(|b| state.bus_ids[&b.id].sender_id.to_string() == *sid).map(|b| b.flow_id);
+    let own_flow_id =
+        state.mixer.output_grid.snapshot().into_iter().find(|e| state.output_ids[&e.id].sender_id.to_string() == *sid).map(|e| e.flow_id);
     let resolved = match own_flow_id {
         Some(fid) => Ok(fid.to_string()),
         None => registration::resolve_sender_flow_id(&state, sid).await,
@@ -303,14 +306,10 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
         }
     };
 
-    match crate::flow::FlowReader::open(&state.cfg.mxl_domain, &state.mxl_so_path, &flow_id, track.channels) {
+    match crate::flow::FlowReader::open(&state.cfg.mxl_domain, &state.mxl_so_path, &flow_id, entry.channels) {
         Ok(reader) => {
-            state.mixer.input_grid.insert(crate::patch::InputGridEntry {
-                id: entry_id.clone(),
-                label: format!("Receiver activation for track {}", track.id),
-                channels: track.channels,
-                reader: std::sync::Mutex::new(Some(reader)),
-            });
+            *entry.reader.lock().unwrap() = Some(reader);
+            *entry.subscribed_sender_id.lock().unwrap() = sender_id;
         }
         Err(e) => {
             tracing::error!(error = %e, "receiver activation failed to open flow");
@@ -321,19 +320,6 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
                 .into_response();
         }
     }
-
-    let whole_track_patch: Vec<Option<crate::patch::SourceRef>> =
-        (0..track.channels).map(|ch| Some(crate::patch::SourceRef::Input { entry_id: entry_id.clone(), channel: ch })).collect();
-    if let Err(e) = state.mixer.patch.set_track_in(&state.mixer.tracks, &bus_channels, &state.mixer.input_grid, track.id, whole_track_patch) {
-        state.mixer.input_grid.remove(&entry_id);
-        tracing::error!(error = %e, "receiver activation failed to apply input-patch");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"code": 500, "error": e, "debug": null})),
-        )
-            .into_response();
-    }
-    *track.sender_id.lock().unwrap() = sender_id;
 
     receiver_staged(State(state), Path(id)).await
 }

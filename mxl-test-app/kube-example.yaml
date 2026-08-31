@@ -12,7 +12,7 @@
 # StatefulSet, not a plain Deployment (the difference from MXL's own reference example, and from
 # an earlier version of this file) -- this is specifically what redundancy/state-resume
 # (persistence.rs) needs: a Deployment's pods get a new, random name every time one is replaced, so
-# a STATE_PATH keyed off that name (the ids::instance_bus_flow_id / config.rs `instance_name`
+# a STATE_PATH keyed off that name (the ids::instance_output_flow_id / config.rs `instance_name`
 # convention this app already uses) would never find its predecessor's state -- the replacement
 # would be looking under a name that never existed. A StatefulSet gives each replica a stable
 # ordinal identity (mxl-test-app-0, mxl-test-app-1, ...) *and*, via volumeClaimTemplates below, its
@@ -77,8 +77,8 @@ spec:
             # on the next start -- see persistence.rs and docker-entrypoint.sh's STATE_PATH docs.
             - name: STATE_PATH
               value: /data/state.json
-            # Each replica's own pod name -- keeps bus flow ids distinct per replica without any
-            # per-replica config authoring (see ids::instance_bus_flow_id / config.rs's
+            # Each replica's own pod name -- keeps output-grid flow ids distinct per replica without
+            # any per-replica config authoring (see ids::instance_output_flow_id / config.rs's
             # `instance_name` docs). Kubernetes' downward API is the normalized way to get a pod
             # its own identity from inside itself. Stable across replacement here specifically
             # *because* this is a StatefulSet (mxl-test-app-0 is always mxl-test-app-0) -- a plain

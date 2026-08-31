@@ -66,8 +66,10 @@ pub async fn run(state: Arc<NmosState>, ip: String) {
 async fn register_all(client: &reqwest::Client, base: &str, state: &NmosState, ip: &str) -> anyhow::Result<()> {
     register_resource(client, base, "node", resources::node_json(&state.cfg, state.node_id, ip, &state.version())).await?;
 
-    let sender_ids: Vec<_> = state.bus_ids.values().map(|b| b.sender_id).collect();
-    let receiver_ids: Vec<_> = state.track_receiver_ids.values().copied().collect();
+    // The output/input grid is the only NMOS-facing surface (see the plan's §14) -- neither a
+    // bus's nor a master's nor a track's own signal is registered directly.
+    let sender_ids: Vec<_> = state.output_ids.values().map(|o| o.sender_id).collect();
+    let receiver_ids: Vec<_> = state.mixer.input_grid.snapshot().iter().map(|e| e.receiver_id).collect();
     register_resource(
         client,
         base,
@@ -76,36 +78,35 @@ async fn register_all(client: &reqwest::Client, base: &str, state: &NmosState, i
     )
     .await?;
 
-    for b in &state.mixer.buses {
-        let ids = &state.bus_ids[&b.id];
-        register_resource(client, base, "source", resources::source_json(&state.cfg, state.device_id, b, ids.source_id, &state.version()))
+    for e in state.mixer.output_grid.snapshot() {
+        let ids = &state.output_ids[&e.id];
+        register_resource(client, base, "source", resources::source_json(&state.cfg, state.device_id, &e, ids.source_id, &state.version()))
             .await?;
         register_resource(
             client,
             base,
             "flow",
-            resources::flow_json(&state.cfg, state.device_id, b, ids.source_id, b.flow_id, &state.version()),
+            resources::flow_json(&state.cfg, state.device_id, &e, ids.source_id, e.flow_id, &state.version()),
         )
         .await?;
-        let receiver_id = b.receiver_id.lock().unwrap().clone();
+        let receiver_id = e.receiver_id.lock().unwrap().clone();
         register_resource(
             client,
             base,
             "sender",
-            resources::sender_json(&state.cfg, ip, state.device_id, b, ids.sender_id, b.flow_id, receiver_id, &state.version()),
+            resources::sender_json(&state.cfg, ip, state.device_id, &e, ids.sender_id, e.flow_id, receiver_id, &state.version()),
         )
         .await?;
     }
 
-    for t in &state.mixer.tracks {
-        let receiver_id = state.track_receiver_ids[&t.id];
-        let active = state.mixer.patch.has_track_in(t.id);
-        let sender_id = t.sender_id.lock().unwrap().clone();
+    for e in state.mixer.input_grid.snapshot() {
+        let active = e.reader.lock().unwrap().is_some();
+        let sender_id = e.subscribed_sender_id.lock().unwrap().clone();
         register_resource(
             client,
             base,
             "receiver",
-            resources::receiver_json(&state.cfg, state.device_id, t, receiver_id, active, sender_id, &state.version()),
+            resources::receiver_json(&state.cfg, state.device_id, &e, e.receiver_id, active, sender_id, &state.version()),
         )
         .await?;
     }

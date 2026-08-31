@@ -18,18 +18,26 @@ pub fn version_string(v: (u64, u64)) -> String {
     format!("{}:{}", v.0, v.1)
 }
 
-/// A bus's mirrored Source/Flow/Sender ids — computed once at startup (ids.rs), never persisted.
-pub struct BusIds {
+/// An output-grid entry's mirrored Source/Flow/Sender ids — computed once at startup (ids.rs),
+/// never persisted. The entry's own `flow_id` (`patch::OutputGridEntry`) is the Flow's own id;
+/// these are its Source/Sender, distinct resources.
+pub struct OutputIds {
     pub source_id: uuid::Uuid,
     pub sender_id: uuid::Uuid,
 }
 
 /// Shared state for the NMOS layer: a thin, read-only-after-startup wrapper around `MixerState`
-/// (the real audio engine's own tracks/buses, which this just mirrors — see nmos/server.rs) plus
+/// (the real audio engine's own input/output grid, which this mirrors — see nmos/server.rs) plus
 /// the deterministic ids every resource needs. Unlike mxl-bridge's own `NmosState`, there is no
-/// daemon to poll and no dynamic Sink/Source set to sync — tracks and buses are fixed at startup
-/// (this app's whole config), so this only ever needs building once, not a `sync.rs` reacting to
-/// external change.
+/// daemon to poll and no dynamic Sink/Source set to sync — the grid is fixed at startup (plus
+/// registry-discovered input-grid entries, `discovery.rs`), so this only ever needs building once,
+/// not a `sync.rs` reacting to external change.
+///
+/// Per the plan at ~/.claude/plans/snug-painting-elephant.md §14, the input/output grid is the
+/// *only* NMOS-facing surface — tracks/buses/masters have no NMOS presence of their own, so unlike
+/// before this pass there's no `bus_ids`/`track_receiver_ids` map: an input-grid entry already
+/// carries its own stable `receiver_id` directly (`patch::InputGridEntry`), and `output_ids` below
+/// is keyed by the output grid's own string namespace, not a numeric bus id.
 pub struct NmosState {
     pub cfg: Config,
     pub mxl_so_path: std::path::PathBuf,
@@ -39,28 +47,26 @@ pub struct NmosState {
     pub device_id: uuid::Uuid,
     node_version: (u64, u64),
 
-    pub bus_ids: HashMap<u32, BusIds>,
-    pub track_receiver_ids: HashMap<u32, uuid::Uuid>,
+    pub output_ids: HashMap<String, OutputIds>,
 }
 
 impl NmosState {
     pub fn new(cfg: Config, mxl_so_path: std::path::PathBuf, mixer: Arc<MixerState>) -> Self {
         let instance = cfg.instance_name.clone();
-        let bus_ids = mixer
-            .buses
+        let output_ids = mixer
+            .output_grid
+            .snapshot()
             .iter()
-            .map(|b| {
+            .map(|e| {
                 (
-                    b.id,
-                    BusIds {
-                        source_id: crate::ids::instance_bus_source_id(&instance, b.id),
-                        sender_id: crate::ids::instance_bus_sender_id(&instance, b.id),
+                    e.id.clone(),
+                    OutputIds {
+                        source_id: crate::ids::instance_output_source_id(&instance, &e.id),
+                        sender_id: crate::ids::instance_output_sender_id(&instance, &e.id),
                     },
                 )
             })
             .collect();
-        let track_receiver_ids =
-            mixer.tracks.iter().map(|t| (t.id, crate::ids::instance_track_receiver_id(&instance, t.id))).collect();
 
         Self {
             node_id: crate::ids::node_id(&instance),
@@ -69,8 +75,7 @@ impl NmosState {
             cfg,
             mxl_so_path,
             mixer,
-            bus_ids,
-            track_receiver_ids,
+            output_ids,
         }
     }
 

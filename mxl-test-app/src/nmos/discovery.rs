@@ -1,18 +1,19 @@
-//! Milestone 3 of the pickoff-point patch bay plan (`~/.claude/plans/snug-painting-elephant.md`):
-//! populates the input grid (`patch.rs`) by polling the NMOS registry's Query API for other apps'
-//! MXL-transport Senders, on top of (not replacing) `Config.input_grid`'s static list and
-//! `nmos/server.rs`'s IS-05-activated ephemeral entries — "audio input grid... decorrelated from
-//! the number of tracks" now also means *discovered*, not just hand-configured. Only ever manages
-//! entries under its own `"registry:<sender_id>"` id prefix, so it never touches an entry either of
-//! the other two sources created.
+//! Populates the input grid (`patch.rs`) by polling the NMOS registry's Query API for other apps'
+//! MXL-transport Senders, on top of (not replacing) `Config.input_grid`'s static list — "audio
+//! input grid... decorrelated from the number of tracks" now also means *discovered*, not just
+//! hand-configured. Only ever manages entries under its own `"registry:<sender_id>"` id prefix, so
+//! it never touches an entry the static config or IS-05 activation (`nmos/server.rs::receiver_patch`
+//! — a *different* input-grid entry gets activated, this module never creates one on that path)
+//! created. Every entry it creates gets its own stable Receiver id too, same as every other
+//! input-grid entry (see the plan's §14).
 //!
 //! Only Senders whose `transport` is `urn:x-mxl:transport:flow` (`resources::TRANSPORT_TYPE` —
-//! mxl-bridge's own mirrored Sinks, any mxl-test-app instance's own bus Senders, or any other MXL
-//! app that advertises one) are candidates: a real AES67/2110 Sender's `flow_id` isn't a raw MXL
-//! flow this app could open directly — that still needs mxl-bridge's own on-demand provisioning
-//! path (Phase 2 plan §5) to become an MXL flow first. This instance's own Senders are excluded
-//! (matching `device_id`) — redundant with the more direct `bus-out:` source kind (`patch.rs`), and
-//! pointless to loop a shared-memory flow back through its own writer for.
+//! mxl-bridge's own mirrored Sinks, any mxl-test-app instance's own output-grid Senders, or any
+//! other MXL app that advertises one) are candidates: a real AES67/2110 Sender's `flow_id` isn't a
+//! raw MXL flow this app could open directly — that still needs mxl-bridge's own on-demand
+//! provisioning path to become an MXL flow first. This instance's own Senders are excluded
+//! (matching `device_id`) — redundant with the more direct `bus-out:`/`master-out:` source kinds
+//! (`patch.rs`), and pointless to loop a shared-memory flow back through its own writer for.
 //!
 //! A plain unpaginated poll-and-diff, same shape as mxl-bridge's own `daemon_client.rs` (there,
 //! against the daemon's `/api/streams`; here, against the registry's Query API) — acceptable for a
@@ -129,10 +130,13 @@ fn apply_diff(state: &NmosState, known: &mut HashMap<String, Candidate>, candida
         match crate::flow::FlowReader::open(&state.cfg.mxl_domain, &state.mxl_so_path, &candidate.flow_id, candidate.channels) {
             Ok(reader) => {
                 state.mixer.input_grid.insert(InputGridEntry {
+                    receiver_id: crate::ids::instance_input_receiver_id(&state.cfg.instance_name, &entry_id),
                     id: entry_id,
                     label: candidate.label.clone(),
                     channels: candidate.channels,
                     reader: std::sync::Mutex::new(Some(reader)),
+                    meter_db: std::sync::Mutex::new(vec![f32::NEG_INFINITY; candidate.channels]),
+                    subscribed_sender_id: std::sync::Mutex::new(None),
                 });
                 tracing::info!(sender_id = id, label = %candidate.label, channels = candidate.channels, "input grid discovery: entry ready");
             }
