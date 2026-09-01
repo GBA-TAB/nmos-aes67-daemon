@@ -653,6 +653,7 @@ mod tests {
                         gain_db: 0.0,
                         fader_db: 0.0,
                         template: crate::config::ChannelTemplate::Simple,
+                        chain: vec![],
                     },
                     ch,
                 ))

@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
             channels: b.channels,
             fader_db: auto.fader_db,
             template: auto.template,
+            chain: auto.chain.clone(),
         });
     }
 

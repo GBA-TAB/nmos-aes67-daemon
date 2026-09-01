@@ -445,7 +445,7 @@ mod tests {
     use crate::config::{BusConfig, MasterTrackConfig, TrackConfig};
 
     fn track(id: u32, channels: usize) -> Arc<Track> {
-        Arc::new(Track::new(&TrackConfig { id, label: format!("T{id}"), channels: None, sends: vec![], gain_db: 0.0, fader_db: 0.0, template: Default::default() }, channels))
+        Arc::new(Track::new(&TrackConfig { id, label: format!("T{id}"), channels: None, sends: vec![], gain_db: 0.0, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels))
     }
 
     fn bus(id: u32, channels: usize) -> Arc<Bus> {
@@ -453,7 +453,7 @@ mod tests {
     }
 
     fn master(id: u32, channels: usize) -> Arc<MasterTrack> {
-        Arc::new(MasterTrack::new(&MasterTrackConfig { id, label: format!("M{id}"), channels: None, fader_db: 0.0, template: Default::default() }, channels))
+        Arc::new(MasterTrack::new(&MasterTrackConfig { id, label: format!("M{id}"), channels: None, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels))
     }
 
     #[test]

@@ -27,19 +27,8 @@
 
 use std::sync::atomic::Ordering;
 
-use crate::config::ChannelTemplate;
 use crate::engine::MixerState;
 use crate::mixer::MasterTrack;
-
-/// `ChannelTemplate` only derives `Deserialize` (config.rs), not `Serialize` -- consistent with
-/// this whole module's own "no Serialize derives on domain/config structs, hand-build the JSON"
-/// convention (see the module doc comment), so this is a plain match, not a missing derive.
-fn template_json(t: ChannelTemplate) -> &'static str {
-    match t {
-        ChannelTemplate::Simple => "simple",
-        ChannelTemplate::FullChannel => "full_channel",
-    }
-}
 
 /// Snapshots every track's, bus's, and master's current live state into one JSON document. A bus
 /// is a pure summer now (see mixer::Bus's own docs) — only its own `input_patch` (bus-in) is
@@ -58,12 +47,7 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
                 "mute": t.mute.load(Ordering::Relaxed),
                 "solo": t.solo.load(Ordering::Relaxed),
                 "sends": crate::ws::sends_json(t),
-                "filter": crate::ws::filter_json(&t.filter),
-                "eq": crate::ws::eq_json(&t.eq),
-                "dyn1": crate::ws::dynamics_json(&t.dyn1),
-                "dyn2": crate::ws::dynamics_json(&t.dyn2),
-                "phase": crate::ws::phase_json(&t.phase),
-                "delay": crate::ws::delay_json(&t.delay),
+                "chain": crate::ws::chain_json(&t.chain),
                 "input_patch": mixer.patch.track_in_json(t.id, t.channels),
             });
             (t.id.to_string(), value)
@@ -84,12 +68,7 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
             let value = serde_json::json!({
                 "fader_db": *m.fader_db.lock().unwrap(),
                 "mute": m.mute.load(Ordering::Relaxed),
-                "filter": crate::ws::filter_json(&m.filter),
-                "eq": crate::ws::eq_json(&m.eq),
-                "dyn1": crate::ws::dynamics_json(&m.dyn1),
-                "dyn2": crate::ws::dynamics_json(&m.dyn2),
-                "phase": crate::ws::phase_json(&m.phase),
-                "delay": crate::ws::delay_json(&m.delay),
+                "chain": crate::ws::chain_json(&m.chain),
                 "input_patch": mixer.patch.master_in_json(m.id, m.channels),
             });
             (m.id.to_string(), value)
@@ -108,7 +87,7 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
                 "id": t.id,
                 "label": t.label,
                 "channels": t.channels,
-                "template": template_json(t.template),
+                "chain": crate::ws::chain_json(&t.chain),
                 "sends": crate::ws::sends_json(t),
                 "gain_db": *t.gain_db.lock().unwrap(),
                 "fader_db": *t.fader_db.lock().unwrap(),
@@ -129,7 +108,7 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
                 "id": m.id,
                 "label": m.label,
                 "channels": m.channels,
-                "template": template_json(m.template),
+                "chain": crate::ws::chain_json(&m.chain),
                 "fader_db": *m.fader_db.lock().unwrap(),
             });
             (m.id.to_string(), value)
@@ -181,24 +160,7 @@ pub fn apply_snapshot(mixer: &MixerState, snapshot: &serde_json::Value) {
                     Err(e) => tracing::warn!(track_id = track.id, error = %e, "state file: malformed sends, skipped"),
                 }
             }
-            if let Some(v) = t.get("filter") {
-                let _ = crate::ws::apply_filter(&track.filter, v);
-            }
-            if let Some(v) = t.get("eq") {
-                let _ = crate::ws::apply_eq(&track.eq, v);
-            }
-            if let Some(v) = t.get("dyn1") {
-                let _ = crate::ws::apply_dynamics(&track.dyn1, v);
-            }
-            if let Some(v) = t.get("dyn2") {
-                let _ = crate::ws::apply_dynamics(&track.dyn2, v);
-            }
-            if let Some(v) = t.get("phase") {
-                let _ = crate::ws::apply_phase(&track.phase, v);
-            }
-            if let Some(v) = t.get("delay") {
-                let _ = crate::ws::apply_delay(&track.delay, v);
-            }
+            apply_chain_snapshot(&track.chain, t.get("chain"));
             if let Some(v) = t.get("input_patch") {
                 match crate::patch::PatchState::parse_track_in(v) {
                     Ok(patch) => {
@@ -267,23 +229,24 @@ fn apply_master_fields(master: &MasterTrack, m: &serde_json::Value) {
     if let Some(v) = m.get("mute").and_then(|v| v.as_bool()) {
         master.mute.store(v, Ordering::Relaxed);
     }
-    if let Some(v) = m.get("filter") {
-        let _ = crate::ws::apply_filter(&master.filter, v);
-    }
-    if let Some(v) = m.get("eq") {
-        let _ = crate::ws::apply_eq(&master.eq, v);
-    }
-    if let Some(v) = m.get("dyn1") {
-        let _ = crate::ws::apply_dynamics(&master.dyn1, v);
-    }
-    if let Some(v) = m.get("dyn2") {
-        let _ = crate::ws::apply_dynamics(&master.dyn2, v);
-    }
-    if let Some(v) = m.get("phase") {
-        let _ = crate::ws::apply_phase(&master.phase, v);
-    }
-    if let Some(v) = m.get("delay") {
-        let _ = crate::ws::apply_delay(&master.delay, v);
+    apply_chain_snapshot(&master.chain, m.get("chain"));
+}
+
+/// Applies a captured `"chain"` array (`ws::chain_json`'s own `[{index,kind,params},...]` shape)
+/// onto the already-reconstructed live `chain` -- by index, never by shape: this never adds/removes
+/// slots (topology reconstruction, which runs before this, is what builds the chain's shape at all
+/// -- see this module's own doc comment on why that ordering matters), only overlays each existing
+/// slot's own field values. An index absent from the live chain (e.g. the state file predates a
+/// since-shrunk chain) is silently skipped, same "don't conjure/crash, just skip" convention as
+/// every other stale-snapshot-entry case in this function.
+fn apply_chain_snapshot(chain: &[crate::dsp::ProcessingStage], snapshot: Option<&serde_json::Value>) {
+    let Some(entries) = snapshot.and_then(|v| v.as_array()) else { return };
+    for entry in entries {
+        let Some(index) = entry.get("index").and_then(|v| v.as_u64()) else { continue };
+        let Some(params) = entry.get("params") else { continue };
+        if let Some(stage) = chain.get(index as usize) {
+            stage.apply(params);
+        }
     }
 }
 
@@ -330,6 +293,7 @@ pub fn load_and_apply(mixer: &MixerState, path: &str) -> anyhow::Result<bool> {
 mod tests {
     use super::*;
     use crate::config::{ChannelTemplate, MasterTrackConfig, TrackConfig};
+    use crate::dsp::ProcessingStage;
     use crate::mixer::{MasterTrack, Track};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -355,6 +319,7 @@ mod tests {
                         gain_db: 0.0,
                         fader_db: 0.0,
                         template: ChannelTemplate::FullChannel,
+                        chain: vec![],
                     },
                     ch,
                 ));
@@ -373,6 +338,7 @@ mod tests {
                         channels: None,
                         fader_db: 0.0,
                         template: ChannelTemplate::FullChannel,
+                        chain: vec![],
                     },
                     ch,
                 ));
@@ -414,13 +380,36 @@ mod tests {
         assert!(fresh_track0.solo.load(Ordering::Relaxed));
     }
 
+    /// `test_mixer`'s tracks/masters are built with `template: FullChannel` and an empty `chain`,
+    /// so `build_chain` expands the legacy fixed order into `chain`: index 0 filter, 1 eq, 2/3 the
+    /// two dynamics slots, 4 phase, 5 delay -- pinned here rather than searched-by-kind so this test
+    /// also doubles as a regression check on `ChannelTemplate::expand`'s own exact ordering.
+    fn expect_filter(chain: &[ProcessingStage], index: usize) -> &crate::dsp::FilterStage {
+        match &chain[index] {
+            ProcessingStage::Filter(s) => s,
+            _ => panic!("expected a Filter stage at chain index {index}"),
+        }
+    }
+    fn expect_dynamics(chain: &[ProcessingStage], index: usize) -> &crate::dsp::DynamicsStage {
+        match &chain[index] {
+            ProcessingStage::Dynamics(s) => s,
+            _ => panic!("expected a Dynamics stage at chain index {index}"),
+        }
+    }
+    fn expect_phase(chain: &[ProcessingStage], index: usize) -> &crate::dsp::PhaseStage {
+        match &chain[index] {
+            ProcessingStage::Phase(s) => s,
+            _ => panic!("expected a Phase stage at chain index {index}"),
+        }
+    }
+
     #[test]
     fn capture_apply_round_trips_dsp_stage_params() {
         let mixer = test_mixer(&[2]);
         let track0 = mixer.tracks.lock().unwrap().get(&0).unwrap().clone();
-        *track0.filter.as_ref().unwrap().hp_hz.lock().unwrap() = 120.0;
-        *track0.dyn1.as_ref().unwrap().threshold_db.lock().unwrap() = -18.0;
-        track0.phase.as_ref().unwrap().invert.store(true, Ordering::Relaxed);
+        *expect_filter(&track0.chain, 0).hp_hz.lock().unwrap() = 120.0;
+        *expect_dynamics(&track0.chain, 2).threshold_db.lock().unwrap() = -18.0;
+        expect_phase(&track0.chain, 4).invert.store(true, Ordering::Relaxed);
 
         let snapshot = capture(&mixer);
 
@@ -428,9 +417,9 @@ mod tests {
         apply_snapshot(&fresh, &snapshot);
         let fresh_track0 = fresh.tracks.lock().unwrap().get(&0).unwrap().clone();
 
-        assert_eq!(*fresh_track0.filter.as_ref().unwrap().hp_hz.lock().unwrap(), 120.0);
-        assert_eq!(*fresh_track0.dyn1.as_ref().unwrap().threshold_db.lock().unwrap(), -18.0);
-        assert!(fresh_track0.phase.as_ref().unwrap().invert.load(Ordering::Relaxed));
+        assert_eq!(*expect_filter(&fresh_track0.chain, 0).hp_hz.lock().unwrap(), 120.0);
+        assert_eq!(*expect_dynamics(&fresh_track0.chain, 2).threshold_db.lock().unwrap(), -18.0);
+        assert!(expect_phase(&fresh_track0.chain, 4).invert.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -439,7 +428,7 @@ mod tests {
         let master0 = mixer.masters.lock().unwrap().get(&0).unwrap().clone();
         *master0.fader_db.lock().unwrap() = -6.0;
         master0.mute.store(true, Ordering::Relaxed);
-        *master0.filter.as_ref().unwrap().hp_hz.lock().unwrap() = 80.0;
+        *expect_filter(&master0.chain, 0).hp_hz.lock().unwrap() = 80.0;
 
         let snapshot = capture(&mixer);
 
@@ -449,7 +438,7 @@ mod tests {
 
         assert_eq!(*fresh_master0.fader_db.lock().unwrap(), -6.0);
         assert!(fresh_master0.mute.load(Ordering::Relaxed));
-        assert_eq!(*fresh_master0.filter.as_ref().unwrap().hp_hz.lock().unwrap(), 80.0);
+        assert_eq!(*expect_filter(&fresh_master0.chain, 0).hp_hz.lock().unwrap(), 80.0);
     }
 
     #[test]
@@ -464,7 +453,7 @@ mod tests {
 
         let created = crate::topology::create_track(
             &mixer,
-            &TrackConfig { id: 99, label: "Dyn".into(), channels: Some(2), sends: vec![], gain_db: 1.0, fader_db: 0.0, template: ChannelTemplate::Simple },
+            &TrackConfig { id: 99, label: "Dyn".into(), channels: Some(2), sends: vec![], gain_db: 1.0, fader_db: 0.0, template: ChannelTemplate::Simple, chain: vec![] },
         )
         .unwrap();
         assert!(created.dynamically_created);

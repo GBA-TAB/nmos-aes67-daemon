@@ -109,13 +109,13 @@ pub(crate) fn master_channels(state: &WsState) -> Vec<(u32, usize)> {
 
 fn handle_put(state: &WsState, path: &str, value: Option<&serde_json::Value>) {
     let Some(value) = value else { return };
-    let Some((kind, id, param)) = parse_path(path, state.mixer_id) else { return };
+    let Some((kind, id, param, extra)) = parse_path(path, state.mixer_id) else { return };
 
     match kind {
         "channel" => {
             let Ok(id) = id.parse::<u32>() else { return };
             let Some(track) = state.mixer.tracks.lock().unwrap().get(&id).cloned() else { return };
-            apply_track_param(state, &track, param, value);
+            apply_track_param(state, &track, param, extra, value);
         }
         "sum" => {
             let Ok(id) = id.parse::<u32>() else { return };
@@ -126,8 +126,8 @@ fn handle_put(state: &WsState, path: &str, value: Option<&serde_json::Value>) {
         "master" => {
             let Ok(id) = id.parse::<u32>() else { return };
             let Some(master) = state.mixer.masters.lock().unwrap().get(&id).cloned() else { return };
-            apply_master_param(state, &master, param, value);
-            publish(state, path, current_master_value(state, &master, param));
+            apply_master_param(state, &master, param, extra, value);
+            publish(state, path, current_master_value(state, &master, param, extra));
         }
         // The pickoff-point patch bay's output grid -- `id` here is the output grid's own string
         // namespace (`patch.rs`), not a numeric track/bus/master id.
@@ -271,7 +271,7 @@ fn publish_lists(state: &WsState) {
     publish(state, &format!("amixer/{}/master-list", state.mixer_id), masters_list_json(state));
 }
 
-fn apply_track_param(state: &WsState, track: &Track, param: &str, value: &serde_json::Value) {
+fn apply_track_param(state: &WsState, track: &Track, param: &str, extra: Option<&str>, value: &serde_json::Value) {
     match param {
         "gain" => {
             if let Some(v) = value.as_f64() {
@@ -324,18 +324,17 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, value: &serde_
             }
             Err(e) => tracing::warn!(track_id = track.id, error = %e, "PUT input-patch: malformed value"),
         },
-        // Processing-chain stages (dsp.rs) -- structural placeholders (see dsp.rs's module docs),
-        // present only if this track's ChannelTemplate includes them; a PUT against an absent one
-        // is rejected with a warning, not silently accepted or a crash.
-        "filter" => reject_if_err(apply_filter(&track.filter, value), "track", track.id, "filter"),
-        "eq" => reject_if_err(apply_eq(&track.eq, value), "track", track.id, "eq"),
-        "dyn1" => reject_if_err(apply_dynamics(&track.dyn1, value), "track", track.id, "dyn1"),
-        "dyn2" => reject_if_err(apply_dynamics(&track.dyn2, value), "track", track.id, "dyn2"),
-        "phase" => reject_if_err(apply_phase(&track.phase, value), "track", track.id, "phase"),
-        "delay" => reject_if_err(apply_delay(&track.delay, value), "track", track.id, "delay"),
+        // Processing-chain stage (dsp.rs) -- `extra` is that slot's own index into track.chain
+        // (see parse_path's own docs); an out-of-range index warns and no-ops, same silent-failure
+        // convention as every other malformed/rejected PUT in this protocol, never a panic.
+        "stage" => match extra.and_then(|s| s.parse::<usize>().ok()).and_then(|i| track.chain.get(i)) {
+            Some(stage) => stage.apply(value),
+            None => tracing::warn!(track_id = track.id, ?extra, "PUT stage rejected: no chain slot at this index"),
+        },
         _ => {}
     }
-    publish(state, &format!("amixer/{}/channel/{}/{param}", state.mixer_id, track.id), current_track_value(state, track, param));
+    let echo_param = match extra { Some(idx) => format!("{param}/{idx}"), None => param.to_string() };
+    publish(state, &format!("amixer/{}/channel/{}/{echo_param}", state.mixer_id, track.id), current_track_value(state, track, param, extra));
 }
 
 /// A bus is a pure summer now (see `mixer::Bus`'s own docs) -- `input-patch` (`bus-in`) is the only
@@ -364,7 +363,7 @@ fn apply_bus_param(state: &WsState, bus: &Bus, param: &str, value: &serde_json::
 
 /// Everything a bus used to carry before the bus/master split moved here — see `mixer::MasterTrack`'s
 /// own docs.
-fn apply_master_param(state: &WsState, master: &MasterTrack, param: &str, value: &serde_json::Value) {
+fn apply_master_param(state: &WsState, master: &MasterTrack, param: &str, extra: Option<&str>, value: &serde_json::Value) {
     match param {
         "fader" => {
             if let Some(v) = value.as_f64() {
@@ -395,17 +394,15 @@ fn apply_master_param(state: &WsState, master: &MasterTrack, param: &str, value:
             }
             Err(e) => tracing::warn!(master_id = master.id, error = %e, "PUT input-patch: malformed value"),
         },
-        "filter" => reject_if_err(apply_filter(&master.filter, value), "master", master.id, "filter"),
-        "eq" => reject_if_err(apply_eq(&master.eq, value), "master", master.id, "eq"),
-        "dyn1" => reject_if_err(apply_dynamics(&master.dyn1, value), "master", master.id, "dyn1"),
-        "dyn2" => reject_if_err(apply_dynamics(&master.dyn2, value), "master", master.id, "dyn2"),
-        "phase" => reject_if_err(apply_phase(&master.phase, value), "master", master.id, "phase"),
-        "delay" => reject_if_err(apply_delay(&master.delay, value), "master", master.id, "delay"),
+        "stage" => match extra.and_then(|s| s.parse::<usize>().ok()).and_then(|i| master.chain.get(i)) {
+            Some(stage) => stage.apply(value),
+            None => tracing::warn!(master_id = master.id, ?extra, "PUT stage rejected: no chain slot at this index"),
+        },
         _ => {}
     }
 }
 
-fn current_track_value(state: &WsState, track: &Track, param: &str) -> serde_json::Value {
+fn current_track_value(state: &WsState, track: &Track, param: &str, extra: Option<&str>) -> serde_json::Value {
     match param {
         "gain" => serde_json::json!(*track.gain_db.lock().unwrap()),
         "fader" => serde_json::json!(*track.fader_db.lock().unwrap()),
@@ -413,27 +410,23 @@ fn current_track_value(state: &WsState, track: &Track, param: &str) -> serde_jso
         "solo" => serde_json::json!(track.solo.load(Ordering::Relaxed)),
         "sends" => sends_json(track),
         "input-patch" => state.mixer.patch.track_in_json(track.id, track.channels),
-        "filter" => filter_json(&track.filter),
-        "eq" => eq_json(&track.eq),
-        "dyn1" => dynamics_json(&track.dyn1),
-        "dyn2" => dynamics_json(&track.dyn2),
-        "phase" => phase_json(&track.phase),
-        "delay" => delay_json(&track.delay),
+        "stage" => extra
+            .and_then(|s| s.parse::<usize>().ok())
+            .and_then(|i| track.chain.get(i))
+            .map(|s| s.to_json())
+            .unwrap_or(serde_json::Value::Null),
+        "chain" => chain_json(&track.chain),
         _ => serde_json::Value::Null,
     }
 }
 
-/// Logs a rejection for a processing-stage PUT against a resource whose `ChannelTemplate` doesn't
-/// include that stage (`Err("not present...")`, from `apply_filter`/etc. below) or that failed to
-/// parse -- shared by both the track and bus match arms in `apply_track_param`/`apply_bus_param`.
-fn reject_if_err(result: Result<(), &'static str>, kind: &str, id: u32, param: &str) {
-    if let Err(e) = result {
-        tracing::warn!(kind, id, param, error = e, "PUT rejected");
-    }
-}
+// Each apply_*/​*_json pair below takes a plain `&Stage` (not `&Option<Stage>`) -- the "is this
+// slot even present" question moved to the caller (ProcessingStage::apply/to_json + the chain
+// index lookups in apply_track_param/current_track_value etc.), since presence is now "this index
+// exists in the chain Vec," not `Option::None`. These five bodies are otherwise byte-identical to
+// before the chain redesign -- infallible field extraction, ignoring absent/malformed input.
 
-pub(crate) fn apply_filter(stage: &Option<crate::dsp::FilterStage>, value: &serde_json::Value) -> Result<(), &'static str> {
-    let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
+pub(crate) fn apply_filter(s: &crate::dsp::FilterStage, value: &serde_json::Value) {
     if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
         s.on.store(v, Ordering::Relaxed);
     }
@@ -443,22 +436,17 @@ pub(crate) fn apply_filter(stage: &Option<crate::dsp::FilterStage>, value: &serd
     if let Some(v) = value.get("lp_hz").and_then(|v| v.as_f64()) {
         *s.lp_hz.lock().unwrap() = v as f32;
     }
-    Ok(())
 }
 
-pub(crate) fn filter_json(stage: &Option<crate::dsp::FilterStage>) -> serde_json::Value {
-    match stage {
-        Some(s) => serde_json::json!({
-            "on": s.on.load(Ordering::Relaxed),
-            "hp_hz": *s.hp_hz.lock().unwrap(),
-            "lp_hz": *s.lp_hz.lock().unwrap(),
-        }),
-        None => serde_json::Value::Null,
-    }
+pub(crate) fn filter_json(s: &crate::dsp::FilterStage) -> serde_json::Value {
+    serde_json::json!({
+        "on": s.on.load(Ordering::Relaxed),
+        "hp_hz": *s.hp_hz.lock().unwrap(),
+        "lp_hz": *s.lp_hz.lock().unwrap(),
+    })
 }
 
-pub(crate) fn apply_eq(stage: &Option<crate::dsp::EqStage>, value: &serde_json::Value) -> Result<(), &'static str> {
-    let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
+pub(crate) fn apply_eq(s: &crate::dsp::EqStage, value: &serde_json::Value) {
     if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
         s.on.store(v, Ordering::Relaxed);
     }
@@ -477,23 +465,18 @@ pub(crate) fn apply_eq(stage: &Option<crate::dsp::EqStage>, value: &serde_json::
             .collect();
         *s.bands.lock().unwrap() = bands;
     }
-    Ok(())
 }
 
-pub(crate) fn eq_json(stage: &Option<crate::dsp::EqStage>) -> serde_json::Value {
-    match stage {
-        Some(s) => serde_json::json!({
-            "on": s.on.load(Ordering::Relaxed),
-            "bands": s.bands.lock().unwrap().iter().map(|b| serde_json::json!({
-                "freq_hz": b.freq_hz, "gain_db": b.gain_db, "q": b.q,
-            })).collect::<Vec<_>>(),
-        }),
-        None => serde_json::Value::Null,
-    }
+pub(crate) fn eq_json(s: &crate::dsp::EqStage) -> serde_json::Value {
+    serde_json::json!({
+        "on": s.on.load(Ordering::Relaxed),
+        "bands": s.bands.lock().unwrap().iter().map(|b| serde_json::json!({
+            "freq_hz": b.freq_hz, "gain_db": b.gain_db, "q": b.q,
+        })).collect::<Vec<_>>(),
+    })
 }
 
-pub(crate) fn apply_dynamics(stage: &Option<crate::dsp::DynamicsStage>, value: &serde_json::Value) -> Result<(), &'static str> {
-    let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
+pub(crate) fn apply_dynamics(s: &crate::dsp::DynamicsStage, value: &serde_json::Value) {
     if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
         s.on.store(v, Ordering::Relaxed);
     }
@@ -512,54 +495,56 @@ pub(crate) fn apply_dynamics(stage: &Option<crate::dsp::DynamicsStage>, value: &
     if let Some(v) = value.get("makeup_db").and_then(|v| v.as_f64()) {
         *s.makeup_db.lock().unwrap() = v as f32;
     }
-    Ok(())
 }
 
-pub(crate) fn dynamics_json(stage: &Option<crate::dsp::DynamicsStage>) -> serde_json::Value {
-    match stage {
-        Some(s) => serde_json::json!({
-            "on": s.on.load(Ordering::Relaxed),
-            "threshold_db": *s.threshold_db.lock().unwrap(),
-            "ratio": *s.ratio.lock().unwrap(),
-            "attack_ms": *s.attack_ms.lock().unwrap(),
-            "release_ms": *s.release_ms.lock().unwrap(),
-            "makeup_db": *s.makeup_db.lock().unwrap(),
-        }),
-        None => serde_json::Value::Null,
-    }
+pub(crate) fn dynamics_json(s: &crate::dsp::DynamicsStage) -> serde_json::Value {
+    serde_json::json!({
+        "on": s.on.load(Ordering::Relaxed),
+        "threshold_db": *s.threshold_db.lock().unwrap(),
+        "ratio": *s.ratio.lock().unwrap(),
+        "attack_ms": *s.attack_ms.lock().unwrap(),
+        "release_ms": *s.release_ms.lock().unwrap(),
+        "makeup_db": *s.makeup_db.lock().unwrap(),
+    })
 }
 
-pub(crate) fn apply_phase(stage: &Option<crate::dsp::PhaseStage>, value: &serde_json::Value) -> Result<(), &'static str> {
-    let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
+pub(crate) fn apply_phase(s: &crate::dsp::PhaseStage, value: &serde_json::Value) {
     if let Some(v) = value.get("invert").and_then(|v| v.as_bool()) {
         s.invert.store(v, Ordering::Relaxed);
     }
-    Ok(())
 }
 
-pub(crate) fn phase_json(stage: &Option<crate::dsp::PhaseStage>) -> serde_json::Value {
-    match stage {
-        Some(s) => serde_json::json!({ "invert": s.invert.load(Ordering::Relaxed) }),
-        None => serde_json::Value::Null,
-    }
+pub(crate) fn phase_json(s: &crate::dsp::PhaseStage) -> serde_json::Value {
+    serde_json::json!({ "invert": s.invert.load(Ordering::Relaxed) })
 }
 
-pub(crate) fn apply_delay(stage: &Option<crate::dsp::DelayStage>, value: &serde_json::Value) -> Result<(), &'static str> {
-    let s = stage.as_ref().ok_or("stage not present for this resource's ChannelTemplate")?;
+pub(crate) fn apply_delay(s: &crate::dsp::DelayStage, value: &serde_json::Value) {
     if let Some(v) = value.get("on").and_then(|v| v.as_bool()) {
         s.on.store(v, Ordering::Relaxed);
     }
     if let Some(v) = value.get("delay_ms").and_then(|v| v.as_f64()) {
         *s.delay_ms.lock().unwrap() = v as f32;
     }
-    Ok(())
 }
 
-pub(crate) fn delay_json(stage: &Option<crate::dsp::DelayStage>) -> serde_json::Value {
-    match stage {
-        Some(s) => serde_json::json!({ "on": s.on.load(Ordering::Relaxed), "delay_ms": *s.delay_ms.lock().unwrap() }),
-        None => serde_json::Value::Null,
-    }
+pub(crate) fn delay_json(s: &crate::dsp::DelayStage) -> serde_json::Value {
+    serde_json::json!({ "on": s.on.load(Ordering::Relaxed), "delay_ms": *s.delay_ms.lock().unwrap() })
+}
+
+/// `{"index","kind","params"}` -- the one canonical per-slot shape reused by the `chain` discovery
+/// broadcast, CREATE's own `StageSlotConfig` (config.rs, a close cousin -- `index` there is
+/// harmlessly ignored, array position is authoritative), and persistence's topology capture.
+pub(crate) fn chain_slot_json(stage: &crate::dsp::ProcessingStage, index: usize) -> serde_json::Value {
+    serde_json::json!({ "index": index, "kind": stage.kind().wire(), "params": stage.to_json() })
+}
+
+/// The full ordered chain as one array -- `channel/{id}/chain` / `master/{id}/chain`'s own value,
+/// and the shape `persistence.rs::capture()` stores verbatim. Replaces the old six independent
+/// per-stage broadcasts with one publish (`run_meter_broadcaster`) -- a genuine collapse into
+/// iterating a collection, though `ProcessingStage::to_json`'s own per-kind match still can't be
+/// generic (five unrelated struct shapes, unavoidably type-specific).
+pub(crate) fn chain_json(chain: &[crate::dsp::ProcessingStage]) -> serde_json::Value {
+    serde_json::json!(chain.iter().enumerate().map(|(i, s)| chain_slot_json(s, i)).collect::<Vec<_>>())
 }
 
 fn pickoff_wire(p: crate::mixer::PickoffPoint) -> &'static str {
@@ -609,17 +594,17 @@ fn current_bus_value(state: &WsState, bus: &Bus, param: &str) -> serde_json::Val
     }
 }
 
-fn current_master_value(state: &WsState, master: &MasterTrack, param: &str) -> serde_json::Value {
+fn current_master_value(state: &WsState, master: &MasterTrack, param: &str, extra: Option<&str>) -> serde_json::Value {
     match param {
         "fader" => serde_json::json!(*master.fader_db.lock().unwrap()),
         "mute" => serde_json::json!(master.mute.load(Ordering::Relaxed)),
         "input-patch" => state.mixer.patch.master_in_json(master.id, master.channels),
-        "filter" => filter_json(&master.filter),
-        "eq" => eq_json(&master.eq),
-        "dyn1" => dynamics_json(&master.dyn1),
-        "dyn2" => dynamics_json(&master.dyn2),
-        "phase" => phase_json(&master.phase),
-        "delay" => delay_json(&master.delay),
+        "stage" => extra
+            .and_then(|s| s.parse::<usize>().ok())
+            .and_then(|i| master.chain.get(i))
+            .map(|s| s.to_json())
+            .unwrap_or(serde_json::Value::Null),
+        "chain" => chain_json(&master.chain),
         _ => serde_json::Value::Null,
     }
 }
@@ -634,7 +619,10 @@ fn publish(state: &WsState, path: &str, value: serde_json::Value) {
 /// parsed as a number here — "channel"/"sum" ids are numeric (parsed by their own `handle_put`
 /// branch), but "output" (grid) ids are the output grid's own string namespace (`patch.rs`), so
 /// this can't uniformly parse one type for every kind.
-fn parse_path(path: &str, expected_mixer_id: u32) -> Option<(&str, &str, &str)> {
+/// `amixer/{mixerId}/{kind}/{id}/{param}`, with one optional trailing segment for `.../stage/
+/// {index}` (a track/master's own chain-slot addressing, e.g. `amixer/0/channel/5/stage/2`) --
+/// `extra` is `None` for every other (4-segment) param, `Some("<index>")` only there.
+fn parse_path(path: &str, expected_mixer_id: u32) -> Option<(&str, &str, &str, Option<&str>)> {
     let mut parts = path.split('/');
     if parts.next()? != "amixer" {
         return None;
@@ -645,22 +633,25 @@ fn parse_path(path: &str, expected_mixer_id: u32) -> Option<(&str, &str, &str)> 
     let kind = parts.next()?;
     let id = parts.next()?;
     let param = parts.next()?;
-    Some((kind, id, param))
+    let extra = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((kind, id, param, extra))
 }
 
-/// Periodically broadcasts every track's and bus's current meter and processing-chain stage state
-/// (`filter`/`eq`/`dyn1`/`dyn2`/`phase`/`delay`, plus a track's own `sends`), and the input/output
-/// grid's current entry lists, to all connected clients. A separate tokio task, not tied to the
-/// audio engine's own period (see module docs).
+/// Periodically broadcasts every track's and master's current meter and processing-chain state
+/// (`chain` — the full ordered `[{index,kind,params},...]` array, see `ws::chain_json`), plus a
+/// track's own `sends`, and the input/output grid's current entry lists, to all connected clients.
+/// A separate tokio task, not tied to the audio engine's own period (see module docs).
 ///
-/// The stage params ride this same always-on tick rather than only being pushed on change (like
-/// `fader`/`mute`/etc. are) because a freshly-connected client has no other way to learn whether a
-/// stage even *exists* for a given track/bus (its `ChannelTemplate` isn't queryable any other way)
-/// — the value is `null` if absent, the real object if present, so this tick is what lets the
-/// dashboard decide whether to render that stage's controls at all, not just what to show in them.
-/// The input/output grid listings are folded in for the same underlying reason (no other
-/// change-triggered publish path — see git history for why) — a new/removed entry or stage just
-/// shows up on the next tick either way.
+/// `chain` rides this same always-on tick rather than only being pushed on change (like `fader`/
+/// `mute`/etc. are) because a freshly-connected client has no other way to learn what a track's/
+/// master's chain even *is* (its shape isn't queryable any other way) — this tick is what lets the
+/// dashboard decide which stage subcards to render at all, not just what to show inside them. The
+/// input/output grid listings are folded in for the same underlying reason (no other
+/// change-triggered publish path — see git history for why) — a new/removed entry or a changed
+/// chain just shows up on the next tick either way.
 pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
     let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / hz));
     loop {
@@ -670,12 +661,7 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
             publish(&state, &format!("{base}/peakmeter"), serde_json::json!(*track.meter_db.lock().unwrap()));
             publish(&state, &format!("{base}/input-meter"), serde_json::json!(*track.input_meter_db.lock().unwrap()));
             publish(&state, &format!("{base}/sends"), sends_json(track));
-            publish(&state, &format!("{base}/filter"), filter_json(&track.filter));
-            publish(&state, &format!("{base}/eq"), eq_json(&track.eq));
-            publish(&state, &format!("{base}/dyn1"), dynamics_json(&track.dyn1));
-            publish(&state, &format!("{base}/dyn2"), dynamics_json(&track.dyn2));
-            publish(&state, &format!("{base}/phase"), phase_json(&track.phase));
-            publish(&state, &format!("{base}/delay"), delay_json(&track.delay));
+            publish(&state, &format!("{base}/chain"), chain_json(&track.chain));
         }
         for bus in &state.mixer.buses_snapshot() {
             // A bus is a pure summer now -- just its two meters, no fader/DSP pushes (see
@@ -688,12 +674,7 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
             let base = format!("amixer/{}/master/{}", state.mixer_id, master.id);
             publish(&state, &format!("{base}/peakmeter"), serde_json::json!(*master.meter_db.lock().unwrap()));
             publish(&state, &format!("{base}/input-meter"), serde_json::json!(*master.input_meter_db.lock().unwrap()));
-            publish(&state, &format!("{base}/filter"), filter_json(&master.filter));
-            publish(&state, &format!("{base}/eq"), eq_json(&master.eq));
-            publish(&state, &format!("{base}/dyn1"), dynamics_json(&master.dyn1));
-            publish(&state, &format!("{base}/dyn2"), dynamics_json(&master.dyn2));
-            publish(&state, &format!("{base}/phase"), phase_json(&master.phase));
-            publish(&state, &format!("{base}/delay"), delay_json(&master.delay));
+            publish(&state, &format!("{base}/chain"), chain_json(&master.chain));
         }
         // channel-list/sum-list/master-list: how a client discovers what track/bus/master ids
         // exist at all (topology.rs's CREATE/DELETE also re-publish these immediately on success,
@@ -747,5 +728,31 @@ impl StreamHalf {
     async fn next_message(&mut self) -> Option<Result<Message, axum::Error>> {
         use futures_util::StreamExt;
         self.0.next().await
+    }
+}
+
+#[cfg(test)]
+mod parse_path_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_four_segment_path_has_no_extra() {
+        assert_eq!(parse_path("amixer/0/channel/5/gain", 0), Some(("channel", "5", "gain", None)));
+    }
+
+    #[test]
+    fn stage_path_carries_its_index_as_extra() {
+        assert_eq!(parse_path("amixer/0/channel/5/stage/2", 0), Some(("channel", "5", "stage", Some("2"))));
+        assert_eq!(parse_path("amixer/0/master/1/stage/0", 0), Some(("master", "1", "stage", Some("0"))));
+    }
+
+    #[test]
+    fn a_seventh_segment_is_rejected() {
+        assert_eq!(parse_path("amixer/0/channel/5/stage/2/extra", 0), None);
+    }
+
+    #[test]
+    fn wrong_mixer_id_is_rejected() {
+        assert_eq!(parse_path("amixer/1/channel/5/gain", 0), None);
     }
 }

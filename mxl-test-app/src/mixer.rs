@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use crate::config::{BusConfig, ChannelTemplate, MasterTrackConfig, TrackConfig};
-use crate::dsp::{DelayStage, DynamicsStage, EqStage, FilterStage, PhaseStage};
+use crate::config::{BusConfig, MasterTrackConfig, TrackConfig};
+use crate::dsp::ProcessingStage;
 
 /// Where in a track's own chain a `Send` taps its signal from. Real consoles (see
 /// `~/DEV/yam bus.png`, a Yamaha "CH to MIX" send diagram) offer taps before/after several
@@ -70,21 +70,13 @@ pub struct Track {
     /// `std::sync::Mutex` for the same plain-OS-thread-engine reasoning as `mixer.rs`'s other
     /// per-period-written fields.
     pub direct_out_prev: Mutex<Vec<Vec<f32>>>,
-    /// Processing-chain stages (`dsp.rs`) — `None` unless this track's `ChannelTemplate` includes
-    /// them; see `dsp.rs`'s module docs for why an absent stage is `None`, not a present-but-off
-    /// one, and why none of them affect the signal yet (structural placeholders, not real DSP).
-    pub filter: Option<FilterStage>,
-    pub eq: Option<EqStage>,
-    pub dyn1: Option<DynamicsStage>,
-    pub dyn2: Option<DynamicsStage>,
-    pub phase: Option<PhaseStage>,
-    pub delay: Option<DelayStage>,
-    /// Which `ChannelTemplate` this track was built with — stored explicitly (not derived from
-    /// `filter.is_some()`) so persistence's topology capture (`persistence.rs`, `topology.rs`)
-    /// stays correct even if a future `dsp.rs` change ever lets stages move independently of each
-    /// other; right now they always move together as one `full` bool (see `Track::new`), but that's
-    /// an implementation detail this field doesn't want to depend on.
-    pub template: ChannelTemplate,
+    /// Ordered, typed processing chain (`dsp.rs`) — replaces the old six named `Option<Stage>`
+    /// fields + binary `ChannelTemplate` gate. Order and membership are fixed at construction time
+    /// (CREATE or startup `Config`, via `config::build_chain`); there's no live reorder (confirmed
+    /// with the user — delete/recreate the track to change its chain). An absent stage is simply
+    /// not an element of this `Vec` (see `dsp.rs`'s own module docs) — not present-but-off, and
+    /// none of them affect the signal yet (structural placeholders, not real DSP).
+    pub chain: Vec<ProcessingStage>,
     /// `true` for a track created at runtime via the `CREATE` WS op (`ws.rs`/`topology.rs`), `false`
     /// for anything built from `Config` at startup. Lets `persistence.rs::capture` know which
     /// tracks need their full topology (not just live values) saved so they can be reconstructed on
@@ -98,7 +90,6 @@ impl Track {
     }
 
     pub fn new_with_origin(cfg: &TrackConfig, channels: usize, dynamically_created: bool) -> Self {
-        let full = cfg.template == ChannelTemplate::FullChannel;
         Self {
             id: cfg.id,
             label: cfg.label.clone(),
@@ -111,13 +102,7 @@ impl Track {
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             input_meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             direct_out_prev: Mutex::new(vec![Vec::new(); channels]),
-            filter: full.then(FilterStage::default_on),
-            eq: full.then(EqStage::default_on),
-            dyn1: full.then(DynamicsStage::default_on),
-            dyn2: full.then(DynamicsStage::default_on),
-            phase: full.then(PhaseStage::default_on),
-            delay: full.then(DelayStage::default_on),
-            template: cfg.template,
+            chain: crate::config::build_chain(&cfg.chain, cfg.template),
             dynamically_created,
         }
     }
@@ -208,16 +193,9 @@ pub struct MasterTrack {
     /// never need cycle detection/topological sort, the exact same trick
     /// `Track.direct_out_prev`/`Bus.output_prev` already rely on for track/bus.
     pub output_prev: Mutex<Vec<Vec<f32>>>,
-    /// Processing-chain stages (`dsp.rs`) — see `Track`'s own fields of the same names for what
-    /// each means.
-    pub filter: Option<FilterStage>,
-    pub eq: Option<EqStage>,
-    pub dyn1: Option<DynamicsStage>,
-    pub dyn2: Option<DynamicsStage>,
-    pub phase: Option<PhaseStage>,
-    pub delay: Option<DelayStage>,
-    /// See `Track.template`'s own doc -- same meaning, same purpose.
-    pub template: ChannelTemplate,
+    /// Ordered, typed processing chain (`dsp.rs`) — see `Track.chain`'s own doc for what this
+    /// means; same shape and same fixed-at-construction lifecycle here.
+    pub chain: Vec<ProcessingStage>,
     /// See `Track.dynamically_created`'s own doc -- same meaning, same purpose.
     pub dynamically_created: bool,
 }
@@ -228,7 +206,6 @@ impl MasterTrack {
     }
 
     pub fn new_with_origin(cfg: &MasterTrackConfig, channels: usize, dynamically_created: bool) -> Self {
-        let full = cfg.template == ChannelTemplate::FullChannel;
         Self {
             id: cfg.id,
             label: cfg.label.clone(),
@@ -238,13 +215,7 @@ impl MasterTrack {
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             input_meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             output_prev: Mutex::new(vec![Vec::new(); channels]),
-            filter: full.then(FilterStage::default_on),
-            eq: full.then(EqStage::default_on),
-            dyn1: full.then(DynamicsStage::default_on),
-            dyn2: full.then(DynamicsStage::default_on),
-            phase: full.then(PhaseStage::default_on),
-            delay: full.then(DelayStage::default_on),
-            template: cfg.template,
+            chain: crate::config::build_chain(&cfg.chain, cfg.template),
             dynamically_created,
         }
     }

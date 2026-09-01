@@ -141,23 +141,88 @@ pub struct TrackConfig {
     pub gain_db: f32,
     #[serde(default)]
     pub fader_db: f32,
-    /// Which processing stages this track's chain actually has — see `ChannelTemplate`'s docs.
+    /// Back-compat sugar only — expanded by `build_chain` into a canned `chain` when `chain` itself
+    /// is empty. See `ChannelTemplate::expand`'s own docs for why this stays supported rather than
+    /// being removed now that `chain` is the authoritative shape.
     #[serde(default)]
     pub template: ChannelTemplate,
+    /// This track's ordered, typed processing chain (`dsp.rs::ProcessingStage`) — authoritative
+    /// whenever non-empty; wins over `template` (see `build_chain`). Order is fixed once the track
+    /// is built (CREATE or startup `Config`) — no live reorder exists.
+    #[serde(default)]
+    pub chain: Vec<StageSlotConfig>,
 }
 
-/// Which processing stages a `Track`/`Bus` chain actually has (`dsp.rs`) — chosen per-resource in
-/// config, or in bulk for a container-sized deployment via `docker-entrypoint.sh`'s
-/// `CHANNEL_TEMPLATE` env var. `Simple` (the default) is today's chain: gain -> fader -> mute/solo
-/// only, matching every track/bus before this was added. `FullChannel` adds every stage in
-/// `dsp.rs` (filter, EQ, both dynamics stages, phase, delay) — as structural placeholders (see
-/// `dsp.rs`'s own docs), not real DSP yet.
+/// One entry in a `TrackConfig`'s/`MasterTrackConfig`'s ordered `chain` — the CREATE-time/config.json
+/// shape for one processing-chain slot (`dsp.rs::ProcessingStage`). `index` is accepted but
+/// harmlessly ignored here (no `deny_unknown_fields`) — array position within `chain` is what's
+/// authoritative, matching the same `{index,kind,params}` shape `ws.rs::chain_json` publishes, so a
+/// dashboard can round-trip a discovered chain straight back into a CREATE payload without
+/// reshaping it.
+#[derive(Deserialize, Clone, Debug)]
+pub struct StageSlotConfig {
+    pub kind: crate::dsp::StageKind,
+    /// Initial per-field overrides, same shape as that kind's own PUT/broadcast value (e.g.
+    /// `{"hp_hz":100}` for a filter). Omitted/null keeps that kind's own `default_on()` values.
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+impl StageSlotConfig {
+    pub fn build(&self) -> crate::dsp::ProcessingStage {
+        let stage = crate::dsp::ProcessingStage::default_on(self.kind);
+        stage.apply(&self.params);
+        stage
+    }
+}
+
+/// Which processing stages a `Track`/`MasterTrack` chain has by default when its own `chain` is
+/// left empty (`build_chain`) — deploy-time convenience sugar, chosen per-resource in config, or in
+/// bulk for a container-sized deployment via `docker-entrypoint.sh`'s `CHANNEL_TEMPLATE` env var.
+/// `Simple` (the default) means no stages at all — matching every track/master before the ordered
+/// `chain` feature existed. `FullChannel` expands to the exact legacy fixed six-stage chain (filter
+/// -> eq -> dynamics -> dynamics -> phase -> delay, `ChannelTemplate::expand`) — as structural
+/// placeholders (see `dsp.rs`'s own docs), not real DSP yet. Kept (not replaced by `chain` alone)
+/// so every existing `docker-entrypoint.sh`/`kube-example.yaml` deployment and hand-authored
+/// `config.json` using `"template":"full_channel"` keeps building the exact same chain it always
+/// did, with zero changes required on their part.
 #[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelTemplate {
     #[default]
     Simple,
     FullChannel,
+}
+
+impl ChannelTemplate {
+    /// `Simple` -> no stages. `FullChannel` -> byte-identical to the legacy fixed
+    /// filter->eq->dyn1->dyn2->phase->delay order/defaults this template always produced, before
+    /// the ordered `chain` field existed — a deserialize-time convenience only, not itself stored
+    /// on the live `Track`/`MasterTrack` (see mixer.rs's `chain` field doc).
+    pub fn expand(self) -> Vec<StageSlotConfig> {
+        use crate::dsp::StageKind;
+        match self {
+            ChannelTemplate::Simple => vec![],
+            ChannelTemplate::FullChannel => {
+                [StageKind::Filter, StageKind::Eq, StageKind::Dynamics, StageKind::Dynamics, StageKind::Phase, StageKind::Delay]
+                    .into_iter()
+                    .map(|kind| StageSlotConfig { kind, params: serde_json::Value::Null })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// Resolves a `TrackConfig`'s/`MasterTrackConfig`'s actual processing chain: an explicit non-empty
+/// `chain` always wins; `template` is expanded (`ChannelTemplate::expand`) only when `chain` is
+/// empty. See `ChannelTemplate`'s own doc for why `template` stays supported as sugar rather than
+/// being removed now that `chain` is the authoritative, self-describing shape.
+pub fn build_chain(chain: &[StageSlotConfig], template: ChannelTemplate) -> Vec<crate::dsp::ProcessingStage> {
+    if chain.is_empty() {
+        template.expand().iter().map(StageSlotConfig::build).collect()
+    } else {
+        chain.iter().map(StageSlotConfig::build).collect()
+    }
 }
 
 /// One `TrackConfig`'s send — see `mixer::Send`'s docs for what each field means and why this one
@@ -263,6 +328,9 @@ pub struct AutoMasterConfig {
     pub fader_db: f32,
     #[serde(default)]
     pub template: ChannelTemplate,
+    /// See `TrackConfig.chain`'s own doc — same meaning, applied to the synthesized master.
+    #[serde(default)]
+    pub chain: Vec<StageSlotConfig>,
 }
 
 /// A master track: a controllable channel strip fed by `master-in` (patch.rs) — see `mixer::MasterTrack`'s
@@ -279,6 +347,9 @@ pub struct MasterTrackConfig {
     pub fader_db: f32,
     #[serde(default)]
     pub template: ChannelTemplate,
+    /// See `TrackConfig.chain`'s own doc — same meaning, same authoritative-over-`template` rule.
+    #[serde(default)]
+    pub chain: Vec<StageSlotConfig>,
 }
 
 /// Where an output-grid entry's own MXL flow is created (`OutputGridEntryConfig::target`) — no
@@ -377,5 +448,91 @@ mod entrypoint_tests {
         assert!(cfg.buses[0].auto_master.is_some());
         assert!(cfg.buses[1].auto_master.is_some());
         assert!(cfg.output_grid[0].target.is_some());
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use crate::dsp::StageKind;
+
+    #[test]
+    fn full_channel_expands_to_the_exact_legacy_order_and_defaults() {
+        // Regression pin: this exact order (filter, eq, two dynamics, phase, delay) is what every
+        // FullChannel-templated track/master has always built, from before the ordered `chain`
+        // field existed -- changing it would silently change every existing deployment's chain
+        // shape with no compile-time signal.
+        let slots = ChannelTemplate::FullChannel.expand();
+        let kinds: Vec<StageKind> = slots.iter().map(|s| s.kind).collect();
+        assert_eq!(kinds, vec![StageKind::Filter, StageKind::Eq, StageKind::Dynamics, StageKind::Dynamics, StageKind::Phase, StageKind::Delay]);
+    }
+
+    #[test]
+    fn simple_expands_to_no_stages() {
+        assert!(ChannelTemplate::Simple.expand().is_empty());
+    }
+
+    #[test]
+    fn build_chain_prefers_explicit_chain_over_template() {
+        let explicit = vec![StageSlotConfig { kind: StageKind::Eq, params: serde_json::Value::Null }];
+        let chain = build_chain(&explicit, ChannelTemplate::FullChannel);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].kind(), StageKind::Eq);
+    }
+
+    #[test]
+    fn build_chain_falls_back_to_template_expansion_when_chain_is_empty() {
+        let chain = build_chain(&[], ChannelTemplate::FullChannel);
+        let kinds: Vec<StageKind> = chain.iter().map(|s| s.kind()).collect();
+        assert_eq!(kinds, vec![StageKind::Filter, StageKind::Eq, StageKind::Dynamics, StageKind::Dynamics, StageKind::Phase, StageKind::Delay]);
+    }
+
+    #[test]
+    fn build_chain_empty_chain_and_default_template_yields_no_stages() {
+        assert!(build_chain(&[], ChannelTemplate::default()).is_empty());
+    }
+
+    /// The single most important pin for keeping `ChannelTemplate` as back-compat sugar (see its
+    /// own doc comment): a `TrackConfig` JSON byte-identical to what `docker-entrypoint.sh`
+    /// actually generates today (`template` only, no `chain` key at all) must still build the
+    /// legacy 6-stage chain, unchanged, after the ordered-chain feature landed.
+    #[test]
+    fn track_config_with_only_template_still_builds_the_legacy_chain() {
+        let json = serde_json::json!({
+            "id": 0, "label": "Track 1", "sends": [], "template": "full_channel"
+        })
+        .to_string();
+        let cfg: TrackConfig = serde_json::from_str(&json).unwrap();
+        assert!(cfg.chain.is_empty(), "docker-entrypoint.sh never emits a chain key");
+        let chain = build_chain(&cfg.chain, cfg.template);
+        let kinds: Vec<StageKind> = chain.iter().map(|s| s.kind()).collect();
+        assert_eq!(kinds, vec![StageKind::Filter, StageKind::Eq, StageKind::Dynamics, StageKind::Dynamics, StageKind::Phase, StageKind::Delay]);
+    }
+
+    #[test]
+    fn stage_slot_config_build_applies_params_override() {
+        let slot = StageSlotConfig { kind: StageKind::Filter, params: serde_json::json!({"hp_hz": 100.0}) };
+        let stage = slot.build();
+        assert_eq!(stage.to_json()["hp_hz"], 100.0);
+    }
+
+    #[test]
+    fn stage_slot_config_build_with_null_params_yields_default_on() {
+        let slot = StageSlotConfig { kind: StageKind::Delay, params: serde_json::Value::Null };
+        let stage = slot.build();
+        assert_eq!(stage.to_json(), crate::dsp::ProcessingStage::default_on(StageKind::Delay).to_json());
+    }
+
+    #[test]
+    fn a_reordered_explicit_chain_deserializes_and_preserves_order() {
+        let json = serde_json::json!({
+            "id": 5, "label": "Vocal", "sends": [],
+            "chain": [{"kind": "eq"}, {"kind": "dynamics"}, {"kind": "filter"}]
+        })
+        .to_string();
+        let cfg: TrackConfig = serde_json::from_str(&json).unwrap();
+        let chain = build_chain(&cfg.chain, cfg.template);
+        let kinds: Vec<StageKind> = chain.iter().map(|s| s.kind()).collect();
+        assert_eq!(kinds, vec![StageKind::Eq, StageKind::Dynamics, StageKind::Filter]);
     }
 }

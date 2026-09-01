@@ -32,17 +32,9 @@ input-patch (track-in, grid destination)
         v
       gain  ---------------------------------------> PreFader pickoff
         |
-   [filter]  (FullChannel template only, dsp.rs -- structural placeholder, no signal effect yet)
-        |
-     [eq]    (FullChannel template only)
-        |
-   [dyn1]    (FullChannel template only)
-        |
-   [dyn2]    (FullChannel template only)
-        |
-  [phase]    (FullChannel template only)
-        |
-  [delay]    (FullChannel template only)
+   [chain]   (ordered, typed processing slots, dsp.rs -- structural placeholders, no signal
+        |     effect yet -- zero or more of filter/eq/dynamics/phase/delay, in whatever order
+        |     and count this track was built with; see §1a)
         |
       fader
         |
@@ -51,16 +43,34 @@ input-patch (track-in, grid destination)
       sends ---> one or more buses, each at that Send's own pickoff (Pre/PostFader)/level/on
 ```
 
-- `[bracketed]` stages exist only if the track's `ChannelTemplate` (`config.rs`) is `FullChannel` —
-  `Option<Stage>` on `Track`, `None` (not present, not skipped) for `Simple`.
-- **`PreFader`** taps right after gain, before the (possibly absent) processing stages and the
-  fader/mute/solo — see `mixer::PickoffPoint`'s own docs for why this app's chain only has two
-  distinguishable taps (no separate PRE_FILTER/PRE_DYN1/PRE_DYN2 taps the way `yam bus.png` shows a
-  real console offering, since the stages between them don't yet do anything audible to tap
-  differently around).
+- **`PreFader`** taps right after gain, before `chain` and the fader/mute/solo — see
+  `mixer::PickoffPoint`'s own docs for why this app's chain only has two distinguishable taps (no
+  separate per-slot taps the way `yam bus.png` shows a real console offering, since no slot does
+  anything audible yet to tap differently around).
 - **`PostFader`** taps after fader + mute/solo — this *is* the `track-out:<id>` grid source value.
 - A track's contribution to a bus only ever happens through its own `sends` (`mixer::Send`) —
   never automatic, always an explicit send entry.
+
+### 1a. `chain`: ordered, typed processing slots
+
+`Track.chain`/`MasterTrack.chain` (`mixer.rs`) is a `Vec<dsp::ProcessingStage>` — zero or more
+slots, each one of `filter`/`eq`/`dynamics`/`phase`/`delay` (`dsp::StageKind`), in whatever order
+and count this resource was *built* with. Multiple slots of the same kind (e.g. two `dynamics`
+stages) are legitimately allowed — nothing caps it, unlike the old fixed `dyn1`/`dyn2` fields this
+replaced. **Order and membership are fixed at construction time** (CREATE or startup `Config`) —
+there's no live reorder; delete and recreate a track/master to change its chain (cheap, since
+runtime `CREATE`/`DELETE` already exists — see §4's own "Runtime topology" section).
+
+A `TrackConfig`/`MasterTrackConfig`'s `chain` field is the authoritative, ordered source (a list of
+`{"kind", "params"}` entries — `params` are that kind's own default field shape, e.g. `{"hp_hz":100}`
+for a filter, omitted/`null` keeps that kind's own inaudible default). The older binary `template`
+(`ChannelTemplate`, `Simple`/`FullChannel`) still exists as **deploy-time sugar only** — expanded
+into the exact legacy fixed six-slot chain (filter → eq → dynamics → dynamics → phase → delay) when
+`chain` itself is empty; an explicit non-empty `chain` always wins. Kept specifically so
+`docker-entrypoint.sh`'s `CHANNEL_TEMPLATE` env var (hence every existing container/Kubernetes
+deployment) and any hand-authored `config.json` using `"template":"full_channel"` keep building the
+exact same chain they always did, with zero changes required — see §5's own iteration-history entry
+for the full rationale.
 
 ## 2. Bus (pure summer) structure
 
@@ -85,7 +95,7 @@ sends (from any track)  +  bus-in (grid destination, summing)
 master-in (grid destination, summing — from bus-out, track-out, master-out, or input-grid)
         |
         v
-   [filter] [eq] [dyn1] [dyn2] [phase] [delay]   (FullChannel template only, same as tracks)
+   [chain]  (ordered, typed processing slots -- same as tracks, see §1a)
         |
       fader
         |
@@ -162,11 +172,13 @@ three. See `engine.rs`'s module doc for the exact per-period order.
 | `input-meter` | `[number\|null, ...]` | push only — pre-gain, `track-in:<id>`'s own pickoff meter (what this track's own input-patch actually delivered this period, independent of gain/fader/mute) |
 | `sends` | `[{"bus_id","on","level_db","pickoff":"pre_fader"\|"post_fader"}, ...]` | full-array replace |
 | `input-patch` | `[{"source","channel"}\|null, ...]` | one entry per track channel, exclusive |
-| `filter` | `{"on","hp_hz","lp_hz"}` or `null` | `null`/rejected if template is `Simple` |
-| `eq` | `{"on","bands":[{"freq_hz","gain_db","q"}, ...]}` or `null` | same |
-| `dyn1`, `dyn2` | `{"on","threshold_db","ratio","attack_ms","release_ms","makeup_db"}` or `null` | same |
-| `phase` | `{"invert"}` or `null` | same |
-| `delay` | `{"on","delay_ms"}` or `null` | same |
+| `stage/<index>` | that slot's own kind-shaped value (below) | `index` into this track's own `chain` (§1a); out-of-range index rejected (warn, no-op), never a crash |
+| `chain` | `[{"index","kind","params"}, ...]` | push only (`meter_hz`) — the full ordered chain; `params` is that slot's own kind-shaped value, same as `stage/<index>`'s own PUT/echo shape. The only way to discover what a track's chain even *is* (its shape isn't queryable any other way) |
+
+`stage/<index>`'s own value shape depends on that slot's `kind` (`chain[index]`'s own `kind`):
+`filter` → `{"on","hp_hz","lp_hz"}`; `eq` → `{"on","bands":[{"freq_hz","gain_db","q"}, ...]}`;
+`dynamics` → `{"on","threshold_db","ratio","attack_ms","release_ms","makeup_db"}`; `phase` →
+`{"invert"}`; `delay` → `{"on","delay_ms"}`.
 
 ### `sum/<bus_id>/...` (every bus — a pure summer, see §2)
 
@@ -188,7 +200,7 @@ everything that used to live here moved to `master/<master_id>/...`, below.
 | `peakmeter` | `[number\|null, ...]` | push only — post-fader, `master-out:<id>`'s own pickoff meter |
 | `input-meter` | `[number\|null, ...]` | push only — `master-in:<id>`'s own pickoff meter (this master's only input mechanism, no separate "sends"-style second contributor the way a bus has) |
 | `input-patch` | `[[{"source","channel"}, ...], ...]` | one array per master channel, summing |
-| `filter`, `eq`, `dyn1`, `dyn2`, `phase`, `delay` | same shapes as tracks | `null`/rejected if template is `Simple` |
+| `stage/<index>`, `chain` | same shapes as tracks | see §1a — a master's `chain` has the same rules as a track's |
 
 No `gain`, no `solo` — a master never had either (same as a bus never did).
 
@@ -284,10 +296,28 @@ new resource later `CREATE`d with the same client-chosen id.
   every period — are keyed by id (not position) and only rebuilt when a new `topology_generation`
   counter (bumped on every create/delete) has changed since the scratch was last checked, tolerating
   a changing track/bus/master count without a per-period allocation. `Track`/`Bus`/`MasterTrack`
-  gained `dynamically_created`/`template` fields so persistence (§6) can tell a `CREATE`d resource
-  apart from a config-authored one and reconstruct it faithfully on restart. New `channel-list`/
-  `sum-list`/`master-list` broadcasts close a real pre-existing gap: there was previously no way for
-  a client to discover what track/bus/master ids exist at all.
+  gained a `dynamically_created` field so persistence (§6) can tell a `CREATE`d resource apart from
+  a config-authored one and reconstruct it faithfully on restart. New `channel-list`/`sum-list`/
+  `master-list` broadcasts close a real pre-existing gap: there was previously no way for a client
+  to discover what track/bus/master ids exist at all.
+- **Ordered, typed processing-chain slots** (§1a; same plan file as the entry above): replaced the
+  fixed six named `Option<Stage>` fields + binary `ChannelTemplate` gate with `Track.chain`/
+  `MasterTrack.chain: Vec<dsp::ProcessingStage>` — a user now designs a track's/master's own chain
+  (which stages, in what order, some kinds repeated or omitted entirely) instead of picking between
+  exactly two fixed shapes. Order is fixed at construction time only (no live reorder — delete/
+  recreate to change it, consistent with how `template` already worked before this). New
+  `dsp::StageKind`/`ProcessingStage` sum type wraps the five existing concrete stage structs
+  unchanged; `ws.rs`'s five `apply_*`/`*_json` pairs narrowed from `&Option<T>` to `&T` (presence is
+  now index-existence in the chain, not `Option::None`). **Breaking wire-protocol change**: the six
+  standalone PUT params (`filter`/`eq`/`dyn1`/`dyn2`/`phase`/`delay`) are gone, replaced by
+  `stage/<index>` (one slot, addressed by its position in `chain`) and a new `chain` discovery
+  broadcast (§4) — no legacy param aliases, since `dyn1`/`dyn2` become ambiguous the moment a chain
+  has any count of dynamics stages other than exactly two. `ChannelTemplate` (`Simple`/`FullChannel`)
+  deliberately kept, not removed — now pure deserialize-time sugar in `config.rs` only, expanded
+  into the exact legacy fixed chain when a resource's `chain` is left empty, so every existing
+  `docker-entrypoint.sh`/`kube-example.yaml` container deployment and hand-authored `config.json`
+  using `"template":"full_channel"` keeps building the identical chain with zero changes (pinned by
+  a dedicated back-compat regression test, `config.rs::track_config_with_only_template_still_builds_the_legacy_chain`).
 - **Gatherer** (deferred — design sketch only, see the plan's §15, not implemented): a *separate*
   future app, not a change to this one, for bundling several independently-produced narrow MXL
   flows into one wide flow (SMPTE 2110-30-style stream consolidation) — reads N existing flows,
@@ -309,7 +339,7 @@ live state and JSON.
   on top of the config-built tracks/buses, before the engine thread starts. A brand-new deployment
   (no file yet) just proceeds with config defaults, silently.
 - **Runtime-`CREATE`d topology**: the saved file also carries a `"topology"` section — enough of
-  each `dynamically_created` track/bus/master (id/label/channels/template/sends/current values) to
+  each `dynamically_created` track/bus/master (id/label/channels/chain/sends/current values) to
   reconstruct it via the same `TrackConfig`/`BusConfig`/`MasterTrackConfig` shape `CREATE`'s own
   payload uses. On startup this is applied *before* the ordinary value-resume step above — a
   resource has to already exist in the live collection for a resumed value to have anywhere to go,
