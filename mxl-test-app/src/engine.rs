@@ -305,6 +305,12 @@ pub fn run(state: Arc<MixerState>) {
                 }
             }
 
+            // This track's own ordered processing chain (dsp.rs) -- runs after gain, before fader,
+            // in whatever order the chain's own Vec has (no hardcoded per-kind ordering here).
+            for stage in &track.chain {
+                stage.process(pre, state.sample_rate);
+            }
+
             let fader = db_to_linear(*track.fader_db.lock().unwrap());
             let audible = !is_muted(&track.mute) && (!any_solo || is_soloed(&track.solo));
             let post_scale = if audible { fader } else { 0.0 };
@@ -391,6 +397,12 @@ pub fn run(state: Arc<MixerState>) {
             let input_meters: Vec<f32> = dst.iter().map(|ch| peak_to_db(ch.iter().fold(0.0f32, |m, &s| m.max(s.abs())))).collect();
             *master.input_meter_db.lock().unwrap() = input_meters;
 
+            // This master's own ordered processing chain (dsp.rs) -- runs before the fader (a
+            // master has no separate gain stage, unlike a track -- see mixer.rs's MasterTrack).
+            for stage in &master.chain {
+                stage.process(dst, state.sample_rate);
+            }
+
             let fader = if is_muted(&master.mute) { 0.0 } else { db_to_linear(*master.fader_db.lock().unwrap()) };
             let mut meters = Vec::with_capacity(master.channels);
             for ch in dst.iter_mut() {
@@ -445,7 +457,7 @@ mod tests {
     use crate::config::{BusConfig, MasterTrackConfig, TrackConfig};
 
     fn track(id: u32, channels: usize) -> Arc<Track> {
-        Arc::new(Track::new(&TrackConfig { id, label: format!("T{id}"), channels: None, sends: vec![], gain_db: 0.0, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels))
+        Arc::new(Track::new(&TrackConfig { id, label: format!("T{id}"), channels: None, sends: vec![], gain_db: 0.0, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels, 48000))
     }
 
     fn bus(id: u32, channels: usize) -> Arc<Bus> {
@@ -453,7 +465,7 @@ mod tests {
     }
 
     fn master(id: u32, channels: usize) -> Arc<MasterTrack> {
-        Arc::new(MasterTrack::new(&MasterTrackConfig { id, label: format!("M{id}"), channels: None, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels))
+        Arc::new(MasterTrack::new(&MasterTrackConfig { id, label: format!("M{id}"), channels: None, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels, 48000))
     }
 
     #[test]

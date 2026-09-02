@@ -322,6 +322,7 @@ mod tests {
                         chain: vec![],
                     },
                     ch,
+                    48000,
                 ));
                 (id, track)
             })
@@ -341,6 +342,7 @@ mod tests {
                         chain: vec![],
                     },
                     ch,
+                    48000,
                 ));
                 (id, master)
             })

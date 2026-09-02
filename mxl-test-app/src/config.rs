@@ -169,8 +169,8 @@ pub struct StageSlotConfig {
 }
 
 impl StageSlotConfig {
-    pub fn build(&self) -> crate::dsp::ProcessingStage {
-        let stage = crate::dsp::ProcessingStage::default_on(self.kind);
+    pub fn build(&self, channels: usize, sample_rate: u32) -> crate::dsp::ProcessingStage {
+        let stage = crate::dsp::ProcessingStage::default_on(self.kind, channels, sample_rate);
         stage.apply(&self.params);
         stage
     }
@@ -217,11 +217,11 @@ impl ChannelTemplate {
 /// `chain` always wins; `template` is expanded (`ChannelTemplate::expand`) only when `chain` is
 /// empty. See `ChannelTemplate`'s own doc for why `template` stays supported as sugar rather than
 /// being removed now that `chain` is the authoritative, self-describing shape.
-pub fn build_chain(chain: &[StageSlotConfig], template: ChannelTemplate) -> Vec<crate::dsp::ProcessingStage> {
+pub fn build_chain(chain: &[StageSlotConfig], template: ChannelTemplate, channels: usize, sample_rate: u32) -> Vec<crate::dsp::ProcessingStage> {
     if chain.is_empty() {
-        template.expand().iter().map(StageSlotConfig::build).collect()
+        template.expand().iter().map(|s| s.build(channels, sample_rate)).collect()
     } else {
-        chain.iter().map(StageSlotConfig::build).collect()
+        chain.iter().map(|s| s.build(channels, sample_rate)).collect()
     }
 }
 
@@ -475,21 +475,21 @@ mod chain_tests {
     #[test]
     fn build_chain_prefers_explicit_chain_over_template() {
         let explicit = vec![StageSlotConfig { kind: StageKind::Eq, params: serde_json::Value::Null }];
-        let chain = build_chain(&explicit, ChannelTemplate::FullChannel);
+        let chain = build_chain(&explicit, ChannelTemplate::FullChannel, 2, 48000);
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].kind(), StageKind::Eq);
     }
 
     #[test]
     fn build_chain_falls_back_to_template_expansion_when_chain_is_empty() {
-        let chain = build_chain(&[], ChannelTemplate::FullChannel);
+        let chain = build_chain(&[], ChannelTemplate::FullChannel, 2, 48000);
         let kinds: Vec<StageKind> = chain.iter().map(|s| s.kind()).collect();
         assert_eq!(kinds, vec![StageKind::Filter, StageKind::Eq, StageKind::Dynamics, StageKind::Dynamics, StageKind::Phase, StageKind::Delay]);
     }
 
     #[test]
     fn build_chain_empty_chain_and_default_template_yields_no_stages() {
-        assert!(build_chain(&[], ChannelTemplate::default()).is_empty());
+        assert!(build_chain(&[], ChannelTemplate::default(), 2, 48000).is_empty());
     }
 
     /// The single most important pin for keeping `ChannelTemplate` as back-compat sugar (see its
@@ -504,7 +504,7 @@ mod chain_tests {
         .to_string();
         let cfg: TrackConfig = serde_json::from_str(&json).unwrap();
         assert!(cfg.chain.is_empty(), "docker-entrypoint.sh never emits a chain key");
-        let chain = build_chain(&cfg.chain, cfg.template);
+        let chain = build_chain(&cfg.chain, cfg.template, 2, 48000);
         let kinds: Vec<StageKind> = chain.iter().map(|s| s.kind()).collect();
         assert_eq!(kinds, vec![StageKind::Filter, StageKind::Eq, StageKind::Dynamics, StageKind::Dynamics, StageKind::Phase, StageKind::Delay]);
     }
@@ -512,15 +512,15 @@ mod chain_tests {
     #[test]
     fn stage_slot_config_build_applies_params_override() {
         let slot = StageSlotConfig { kind: StageKind::Filter, params: serde_json::json!({"hp_hz": 100.0}) };
-        let stage = slot.build();
+        let stage = slot.build(2, 48000);
         assert_eq!(stage.to_json()["hp_hz"], 100.0);
     }
 
     #[test]
     fn stage_slot_config_build_with_null_params_yields_default_on() {
         let slot = StageSlotConfig { kind: StageKind::Delay, params: serde_json::Value::Null };
-        let stage = slot.build();
-        assert_eq!(stage.to_json(), crate::dsp::ProcessingStage::default_on(StageKind::Delay).to_json());
+        let stage = slot.build(2, 48000);
+        assert_eq!(stage.to_json(), crate::dsp::ProcessingStage::default_on(StageKind::Delay, 2, 48000).to_json());
     }
 
     #[test]
@@ -531,7 +531,7 @@ mod chain_tests {
         })
         .to_string();
         let cfg: TrackConfig = serde_json::from_str(&json).unwrap();
-        let chain = build_chain(&cfg.chain, cfg.template);
+        let chain = build_chain(&cfg.chain, cfg.template, 2, 48000);
         let kinds: Vec<StageKind> = chain.iter().map(|s| s.kind()).collect();
         assert_eq!(kinds, vec![StageKind::Eq, StageKind::Dynamics, StageKind::Filter]);
     }

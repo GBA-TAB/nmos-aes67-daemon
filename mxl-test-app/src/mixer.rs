@@ -85,11 +85,11 @@ pub struct Track {
 }
 
 impl Track {
-    pub fn new(cfg: &TrackConfig, channels: usize) -> Self {
-        Self::new_with_origin(cfg, channels, false)
+    pub fn new(cfg: &TrackConfig, channels: usize, sample_rate: u32) -> Self {
+        Self::new_with_origin(cfg, channels, sample_rate, false)
     }
 
-    pub fn new_with_origin(cfg: &TrackConfig, channels: usize, dynamically_created: bool) -> Self {
+    pub fn new_with_origin(cfg: &TrackConfig, channels: usize, sample_rate: u32, dynamically_created: bool) -> Self {
         Self {
             id: cfg.id,
             label: cfg.label.clone(),
@@ -102,7 +102,7 @@ impl Track {
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             input_meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             direct_out_prev: Mutex::new(vec![Vec::new(); channels]),
-            chain: crate::config::build_chain(&cfg.chain, cfg.template),
+            chain: crate::config::build_chain(&cfg.chain, cfg.template, channels, sample_rate),
             dynamically_created,
         }
     }
@@ -201,11 +201,11 @@ pub struct MasterTrack {
 }
 
 impl MasterTrack {
-    pub fn new(cfg: &MasterTrackConfig, channels: usize) -> Self {
-        Self::new_with_origin(cfg, channels, false)
+    pub fn new(cfg: &MasterTrackConfig, channels: usize, sample_rate: u32) -> Self {
+        Self::new_with_origin(cfg, channels, sample_rate, false)
     }
 
-    pub fn new_with_origin(cfg: &MasterTrackConfig, channels: usize, dynamically_created: bool) -> Self {
+    pub fn new_with_origin(cfg: &MasterTrackConfig, channels: usize, sample_rate: u32, dynamically_created: bool) -> Self {
         Self {
             id: cfg.id,
             label: cfg.label.clone(),
@@ -215,7 +215,7 @@ impl MasterTrack {
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             input_meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             output_prev: Mutex::new(vec![Vec::new(); channels]),
-            chain: crate::config::build_chain(&cfg.chain, cfg.template),
+            chain: crate::config::build_chain(&cfg.chain, cfg.template, channels, sample_rate),
             dynamically_created,
         }
     }
@@ -331,6 +331,50 @@ mod tests {
         mix_into_scaled(&src_a, &mut dst, 1, 1.0);
         mix_into_scaled(&src_b, &mut dst, 1, 1.0);
         assert_eq!(dst, vec![vec![3.0]]);
+    }
+
+    /// End-to-end check of a track built via config with a real, explicit, reordered chain --
+    /// exercises the exact same construction path (`Track::new` -> `config::build_chain`) and chain
+    /// iteration order (`for stage in &track.chain { stage.process(...) }`) `engine.rs`'s per-period
+    /// loop uses, without needing a live MXL flow/WS stack. A highpass well above the tone's own
+    /// frequency, followed by a hard-limiting compressor, should leave a measurably smaller and
+    /// differently-shaped signal than the original.
+    #[test]
+    fn a_tracks_configured_chain_actually_processes_the_signal_in_order() {
+        use crate::config::{StageSlotConfig, TrackConfig};
+        use crate::dsp::StageKind;
+
+        let cfg = TrackConfig {
+            id: 0,
+            label: "T".to_string(),
+            channels: None,
+            sends: vec![],
+            gain_db: 0.0,
+            fader_db: 0.0,
+            template: Default::default(),
+            chain: vec![
+                StageSlotConfig { kind: StageKind::Filter, params: serde_json::json!({"hp_hz": 2000.0}) },
+                StageSlotConfig {
+                    kind: StageKind::Dynamics,
+                    params: serde_json::json!({"threshold_db": -30.0, "ratio": 8.0, "attack_ms": 0.5}),
+                },
+            ],
+        };
+        let sample_rate = 48000;
+        let track = Track::new(&cfg, 1, sample_rate);
+        assert_eq!(track.chain.len(), 2);
+
+        let tone: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.9).collect();
+        let mut samples = vec![tone.clone()];
+        for stage in &track.chain {
+            stage.process(&mut samples, sample_rate);
+        }
+
+        let differs = samples[0].iter().zip(tone.iter()).any(|(a, b)| (a - b).abs() > 1e-3);
+        assert!(differs, "a real filter+dynamics chain should measurably alter the signal");
+        let out_peak = samples[0][4000..4800].iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        let in_peak = tone[4000..4800].iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(out_peak < in_peak, "a low-threshold high-ratio compressor after the filter should reduce steady-state peak level");
     }
 
     #[test]

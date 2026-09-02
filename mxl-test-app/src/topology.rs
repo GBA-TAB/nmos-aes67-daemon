@@ -21,9 +21,9 @@ use crate::config::{BusConfig, MasterTrackConfig, TrackConfig};
 use crate::engine::MixerState;
 use crate::mixer::{channels_compatible, Bus, MasterTrack, Track};
 
-pub fn build_track(cfg: &TrackConfig, default_channels: usize, dynamically_created: bool) -> Arc<Track> {
+pub fn build_track(cfg: &TrackConfig, default_channels: usize, sample_rate: u32, dynamically_created: bool) -> Arc<Track> {
     let channels = cfg.channels.map(|c| c as usize).unwrap_or(default_channels);
-    Arc::new(Track::new_with_origin(cfg, channels, dynamically_created))
+    Arc::new(Track::new_with_origin(cfg, channels, sample_rate, dynamically_created))
 }
 
 pub fn build_bus(cfg: &BusConfig, default_channels: usize, dynamically_created: bool) -> Arc<Bus> {
@@ -31,9 +31,9 @@ pub fn build_bus(cfg: &BusConfig, default_channels: usize, dynamically_created: 
     Arc::new(Bus::new_with_origin(cfg, channels, dynamically_created))
 }
 
-pub fn build_master(cfg: &MasterTrackConfig, default_channels: usize, dynamically_created: bool) -> Arc<MasterTrack> {
+pub fn build_master(cfg: &MasterTrackConfig, default_channels: usize, sample_rate: u32, dynamically_created: bool) -> Arc<MasterTrack> {
     let channels = cfg.channels.map(|c| c as usize).unwrap_or(default_channels);
-    Arc::new(MasterTrack::new_with_origin(cfg, channels, dynamically_created))
+    Arc::new(MasterTrack::new_with_origin(cfg, channels, sample_rate, dynamically_created))
 }
 
 /// Warns (does not reject) about any of `track`'s `sends` targeting a bus with an incompatible
@@ -65,7 +65,7 @@ pub fn warn_incompatible_sends(track: &Track, buses: &[Arc<Bus>]) {
 /// Bumps `topology_generation` on success so `engine::run`'s own scratch-buffer rebuild picks up
 /// the new track on the very next period it checks (see `engine.rs`'s own doc comment).
 pub fn create_track(mixer: &MixerState, cfg: &TrackConfig) -> Result<Arc<Track>, String> {
-    let track = build_track(cfg, mixer.default_channels, true);
+    let track = build_track(cfg, mixer.default_channels, mixer.sample_rate, true);
     {
         let mut tracks = mixer.tracks.lock().unwrap();
         if tracks.contains_key(&cfg.id) {
@@ -97,7 +97,7 @@ pub fn create_bus(mixer: &MixerState, cfg: &BusConfig) -> Result<Arc<Bus>, Strin
 }
 
 pub fn create_master(mixer: &MixerState, cfg: &MasterTrackConfig) -> Result<Arc<MasterTrack>, String> {
-    let master = build_master(cfg, mixer.default_channels, true);
+    let master = build_master(cfg, mixer.default_channels, mixer.sample_rate, true);
     {
         let mut masters = mixer.masters.lock().unwrap();
         if masters.contains_key(&cfg.id) {

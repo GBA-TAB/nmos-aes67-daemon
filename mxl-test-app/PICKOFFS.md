@@ -32,9 +32,9 @@ input-patch (track-in, grid destination)
         v
       gain  ---------------------------------------> PreFader pickoff
         |
-   [chain]   (ordered, typed processing slots, dsp.rs -- structural placeholders, no signal
-        |     effect yet -- zero or more of filter/eq/dynamics/phase/delay, in whatever order
-        |     and count this track was built with; see §1a)
+   [chain]   (ordered, typed processing slots, dsp.rs -- real DSP, applied in order -- zero or
+        |     more of filter/eq/dynamics/phase/delay, in whatever order and count this track
+        |     was built with; see §1a)
         |
       fader
         |
@@ -45,8 +45,8 @@ input-patch (track-in, grid destination)
 
 - **`PreFader`** taps right after gain, before `chain` and the fader/mute/solo — see
   `mixer::PickoffPoint`'s own docs for why this app's chain only has two distinguishable taps (no
-  separate per-slot taps the way `yam bus.png` shows a real console offering, since no slot does
-  anything audible yet to tap differently around).
+  separate per-slot taps the way `yam bus.png` shows a real console offering — a real, audible
+  effect now runs at each slot, but this app still doesn't expose a tap between individual slots).
 - **`PostFader`** taps after fader + mute/solo — this *is* the `track-out:<id>` grid source value.
 - A track's contribution to a bus only ever happens through its own `sends` (`mixer::Send`) —
   never automatic, always an explicit send entry.
@@ -318,6 +318,26 @@ new resource later `CREATE`d with the same client-chosen id.
   `docker-entrypoint.sh`/`kube-example.yaml` container deployment and hand-authored `config.json`
   using `"template":"full_channel"` keeps building the identical chain with zero changes (pinned by
   a dedicated back-compat regression test, `config.rs::track_config_with_only_template_still_builds_the_legacy_chain`).
+- **Real DSP for the processing-chain stages** (`~/.claude/plans/snug-painting-elephant.md`,
+  superseding the entry above's "structural placeholders" framing): every `chain` slot now applies a
+  real effect — `engine.rs` calls `ProcessingStage::process` once per slot, in chain order, between a
+  track's gain and fader (and, for a master, between its input-meter measurement and its fader).
+  Filter is a cascaded HP/LP biquad pair (2nd-order Butterworth); EQ is a bank of peaking biquads,
+  one per band; Dynamics is a feed-forward peak detector with exponential attack/release and a static
+  compressor curve (`ratio` clamped `>= 1.0` — this app still doesn't model a distinct gate/expander
+  mode); Phase is an exact sign flip; Delay is a per-channel circular buffer, pre-allocated to a fixed
+  2-second cap so a `delay_ms` change never allocates on the audio thread. New `biquad.rs` holds the
+  hand-rolled RBJ "Audio EQ Cookbook" coefficient formulas (no DSP crate dependency). Each stage's
+  persistent per-channel signal state (filter/EQ biquad registers, the dynamics envelope, the delay
+  ring) lives in new private, `Mutex`-wrapped fields alongside that stage's existing parameters —
+  sized once at construction from the track's/master's own `channels` (and, for Delay, `sample_rate`),
+  which is why `ProcessingStage::default_on`/`StageSlotConfig::build`/`config::build_chain`/
+  `Track::new*`/`MasterTrack::new*`/`topology::build_track`/`build_master` all gained `channels`/
+  `sample_rate` parameters (pure plumbing, no behavior change to any of them beyond that). At every
+  stage's own default parameters the effect is an exact no-op (pinned by dedicated unit tests), so
+  this does not change the audible behavior of any existing chain until its parameters are actually
+  moved off default. This is the real-time audio thread's only new locking beyond what it already did
+  for gain/fader/sends/mute — deliberately not a new risk category (see the plan's Context section).
 - **Gatherer** (deferred — design sketch only, see the plan's §15, not implemented): a *separate*
   future app, not a change to this one, for bundling several independently-produced narrow MXL
   flows into one wide flow (SMPTE 2110-30-style stream consolidation) — reads N existing flows,

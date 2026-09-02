@@ -656,6 +656,7 @@ mod tests {
                         chain: vec![],
                     },
                     ch,
+                    48000,
                 ))
             })
             .collect()
