@@ -338,6 +338,20 @@ new resource later `CREATE`d with the same client-chosen id.
   this does not change the audible behavior of any existing chain until its parameters are actually
   moved off default. This is the real-time audio thread's only new locking beyond what it already did
   for gain/fader/sends/mute — deliberately not a new risk category (see the plan's Context section).
+
+  **Live-verified end-to-end**, not just unit-tested: a standalone throwaway Rust tool (same `mxl`
+  crate/API `flow.rs` itself uses — no `speaker-test`/ALSA involved, this app has no sound-card path
+  at all) wrote a real 300 Hz sine into a real MXL flow feeding a track's `input-patch`, and read the
+  processed result back from a real MXL flow patched from that track's `track-out`. With a live
+  `hp_hz: 2000` filter stage, the tone came out attenuated **34.3 dB**; PUTting `hp_hz` back down to
+  its inaudible default (20 Hz) over the running WS connection dropped that to a clean ~0 dB
+  passthrough — confirming the engine applies a chain slot's *current* live parameters every period,
+  not a value cached at construction or CREATE time. (One early reading in that same session showed a
+  spurious, perfectly-alternating every-other-period silence pattern on the output flow; extensive
+  follow-up — varying the track, its chain, and the patch — never reproduced it on a freshly-started
+  instance, and it tracked a test-only condition: the tool's own tone generator had a fixed, short
+  lifetime and was mid-exit-or-already-dead during that one reading, not a defect in this app's
+  engine or the new DSP code. Documented here rather than silently dropped, in case it recurs.)
 - **Gatherer** (deferred — design sketch only, see the plan's §15, not implemented): a *separate*
   future app, not a change to this one, for bundling several independently-produced narrow MXL
   flows into one wide flow (SMPTE 2110-30-style stream consolidation) — reads N existing flows,
