@@ -44,8 +44,8 @@ pub fn device_id(instance_name: &str) -> uuid::Uuid {
     stable_id(&format!("mxl-test-app-instance-device:{instance_name}"))
 }
 
-// Neither a bus nor a master track has NMOS presence of its own (see the plan at
-// ~/.claude/plans/snug-painting-elephant.md §14) -- only grid entries do. There is deliberately no
+// Neither a bus nor a master track has NMOS presence of its own (PICKOFFS.md's own intro) -- only
+// grid entries do. There is deliberately no
 // "bus"/"master" id family here anymore; `instance_input_receiver_id`/`instance_output_*` below are
 // the only NMOS-facing ids this app derives.
 

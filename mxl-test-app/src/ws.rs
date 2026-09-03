@@ -2,8 +2,8 @@
 //! WATCH/PUT from the client, plain `{path, value}` pushed from this server) so that existing
 //! dashboard can drive this app with no changes: paths are `amixer/{mixerId}/{trackKind}/{id}/
 //! {param}` with `trackKind` "channel" for tracks, "sum" for buses (pure summers — just
-//! `input-patch`, no fader/mute/DSP anymore, see the plan at
-//! ~/.claude/plans/snug-painting-elephant.md), "master" for master tracks (everything a bus used to
+//! `input-patch`, no fader/mute/DSP anymore, see PICKOFFS.md §2), "master" for master tracks
+//! (everything a bus used to
 //! carry moved here — fader/mute/DSP/`input-patch`), and "output" for the pickoff-point patch bay's
 //! output grid (`id` there is a string, not numeric; see `parse_path`'s docs) — the dashboard also
 //! knows "vca"/"aux"/"reverb"/"group" but this app never populates those, so it simply shows no
@@ -80,8 +80,8 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
             // has very few simultaneous clients) — WATCH is accepted but otherwise a no-op.
             "WATCH" => {}
             "PUT" => handle_put(&state, path, cmd.get("value")),
-            // Runtime processing-scale changes (plan at
-            // ~/.claude/plans/snug-painting-elephant.md) -- fully decorrelated from the NMOS-facing
+            // Runtime processing-scale changes (PICKOFFS.md §4's "Runtime topology" subsection) --
+            // fully decorrelated from the NMOS-facing
             // input/output grid, which this op pair never touches at all (see topology.rs's own
             // module doc comment). Like PUT, a rejected CREATE/DELETE stays silent-with-server-log
             // (no ack/error envelope -- this protocol has no request/response correlation id at
@@ -299,8 +299,8 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, extra: Option<
         // just a send left at its default `level_db: 0.0`/`pickoff: "post_fader"` (see mixer.rs's
         // `Send` docs for why this is one mechanism, not two). This is deliberately *not* part of
         // the pickoff-point patch bay (patch.rs) -- a send lives on the track object itself and is
-        // presented on the track's own channel strip, not the separate patch/grid page; see the
-        // plan at ~/.claude/plans/snug-painting-elephant.md.
+        // presented on the track's own channel strip, not the separate patch/grid page; see
+        // `patch.rs`'s own module doc.
         "sends" => match parse_sends(value) {
             Ok(sends) => *track.sends.lock().unwrap() = sends,
             Err(e) => tracing::warn!(track_id = track.id, error = %e, "PUT sends: malformed value"),

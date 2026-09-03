@@ -7,8 +7,7 @@ material (`~/DEV/yam bus.png`, a Yamaha "CH to MIX" send-chain diagram; `~/DEV/V
 `~/DEV/Vista grid patch.png`, a Studer DSP-router/crosspoint reference) rather than invented from
 scratch — see each section for which document informed which part.
 
-Two vocabularies stay deliberately separate, per the plan at
-`~/.claude/plans/snug-painting-elephant.md`:
+Two vocabularies stay deliberately separate:
 
 - **Pickoff point**: a position in a track's, bus's, or master's own signal chain (`mixer.rs`,
   `dsp.rs`) — owned by that Track/Bus/MasterTrack object, presented on its own channel strip (a
@@ -107,8 +106,7 @@ sends (from any track)  +  bus-in (grid destination, summing)
 - A bus is deliberately *not* a controllable channel strip — no fader, no mute, no processing
   chain, no gain, no solo, and owns no real MXL flow or NMOS presence of its own. `bus-out` is
   simply the raw sum; it's `MasterTrack` (§2b) that carries everything a bus used to (fader/DSP),
-  fed via `master-in`. See the plan at `~/.claude/plans/snug-painting-elephant.md` §1/§3 for why —
-  in short: patch `bus-out:<id>` into an output-grid entry (or a master) if a real destination is
+  fed via `master-in`. In short: patch `bus-out:<id>` into an output-grid entry (or a master) if a real destination is
   ever wanted, rather than every bus permanently owning a flow whether or not anything's listening.
 - `bus-out` is the *only* bus pickoff point.
 
@@ -242,9 +240,8 @@ Source+Flow+Sender)
 
 New `op` values alongside `WATCH`/`PUT`, for changing the mixer's *processing scale* live while it's
 running — deliberately decorrelated from the input/output grid's own sizing (`INPUT_GRID_COUNT`/
-`OUTPUT_GRID_COUNT`, still config/env-only, still fixed for the process's lifetime — see §1). Full
-design rationale: `~/.claude/plans/snug-painting-elephant.md`; see §5's own bullet below for a
-summary.
+`OUTPUT_GRID_COUNT`, still config/env-only, still fixed for the process's lifetime — see §1). See
+§5's own bullet below for the full design rationale.
 
 | op | Path | Value | Notes |
 |---|---|---|---|
@@ -294,7 +291,7 @@ new resource later `CREATE`d with the same client-chosen id.
   `OutputGridEntry.meter_db` (`output:<id>`, peaked in step 6 right after `resolve_output`). All four
   ride the same `meter_hz` broadcaster tick as the existing meters (`channel/<id>/input-meter`,
   `sum/<id>/input-meter`, `input/<id>/peakmeter`, `output/<id>/peakmeter` — see §4).
-- **Bus/master decorrelation** (`~/.claude/plans/snug-painting-elephant.md`): split the old fused
+- **Bus/master decorrelation**: split the old fused
   `Bus` (summer + controllable strip + its own MXL flow + NMOS Sender) into a pure-summer `Bus`
   (§2) and a new `MasterTrack` (§2b, everything `Bus` lost) — decorrelates bus count from
   "controllable master strip" count (more buses than masters, more masters than buses, a master fed
@@ -308,7 +305,7 @@ new resource later `CREATE`d with the same client-chosen id.
   IS-05 receiver activation (`nmos/server.rs::receiver_patch`) no longer touches any patch as a
   side effect — activating an input and routing it to a track/bus/master are now two fully
   independent steps.
-- **Runtime topology `CREATE`/`DELETE`** (`~/.claude/plans/snug-painting-elephant.md`): before this,
+- **Runtime topology `CREATE`/`DELETE`**: before this,
   the mixer's own processing scale (track/bus/master count) was fixed at startup from `Config`,
   requiring a full process restart to change — decorrelated in principle from the input/output
   grid's own sizing, but in practice just as static. Added live `CREATE`/`DELETE` (§4) backed by an
@@ -343,8 +340,8 @@ new resource later `CREATE`d with the same client-chosen id.
   `docker-entrypoint.sh`/`kube-example.yaml` container deployment and hand-authored `config.json`
   using `"template":"full_channel"` keeps building the identical chain with zero changes (pinned by
   a dedicated back-compat regression test, `config.rs::track_config_with_only_template_still_builds_the_legacy_chain`).
-- **Real DSP for the processing-chain stages** (`~/.claude/plans/snug-painting-elephant.md`,
-  superseding the entry above's "structural placeholders" framing): every `chain` slot now applies a
+- **Real DSP for the processing-chain stages** (superseding the entry above's "structural
+  placeholders" framing): every `chain` slot now applies a
   real effect — `engine.rs` calls `ProcessingStage::process` once per slot, in chain order, between a
   track's gain and fader (and, for a master, between its input-meter measurement and its fader).
   Filter is a cascaded HP/LP biquad pair (2nd-order Butterworth); EQ is a bank of peaking biquads,
@@ -362,7 +359,7 @@ new resource later `CREATE`d with the same client-chosen id.
   stage's own default parameters the effect is an exact no-op (pinned by dedicated unit tests), so
   this does not change the audible behavior of any existing chain until its parameters are actually
   moved off default. This is the real-time audio thread's only new locking beyond what it already did
-  for gain/fader/sends/mute — deliberately not a new risk category (see the plan's Context section).
+  for gain/fader/sends/mute — deliberately not a new risk category.
 
   **Live-verified end-to-end**, not just unit-tested: a standalone throwaway Rust tool (same `mxl`
   crate/API `flow.rs` itself uses — no `speaker-test`/ALSA involved, this app has no sound-card path
@@ -386,7 +383,7 @@ new resource later `CREATE`d with the same client-chosen id.
   `engine.rs`'s existing topology-generation-triggered rebuild, published read-only as
   `.../compensation-delay-ms`. A no-op today by construction; ready for whenever a future
   non-zero-latency stage (a lookahead limiter, a linear-phase EQ mode, …) needs it.
-- **Gatherer** (deferred — design sketch only, see the plan's §15, not implemented): a *separate*
+- **Gatherer** (deferred — design sketch only, not implemented): a *separate*
   future app, not a change to this one, for bundling several independently-produced narrow MXL
   flows into one wide flow (SMPTE 2110-30-style stream consolidation) — reads N existing flows,
   writes one new flow it alone owns, needing no new capability in `flow.rs`. Ties into the existing

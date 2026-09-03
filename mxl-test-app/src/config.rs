@@ -113,7 +113,7 @@ pub struct InputGridEntryConfig {
     /// a raw MXL flow_id", exactly what an input-grid entry needs; nothing here is track-specific
     /// despite the name). `None` — starts with no reader, waiting for IS-05 receiver activation
     /// (`nmos/server.rs::receiver_patch`) to open one; every input-grid entry, fixed or empty, gets
-    /// its own NMOS Receiver either way (see the plan's §14).
+    /// its own NMOS Receiver either way (PICKOFFS.md's own intro).
     #[serde(default)]
     pub source: Option<TrackSource>,
     /// This entry's own channel count — defaults to `Config::channels` when unset, same convention
@@ -335,7 +335,7 @@ pub struct AutoMasterConfig {
 
 /// A master track: a controllable channel strip fed by `master-in` (patch.rs) — see `mixer::MasterTrack`'s
 /// own docs. Same fields `BusConfig` used to carry before the bus/master split, minus `target` (a
-/// master owns no flow — see the plan's §14; patch `master-out:<id>` into an output-grid entry
+/// master owns no flow — see PICKOFFS.md §2b; patch `master-out:<id>` into an output-grid entry
 /// instead if external visibility is wanted).
 #[derive(Deserialize, Clone, Debug)]
 pub struct MasterTrackConfig {
@@ -355,7 +355,7 @@ pub struct MasterTrackConfig {
 /// Where an output-grid entry's own MXL flow is created (`OutputGridEntryConfig::target`) — no
 /// longer used by `BusConfig`/`MasterTrackConfig` since neither owns a flow anymore (a bus is a
 /// pure summer, a master's external visibility comes from patching `master-out:<id>` into an
-/// output-grid entry — see the plan's §1/§14).
+/// output-grid entry — see PICKOFFS.md §2/§2b and its own intro).
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum BusTarget {

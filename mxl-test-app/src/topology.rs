@@ -1,7 +1,7 @@
 //! Runtime CREATE/DELETE of tracks, buses, and masters — the "processing scale", fully
 //! decorrelated from the NMOS-facing input/output grid (which stays exactly as it was; nothing in
-//! this module touches `nmos/` or `ids.rs` — see the plan at
-//! ~/.claude/plans/snug-painting-elephant.md for the full design rationale).
+//! this module touches `nmos/` or `ids.rs` — see PICKOFFS.md's own intro and §4's "Runtime
+//! topology" subsection for the full design rationale).
 //!
 //! `build_track`/`build_bus`/`build_master` are the one shared construction path used by three
 //! call sites: `main.rs`'s own startup construction (config-authored resources), `main.rs`'s
@@ -40,7 +40,7 @@ pub fn build_master(cfg: &MasterTrackConfig, default_channels: usize, sample_rat
 /// channel count — reused by both `main.rs`'s own startup batch-validation loop (one call per
 /// config-authored track) and `create_track` below, so runtime CREATE matches startup's own
 /// existing behavior exactly rather than introducing a stricter, inconsistent rule (confirmed with
-/// the user — see the plan's Context section). Does *not* warn about a `bus_id` that doesn't exist
+/// the user). Does *not* warn about a `bus_id` that doesn't exist
 /// at all, matching `main.rs`'s own pre-existing behavior (no `else` branch there either) — a send
 /// to a nonexistent bus is simply inert, the same "trust the client, don't guard every possible
 /// misuse" posture this codebase already takes elsewhere.
@@ -114,7 +114,8 @@ pub fn create_master(mixer: &MixerState, cfg: &MasterTrackConfig) -> Result<Arc<
 /// patch state — not required for crash-safety (a reference to a permanently-gone id already
 /// resolves to silence forever, `patch.rs`'s per-period fresh id lookups) but required to prevent
 /// a failure mode runtime DELETE specifically introduces: id reuse silently "reconnecting" a stale
-/// reference to an unrelated new resource later created with the same id. See the plan's §4.
+/// reference to an unrelated new resource later created with the same id. See PICKOFFS.md §4's
+/// "Runtime topology" subsection.
 pub fn delete_track(mixer: &MixerState, id: u32) -> Option<Arc<Track>> {
     let removed = mixer.tracks.lock().unwrap().remove(&id);
     removed.as_ref()?;

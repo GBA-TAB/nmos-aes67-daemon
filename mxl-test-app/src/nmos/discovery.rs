@@ -5,7 +5,7 @@
 //! it never touches an entry the static config or IS-05 activation (`nmos/server.rs::receiver_patch`
 //! — a *different* input-grid entry gets activated, this module never creates one on that path)
 //! created. Every entry it creates gets its own stable Receiver id too, same as every other
-//! input-grid entry (see the plan's §14).
+//! input-grid entry (see PICKOFFS.md's own intro).
 //!
 //! Only Senders whose `transport` is `urn:x-mxl:transport:flow` (`resources::TRANSPORT_TYPE` —
 //! mxl-bridge's own mirrored Sinks, any mxl-test-app instance's own output-grid Senders, or any

@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Masters, like buses, own no MXL flow of their own (see the plan's §14) -- trivial, infallible
+    // Masters, like buses, own no MXL flow of their own (PICKOFFS.md §2/§2b) -- trivial, infallible
     // construction.
     let mut masters = Vec::with_capacity(master_configs.len());
     for m in &master_configs {
@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
     // Reconstruct any dynamically-created track/bus/master from a previous run's saved state --
     // must run before `persistence::load_and_apply` below, so that step's own per-id value overlay
     // has a home to land in (apply_snapshot only ever mutates ids already present in the live
-    // collection, never creates one -- see persistence.rs's own doc comment and the plan's §5).
+    // collection, never creates one -- see persistence.rs's own doc comment and PICKOFFS.md §6).
     // Config-authored ids always win an id collision (warn + skip the reconstructed entry), and a
     // malformed entry is warned + skipped, never a hard failure -- same "one bad entry doesn't take
     // the whole app down" precedent the rest of this function already follows.
@@ -186,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
     // The pickoff-point patch bay's input grid (patch.rs): statically config-seeded, plus registry
     // auto-discovery (nmos/discovery.rs) at runtime. Every entry gets its own stable NMOS Receiver
     // (ids::instance_input_receiver_id) -- the *only* thing that does, now that tracks have no NMOS
-    // presence of their own (see the plan's §14). A `source` that fails to open is logged and left
+    // presence of their own (PICKOFFS.md's own intro). A `source` that fails to open is logged and left
     // with no reader rather than aborting startup -- same "don't let one bad config entry take the
     // whole app down" precedent as before; an entry declared with no `source` at all starts the
     // same way, waiting for IS-05 activation (`nmos/server.rs::receiver_patch`).
@@ -228,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
     // at startup -- written unconditionally every period (silence when unpatched), never lazily
     // created the way mxl-bridge's Sinks are, since there's no signal here for "does anything
     // actually want this yet" to gate on. The *only* thing that gets a real NMOS Source+Flow+Sender
-    // now (see the plan's §14) -- neither a bus's nor a master's own signal is itself NMOS-visible.
+    // now (PICKOFFS.md's own intro) -- neither a bus's nor a master's own signal is itself NMOS-visible.
     let output_grid = patch::OutputGrid::default();
     for entry in &cfg.output_grid {
         let channels = entry.channels.unwrap_or(cfg.channels) as usize;
@@ -333,7 +333,7 @@ async fn main() -> anyhow::Result<()> {
 
     // NMOS (IS-04 Node API / IS-05 Connection API) makes this a real NMOS Node -- one Sender per
     // output-grid entry, one Receiver per input-grid entry (the *only* NMOS-visible resources, see
-    // the plan's §14 -- tracks/buses/masters have no NMOS presence of their own) --
+    // PICKOFFS.md's own intro -- tracks/buses/masters have no NMOS presence of their own) --
     // discoverable/controllable via the registry like any other device, not just the amixer
     // WebSocket protocol. Merged into the same HTTP server/port as the WebSocket endpoint below
     // (mxl-bridge's own precedent for merging its IS-08 layer into one Node API port, rather than

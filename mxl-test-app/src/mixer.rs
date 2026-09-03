@@ -22,8 +22,8 @@ pub enum PickoffPoint {
 /// One send from a track to a bus — the console-standard "channel to mix" send (see
 /// `~/DEV/yam bus.png`), not the pickoff-point patch bay's crosspoint (`patch.rs`): a send is
 /// owned by the track itself (`Track.sends`), not a `patch.rs` grid object, and is presented
-/// alongside the track's own fader/mute/gain, not on a separate patch page — see the plan at
-/// `~/.claude/plans/snug-painting-elephant.md` for why that distinction matters. A plain
+/// alongside the track's own fader/mute/gain, not on a separate patch page — see `patch.rs`'s own
+/// module doc for why that distinction matters. A plain
 /// bus-assignment (the old `bus_assign: HashSet<u32>` this replaces) is just a `Send` whose
 /// `level_db` is left at its default `0.0` (unity) — see `~/DEV/Vista grid.png`'s contrast between
 /// a bus's fixed-0dB assignment and an AUX's variable send level: this is the same mechanism,
@@ -85,7 +85,7 @@ pub struct Track {
     /// `true` for a track created at runtime via the `CREATE` WS op (`ws.rs`/`topology.rs`), `false`
     /// for anything built from `Config` at startup. Lets `persistence.rs::capture` know which
     /// tracks need their full topology (not just live values) saved so they can be reconstructed on
-    /// the next restart -- see the plan at ~/.claude/plans/snug-painting-elephant.md §5.
+    /// the next restart -- see PICKOFFS.md §6.
     pub dynamically_created: bool,
 }
 
@@ -117,7 +117,7 @@ impl Track {
 /// One summing point: sums every track `Send` targeting it, plus its own `bus-in` patch feed
 /// (patch.rs) — nothing else. A bus is deliberately *not* a controllable channel strip: it has no
 /// fader, no mute, no processing chain, and owns no real MXL flow or NMOS presence of its own (see
-/// the plan at ~/.claude/plans/snug-painting-elephant.md §1/§14 for why that's the more consistent
+/// PICKOFFS.md §2 and its own intro for why that's the more consistent
 /// answer than keeping one "for debugging" — patch `bus-out:<id>` into an output-grid entry
 /// instead, on demand, if a raw tap is ever actually wanted, or into a `MasterTrack`'s `master-in`
 /// for a controllable strip downstream of the sum). Every bus's summed output (`bus-out:<id>`) is
@@ -170,7 +170,7 @@ impl Bus {
 /// grid destination (patch.rs) — fed from bus-out, another master's master-out, a track's
 /// direct-out, or an input-grid entry, any mix. Full processing chain identical in shape to a
 /// track's/pre-decorrelation bus's own (`dsp.rs`), its own fader/mute. Owns no MXL flow and has no
-/// NMOS presence of its own (see the plan at ~/.claude/plans/snug-painting-elephant.md §14) —
+/// NMOS presence of its own (see PICKOFFS.md's own intro) —
 /// `master-out:<id>` is just an in-process pickoff source, same as `bus-out:<id>`; patch it into an
 /// output-grid entry to make a specific master externally visible. On a small mixer, one master is
 /// auto-paired 1:1 with each bus (`BusConfig.auto_master`, config.rs) reproducing today's fused

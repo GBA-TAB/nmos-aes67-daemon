@@ -167,7 +167,7 @@ async fn receiver_ids(State(state): State<S>) -> Json<serde_json::Value> {
 fn receiver_json_for(state: &NmosState, entry: &crate::patch::InputGridEntry) -> serde_json::Value {
     // "active" for an input-grid entry's own Receiver is exactly "does it currently have an open
     // reader" -- unlike before this pass, this is no longer about whether some track happens to be
-    // patched from it (routing is now a fully separate concern -- see the plan's §14).
+    // patched from it (routing is now a fully separate concern -- see PICKOFFS.md's own intro).
     let active = entry.reader.lock().unwrap().is_some();
     let sender_id = entry.subscribed_sender_id.lock().unwrap().clone();
     resources::receiver_json(&state.cfg, state.device_id, entry, entry.receiver_id, active, sender_id, &state.version())
@@ -186,7 +186,7 @@ async fn receiver_get(State(state): State<S>, Path(id): Path<String>) -> axum::r
 }
 
 // ---------------------------------------------------------------------------
-// IS-05 Connection API — sender side (output grid — see the plan's §14)
+// IS-05 Connection API — sender side (output grid — see PICKOFFS.md's own intro)
 // ---------------------------------------------------------------------------
 
 async fn sender_constraints(Path(_id): Path<String>) -> Json<serde_json::Value> {
@@ -230,7 +230,7 @@ async fn sender_patch(State(state): State<S>, Path(id): Path<String>, Json(body)
 }
 
 // ---------------------------------------------------------------------------
-// IS-05 Connection API — receiver side (input grid — see the plan's §14)
+// IS-05 Connection API — receiver side (input grid — see PICKOFFS.md's own intro)
 // ---------------------------------------------------------------------------
 
 async fn receiver_constraints(Path(_id): Path<String>) -> Json<serde_json::Value> {
@@ -262,7 +262,7 @@ async fn receiver_staged(State(state): State<S>, Path(id): Path<String>) -> axum
 /// every input-grid entry has a stable identity from startup (config-seeded or
 /// `INPUT_GRID_COUNT`-generated), unlike before this pass' now-removed `"recv:<track_id>"`
 /// ephemeral-entry synthesis. Routing the now-active entry to a track/bus/master is a fully
-/// separate, explicit step over the ordinary WS patch protocol — see the plan's §14. Same
+/// separate, explicit step over the ordinary WS patch protocol — see PICKOFFS.md's own intro. Same
 /// Milestone-2-era scope note as mxl-bridge's own receiver_patch: only `activate_immediate` is
 /// really handled, anything else is just applied immediately as well.
 async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(body): Json<serde_json::Value>) -> axum::response::Response {

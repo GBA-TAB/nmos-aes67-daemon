@@ -33,7 +33,7 @@ pub struct OutputIds {
 /// registry-discovered input-grid entries, `discovery.rs`), so this only ever needs building once,
 /// not a `sync.rs` reacting to external change.
 ///
-/// Per the plan at ~/.claude/plans/snug-painting-elephant.md §14, the input/output grid is the
+/// Per PICKOFFS.md's own intro, the input/output grid is the
 /// *only* NMOS-facing surface — tracks/buses/masters have no NMOS presence of their own, so unlike
 /// before this pass there's no `bus_ids`/`track_receiver_ids` map: an input-grid entry already
 /// carries its own stable `receiver_id` directly (`patch::InputGridEntry`), and `output_ids` below

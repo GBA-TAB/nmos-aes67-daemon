@@ -66,7 +66,7 @@ pub async fn run(state: Arc<NmosState>, ip: String) {
 async fn register_all(client: &reqwest::Client, base: &str, state: &NmosState, ip: &str) -> anyhow::Result<()> {
     register_resource(client, base, "node", resources::node_json(&state.cfg, state.node_id, ip, &state.version())).await?;
 
-    // The output/input grid is the only NMOS-facing surface (see the plan's §14) -- neither a
+    // The output/input grid is the only NMOS-facing surface (PICKOFFS.md's own intro) -- neither a
     // bus's nor a master's nor a track's own signal is registered directly.
     let sender_ids: Vec<_> = state.output_ids.values().map(|o| o.sender_id).collect();
     let receiver_ids: Vec<_> = state.mixer.input_grid.snapshot().iter().map(|e| e.receiver_id).collect();

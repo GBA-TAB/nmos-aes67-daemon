@@ -16,8 +16,8 @@
 //! **Topology** (which tracks/buses/masters *exist* at all, as opposed to their live values) is
 //! normally `Config`'s sole authority — a snapshot id not already present in the live collection is
 //! silently skipped, never used to conjure a resource into existence (see `apply_snapshot`'s own
-//! doc comment). Runtime `CREATE`/`DELETE` (`topology.rs`, plan at
-//! ~/.claude/plans/snug-painting-elephant.md §5) is a deliberate, narrow exception to that rule:
+//! doc comment). Runtime `CREATE`/`DELETE` (`topology.rs`, PICKOFFS.md §4's "Runtime topology"
+//! subsection) is a deliberate, narrow exception to that rule:
 //! `capture` additionally writes a `"topology"` section describing every resource with
 //! `dynamically_created == true`, and `main.rs`'s own startup sequence reconstructs those (via
 //! `topology::build_track`/etc, the same construction path `CREATE` itself uses) *before* this
@@ -264,7 +264,7 @@ pub fn save(mixer: &MixerState, path: &str) -> std::io::Result<()> {
 /// Reads and parses `path`'s JSON content, if the file exists — the same read+parse logic
 /// `load_and_apply` uses below, extracted so `main.rs` can pull just the `"topology"` section out
 /// of it *before* `MixerState` exists (topology reconstruction must run before `apply_snapshot`'s
-/// own value overlay — see this module's own doc comment and the plan's §5). Returns `Ok(None)`
+/// own value overlay — see this module's own doc comment and PICKOFFS.md §6). Returns `Ok(None)`
 /// (not an error) if the file simply doesn't exist yet.
 pub fn read_state_file(path: &str) -> anyhow::Result<Option<serde_json::Value>> {
     if !std::path::Path::new(path).exists() {
@@ -301,7 +301,7 @@ mod tests {
 
     // Track/master-only (no Bus) -- a real Bus needs a real MXL flow writer, not constructible in
     // a plain unit test; same workaround patch.rs's own tests already use. A MasterTrack needs no
-    // flow at all (see the plan's §14), so it's fully constructible here, unlike a Bus.
+    // flow at all (PICKOFFS.md's own intro), so it's fully constructible here, unlike a Bus.
     // capture/apply_snapshot handle an empty `buses` list fine, so this still exercises the whole
     // track/master-side round trip.
     fn test_mixer(channels: &[usize]) -> MixerState {
@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(topo_track["gain_db"], 1.0);
     }
 
-    /// Regression test for the exact ordering constraint the plan's §5 calls out: topology
+    /// Regression test for the exact ordering constraint PICKOFFS.md §6 calls out: topology
     /// reconstruction (simulated here by directly inserting a "dynamically-created" track into the
     /// live collection, standing in for main.rs's own startup step) must run *before*
     /// `apply_snapshot`, or a dynamically-created id's resumed values are silently stranded. This

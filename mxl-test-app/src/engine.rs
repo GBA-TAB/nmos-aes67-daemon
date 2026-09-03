@@ -13,11 +13,11 @@ pub struct MixerState {
     /// `Mutex<HashMap<id, Arc<T>>>`, not a plain `Vec` -- lets `topology.rs`'s CREATE/DELETE
     /// helpers mutate the live resource set concurrently with the engine thread, the same shape
     /// `InputGrid`/`OutputGrid` already use (and `nmos/discovery.rs` already mutates at runtime,
-    /// proven safe). See the plan at ~/.claude/plans/snug-painting-elephant.md §1.
+    /// proven safe). See PICKOFFS.md §4's "Runtime topology" subsection.
     pub tracks: Mutex<HashMap<u32, Arc<Track>>>,
     pub buses: Mutex<HashMap<u32, Arc<Bus>>>,
     /// Controllable channel strips fed from `master-in` (patch.rs) — decorrelated from bus count
-    /// (see the plan at ~/.claude/plans/snug-painting-elephant.md).
+    /// (see PICKOFFS.md §2b).
     pub masters: Mutex<HashMap<u32, Arc<MasterTrack>>>,
     /// The pickoff-point patch bay's pool of externally available sources (`patch.rs`).
     pub input_grid: InputGrid,
@@ -169,8 +169,8 @@ fn compute_max_channels(tracks: &[Arc<Track>], buses: &[Arc<Bus>], masters: &[Ar
 /// whatever the previous iteration's processing actually cost, the same class of fix mxl's own
 /// `get_duration_until_index`/`sleep_for` example pattern exists for.
 ///
-/// Each period runs the pickoff-point patch bay's fixed pipeline (`patch.rs` module docs, plan at
-/// ~/.claude/plans/snug-painting-elephant.md):
+/// Each period runs the pickoff-point patch bay's fixed pipeline (`patch.rs` module docs,
+/// PICKOFFS.md §3):
 ///
 /// 1. Read every input-grid entry's MXL reader (silence on no-reader/error), and peak it into that
 ///    entry's own `InputGridEntry.meter_db` — `input:<id>`'s own pickoff meter.
@@ -197,7 +197,7 @@ fn compute_max_channels(tracks: &[Arc<Track>], buses: &[Arc<Bus>], masters: &[Ar
 ///    The accumulator's value at this point directly *is* `bus-out:<id>`'s value: peak it into
 ///    `Bus.meter_db`, snapshot it into `Bus.output_prev` for the *next* period's steps 2/4/5, and
 ///    keep it locally for this period's own steps 5/6. No fader, no MXL write — a bus owns neither
-///    (see the plan's §1/§3).
+///    (see PICKOFFS.md §2).
 /// 5. **Master loop**: for each `MasterTrack`, resolve its `master-in` patch (summing, from
 ///    this period's input-grid buffers, this period's `track-out`/`bus-out` [tracks and buses
 ///    already finished this period, steps 3/4 above], and the *previous* period's `master-out`
@@ -211,7 +211,7 @@ fn compute_max_channels(tracks: &[Arc<Track>], buses: &[Arc<Bus>], masters: &[Ar
 ///    yet at this point). Then apply the master's fader/mute — this is `master-out:<id>`'s value:
 ///    peak it into `MasterTrack.meter_db`, snapshot it into `MasterTrack.output_prev` for the next
 ///    period's steps 2/4/5, and keep it locally for this period's own step 6. No MXL write here —
-///    a master owns no flow of its own, same as a bus (see the plan's §1/§14): its signal only
+///    a master owns no flow of its own, same as a bus (see PICKOFFS.md §2b and its own intro): its signal only
 ///    reaches a real flow, and only becomes NMOS-visible, if/when it's patched into an output-grid
 ///    entry, which step 6 resolves and writes.
 /// 6. Resolve every output-grid entry's patch — the pipeline's terminal stage, so *this* period's
@@ -235,7 +235,7 @@ fn compute_max_channels(tracks: &[Arc<Track>], buses: &[Arc<Bus>], masters: &[Ar
 /// matching the `input_grid.snapshot()`/`output_grid.snapshot()` calls already below), while the
 /// `f32` sample scratch buffers (Tier B, the allocations actually worth not paying every period)
 /// only get rebuilt when `topology_generation` has changed since the last period that checked it —
-/// see the plan's §2 for the full rationale.
+/// see PICKOFFS.md §4's "Runtime topology" subsection for the full rationale.
 ///
 /// Runs on its own OS thread — same `std::sync::Mutex` + blocking-from-a-plain-thread reasoning as
 /// mxl-bridge's RX/TX threads (see mixer.rs's field docs), since the WebSocket/IS-05 handlers that
@@ -436,7 +436,7 @@ pub fn run(state: Arc<MixerState>) {
             mix_into_scaled(bus_in_dst, dst, period, 1.0);
 
             // `dst`'s current value directly *is* bus-out:<id>'s value -- a bus is a pure summer, no
-            // fader, no MXL write of its own (see the plan's §1/§3).
+            // fader, no MXL write of its own (see PICKOFFS.md §2).
             let meters: Vec<f32> = dst.iter().map(|ch| peak_to_db(ch.iter().fold(0.0f32, |m, &s| m.max(s.abs())))).collect();
             *bus.meter_db.lock().unwrap() = meters;
             *bus.output_prev.lock().unwrap() = dst.to_vec();
@@ -488,7 +488,7 @@ pub fn run(state: Arc<MixerState>) {
 
             *master.output_prev.lock().unwrap() = dst.to_vec();
             master_out_this_period.insert(master.id, dst.to_vec());
-            // No MXL write here -- a master owns no flow of its own (see the plan's §14): its
+            // No MXL write here -- a master owns no flow of its own (PICKOFFS.md's own intro): its
             // signal only reaches an actual MXL flow if/when it's patched into an output-grid
             // entry, resolved and written in step 6 below.
         }
