@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::mixer::{db_to_linear, is_muted, is_on, is_soloed, mix_into_scaled, peak_to_db, Bus, MasterTrack, PickoffPoint, Track};
+use crate::mixer::{
+    compute_compensation, db_to_linear, is_muted, is_on, is_soloed, mix_into_scaled, peak_to_db, Bus, LatencyCompensation, MasterTrack,
+    PickoffPoint, Track,
+};
 use crate::patch::{InputGrid, OutputGrid, PatchState};
 
 pub struct MixerState {
@@ -62,6 +65,10 @@ impl MixerState {
 struct TrackScratch {
     pre_fader: Vec<Vec<f32>>,
     post_fader: Vec<Vec<f32>>,
+    /// Automatic per-track alignment delay (`mixer::LatencyCompensation`) -- audio-thread-only
+    /// state, same reasoning as `pre_fader`/`post_fader`; only its *current sample count* is
+    /// published (`Track.compensation_delay_samples`), not this buffer itself.
+    compensation: LatencyCompensation,
 }
 
 /// Builds one `TrackScratch` per track, sized to that track's own channel count -- called once at
@@ -80,10 +87,58 @@ fn build_track_scratch(tracks: &[Arc<Track>]) -> HashMap<u32, TrackScratch> {
                 TrackScratch {
                     pre_fader: vec![Vec::new(); t.channels],
                     post_fader: vec![Vec::new(); t.channels],
+                    compensation: LatencyCompensation::new(),
                 },
             )
         })
         .collect()
+}
+
+/// Per-master sample scratch -- masters have no other engine-owned scratch state today (unlike a
+/// track, they process directly against a `mix_scratch` slice), so this exists purely to hold the
+/// automatic alignment delay's audio-thread-only ring buffer. Same keyed-by-id, rebuilt-on-topology-
+/// change reasoning as `TrackScratch`/`build_track_scratch`.
+struct MasterScratch {
+    compensation: LatencyCompensation,
+}
+
+fn build_master_scratch(masters: &[Arc<MasterTrack>]) -> HashMap<u32, MasterScratch> {
+    masters.iter().map(|m| (m.id, MasterScratch { compensation: LatencyCompensation::new() })).collect()
+}
+
+/// Recomputes the system-wide max chain latency across every track/master and resizes each one's
+/// own `LatencyCompensation` buffer (and publishes its `compensation_delay_samples`) to match --
+/// called once at `run`'s own setup and again every time `track_scratch`/`master_scratch` are
+/// rebuilt (`mixer::compute_compensation`'s own docs explain the arithmetic; today every stage
+/// reports 0 latency, `dsp::ProcessingStage::latency_samples`, so this always resizes every buffer
+/// to 0 -- a no-op -- until a future stage actually needs it).
+fn apply_latency_compensation(
+    tracks: &[Arc<Track>],
+    masters: &[Arc<MasterTrack>],
+    track_scratch: &mut HashMap<u32, TrackScratch>,
+    master_scratch: &mut HashMap<u32, MasterScratch>,
+) {
+    let own_latencies: Vec<usize> = tracks
+        .iter()
+        .map(|t| t.chain.iter().map(|s| s.latency_samples()).sum())
+        .chain(masters.iter().map(|m| m.chain.iter().map(|s| s.latency_samples()).sum()))
+        .collect();
+    let compensation = compute_compensation(&own_latencies);
+    let mut comp = compensation.into_iter();
+    for t in tracks {
+        let c = comp.next().unwrap_or(0);
+        if let Some(scratch) = track_scratch.get_mut(&t.id) {
+            scratch.compensation.resize(t.channels, c);
+        }
+        t.compensation_delay_samples.store(c, Ordering::Relaxed);
+    }
+    for m in masters {
+        let c = comp.next().unwrap_or(0);
+        if let Some(scratch) = master_scratch.get_mut(&m.id) {
+            scratch.compensation.resize(m.channels, c);
+        }
+        m.compensation_delay_samples.store(c, Ordering::Relaxed);
+    }
 }
 
 /// The widest channel count across every track, bus, master, and output-grid entry -- sizes the
@@ -196,9 +251,11 @@ pub fn run(state: Arc<MixerState>) {
     let mut masters = state.masters_snapshot();
     let mut last_generation = state.topology_generation.load(Ordering::Relaxed);
     let mut track_scratch = build_track_scratch(&tracks);
+    let mut master_scratch = build_master_scratch(&masters);
     let mut max_channels = compute_max_channels(&tracks, &buses, &masters, &state.output_grid);
     let mut mix_scratch: Vec<Vec<f32>> = vec![Vec::new(); max_channels];
     let mut bus_in_scratch: Vec<Vec<f32>> = vec![Vec::new(); max_channels];
+    apply_latency_compensation(&tracks, &masters, &mut track_scratch, &mut master_scratch);
 
     tracing::info!(
         tracks = tracks.len(),
@@ -246,9 +303,11 @@ pub fn run(state: Arc<MixerState>) {
         let gen = state.topology_generation.load(Ordering::Relaxed);
         if gen != last_generation {
             track_scratch = build_track_scratch(&tracks);
+            master_scratch = build_master_scratch(&masters);
             max_channels = compute_max_channels(&tracks, &buses, &masters, &state.output_grid);
             mix_scratch = vec![Vec::new(); max_channels];
             bus_in_scratch = vec![Vec::new(); max_channels];
+            apply_latency_compensation(&tracks, &masters, &mut track_scratch, &mut master_scratch);
             last_generation = gen;
             tracing::info!(
                 tracks = tracks.len(),
@@ -325,6 +384,12 @@ pub fn run(state: Arc<MixerState>) {
                 meters.push(peak_to_db(peak));
             }
             *track.meter_db.lock().unwrap() = meters;
+
+            // Automatic per-track alignment delay (mixer::LatencyCompensation) -- a delivery-time
+            // correction on what other tracks/patches actually consume, applied after metering so
+            // meter_db keeps reflecting the chain's own processed signal. No-op today (every stage
+            // reports 0 latency) -- see apply_latency_compensation's own docs.
+            scratch.compensation.process(post);
 
             *track.direct_out_prev.lock().unwrap() = post.clone();
             track_out_this_period.insert(track.id, post.clone());
@@ -414,6 +479,13 @@ pub fn run(state: Arc<MixerState>) {
                 meters.push(peak_to_db(peak));
             }
             *master.meter_db.lock().unwrap() = meters;
+
+            // Automatic per-master alignment delay -- same reasoning as the track loop's own
+            // insertion point above.
+            if let Some(scratch) = master_scratch.get_mut(&master.id) {
+                scratch.compensation.process(dst);
+            }
+
             *master.output_prev.lock().unwrap() = dst.to_vec();
             master_out_this_period.insert(master.id, dst.to_vec());
             // No MXL write here -- a master owns no flow of its own (see the plan's §14): its
@@ -502,5 +574,26 @@ mod tests {
     #[test]
     fn compute_max_channels_defaults_to_one_when_nothing_exists() {
         assert_eq!(compute_max_channels(&[], &[], &[], &OutputGrid::default()), 1);
+    }
+
+    #[test]
+    fn apply_latency_compensation_is_zero_for_every_track_and_master_today() {
+        // Every stage kind reports 0 latency (dsp::ProcessingStage::latency_samples), so this is
+        // currently always a no-op regardless of chain contents -- confirms the wiring end-to-end
+        // (real Track/MasterTrack construction -> real chain -> compensation) without needing a
+        // real non-zero-latency stage to exist yet.
+        let tracks = vec![track(0, 2), track(1, 1)];
+        let masters = vec![master(0, 2)];
+        let mut track_scratch = build_track_scratch(&tracks);
+        let mut master_scratch = build_master_scratch(&masters);
+        apply_latency_compensation(&tracks, &masters, &mut track_scratch, &mut master_scratch);
+        for t in &tracks {
+            assert_eq!(t.compensation_delay_samples.load(Ordering::Relaxed), 0);
+            assert_eq!(track_scratch[&t.id].compensation.samples(), 0);
+        }
+        for m in &masters {
+            assert_eq!(m.compensation_delay_samples.load(Ordering::Relaxed), 0);
+            assert_eq!(master_scratch[&m.id].compensation.samples(), 0);
+        }
     }
 }

@@ -72,6 +72,29 @@ deployment) and any hand-authored `config.json` using `"template":"full_channel"
 exact same chain they always did, with zero changes required — see §5's own iteration-history entry
 for the full rationale.
 
+### 1b. Automatic per-track/master latency compensation
+
+Every stage kind is sample-synchronous today — Filter/EQ are direct-form biquads, Dynamics is a
+feed-forward envelope follower, Phase is a sign flip: none of them buffer or look ahead, so they add
+**zero** inherent processing latency (`dsp::ProcessingStage::latency_samples`, currently `0` for
+every kind, including Delay — see below). That means two tracks with different chains, or no chain
+at all, are already sample-aligned at their `track-out`/`master-out` pickoff points, with nothing
+extra needed.
+
+`mixer::LatencyCompensation` + `mixer::compute_compensation` exist anyway, as a forward-looking hook:
+`engine.rs` sums each track's/master's own `chain.iter().map(|s| s.latency_samples()).sum()`, finds
+the system-wide max across every track/master, and gives each one an automatic, invisible delay
+line making up the difference — applied after the chain and fader, on the signal every downstream
+consumer (sends, patches) actually receives. The currently-active amount is published read-only as
+`channel/<id>/compensation-delay-ms` / `master/<id>/compensation-delay-ms` (no PUT exists for it).
+**Deliberately unrelated to `dsp::DelayStage`**: that's a user-controlled creative effect an operator
+dials in on purpose (confirmed with the user before building this) — compensating it away would
+defeat its entire purpose, so it reports `0` for `latency_samples()` too, same as every other kind.
+This mechanism is a no-op today (system-wide max latency is always `0`); it's ready for whenever a
+future stage's own algorithm has real inherent latency (a lookahead limiter, a linear-phase EQ
+mode, …) to report its own sample count and have every other track/master automatically stay
+aligned with it, without needing to build the compensation machinery at that point too.
+
 ## 2. Bus (pure summer) structure
 
 ```
@@ -174,6 +197,7 @@ three. See `engine.rs`'s module doc for the exact per-period order.
 | `input-patch` | `[{"source","channel"}\|null, ...]` | one entry per track channel, exclusive |
 | `stage/<index>` | that slot's own kind-shaped value (below) | `index` into this track's own `chain` (§1a); out-of-range index rejected (warn, no-op), never a crash |
 | `chain` | `[{"index","kind","params"}, ...]` | push only (`meter_hz`) — the full ordered chain; `params` is that slot's own kind-shaped value, same as `stage/<index>`'s own PUT/echo shape. The only way to discover what a track's chain even *is* (its shape isn't queryable any other way) |
+| `compensation-delay-ms` | number (ms) | push only — see §1b; always `0` today, no PUT exists |
 
 `stage/<index>`'s own value shape depends on that slot's `kind` (`chain[index]`'s own `kind`):
 `filter` → `{"on","hp_hz","lp_hz"}`; `eq` → `{"on","bands":[{"freq_hz","gain_db","q"}, ...]}`;
@@ -201,6 +225,7 @@ everything that used to live here moved to `master/<master_id>/...`, below.
 | `input-meter` | `[number\|null, ...]` | push only — `master-in:<id>`'s own pickoff meter (this master's only input mechanism, no separate "sends"-style second contributor the way a bus has) |
 | `input-patch` | `[[{"source","channel"}, ...], ...]` | one array per master channel, summing |
 | `stage/<index>`, `chain` | same shapes as tracks | see §1a — a master's `chain` has the same rules as a track's |
+| `compensation-delay-ms` | number (ms) | push only — see §1b; always `0` today, no PUT exists |
 
 No `gain`, no `solo` — a master never had either (same as a bus never did).
 
@@ -352,6 +377,15 @@ new resource later `CREATE`d with the same client-chosen id.
   instance, and it tracked a test-only condition: the tool's own tone generator had a fixed, short
   lifetime and was mid-exit-or-already-dead during that one reading, not a defect in this app's
   engine or the new DSP code. Documented here rather than silently dropped, in case it recurs.)
+- **Automatic per-track/master latency compensation** (§1b): confirmed every stage kind is already
+  sample-synchronous (0 inherent latency), so tracks with different chains — or none at all — are
+  already sample-aligned today, no work needed for that alone. Built the compensation mechanism
+  anyway, as a forward-looking hook, at the user's explicit request: `dsp::ProcessingStage::
+  latency_samples()` (0 for every kind, including Delay — its `delay_ms` is a deliberate effect, not
+  latency to compensate for), `mixer::LatencyCompensation`/`compute_compensation`, wired into
+  `engine.rs`'s existing topology-generation-triggered rebuild, published read-only as
+  `.../compensation-delay-ms`. A no-op today by construction; ready for whenever a future
+  non-zero-latency stage (a lookahead limiter, a linear-phase EQ mode, …) needs it.
 - **Gatherer** (deferred — design sketch only, see the plan's §15, not implemented): a *separate*
   future app, not a change to this one, for bundling several independently-produced narrow MXL
   flows into one wide flow (SMPTE 2110-30-style stream consolidation) — reads N existing flows,

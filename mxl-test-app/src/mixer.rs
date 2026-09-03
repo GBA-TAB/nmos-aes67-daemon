@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::config::{BusConfig, MasterTrackConfig, TrackConfig};
@@ -77,6 +77,11 @@ pub struct Track {
     /// not an element of this `Vec` (see `dsp.rs`'s own module docs) — not present-but-off, and
     /// none of them affect the signal yet (structural placeholders, not real DSP).
     pub chain: Vec<ProcessingStage>,
+    /// Currently-active automatic alignment delay, in samples -- see `LatencyCompensation`. Always
+    /// 0 today (every stage reports 0 latency, `dsp::ProcessingStage::latency_samples`); read-only
+    /// over WS (`channel/<id>/compensation-delay-ms`), recomputed only on a topology change, same
+    /// trigger as the compensation buffer itself (`engine.rs`).
+    pub compensation_delay_samples: AtomicUsize,
     /// `true` for a track created at runtime via the `CREATE` WS op (`ws.rs`/`topology.rs`), `false`
     /// for anything built from `Config` at startup. Lets `persistence.rs::capture` know which
     /// tracks need their full topology (not just live values) saved so they can be reconstructed on
@@ -103,6 +108,7 @@ impl Track {
             input_meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             direct_out_prev: Mutex::new(vec![Vec::new(); channels]),
             chain: crate::config::build_chain(&cfg.chain, cfg.template, channels, sample_rate),
+            compensation_delay_samples: AtomicUsize::new(0),
             dynamically_created,
         }
     }
@@ -196,6 +202,8 @@ pub struct MasterTrack {
     /// Ordered, typed processing chain (`dsp.rs`) — see `Track.chain`'s own doc for what this
     /// means; same shape and same fixed-at-construction lifecycle here.
     pub chain: Vec<ProcessingStage>,
+    /// See `Track.compensation_delay_samples`'s own doc -- same meaning, same purpose.
+    pub compensation_delay_samples: AtomicUsize,
     /// See `Track.dynamically_created`'s own doc -- same meaning, same purpose.
     pub dynamically_created: bool,
 }
@@ -216,6 +224,7 @@ impl MasterTrack {
             input_meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             output_prev: Mutex::new(vec![Vec::new(); channels]),
             chain: crate::config::build_chain(&cfg.chain, cfg.template, channels, sample_rate),
+            compensation_delay_samples: AtomicUsize::new(0),
             dynamically_created,
         }
     }
@@ -224,6 +233,76 @@ impl MasterTrack {
 /// dB -> linear amplitude multiplier.
 pub fn db_to_linear(db: f32) -> f32 {
     10f32.powf(db / 20.0)
+}
+
+/// Engine-owned, invisible sample-alignment delay -- keeps a track's/master's final output in step
+/// with every other track/master, regardless of how much inherent latency its own chain introduces.
+/// Distinct from `dsp::DelayStage`: that's a user-controlled creative effect a chain opts into; this
+/// is automatic, never user-settable, and (if it does anything at all) runs *after* the chain and
+/// fader, on the signal every downstream consumer (sends, track-out/master-out, patches) receives.
+/// Lives in engine.rs's own per-track/master scratch (audio-thread-only, like its `TrackScratch`),
+/// not on `Track`/`MasterTrack` itself -- only the *current sample count* needs to be visible to the
+/// WS broadcaster, which is why that alone (`Track`/`MasterTrack.compensation_delay_samples`, not
+/// this struct) is what those structs carry.
+pub struct LatencyCompensation {
+    buffers: Vec<Vec<f32>>, // one ring per channel, length == `samples`
+    write_pos: usize,
+    samples: usize,
+}
+
+impl LatencyCompensation {
+    pub fn new() -> Self {
+        Self { buffers: Vec::new(), write_pos: 0, samples: 0 }
+    }
+
+    pub fn samples(&self) -> usize {
+        self.samples
+    }
+
+    /// Resizes to exactly `samples` of compensation for `channels` channels. Only ever called from
+    /// engine.rs's own topology-generation-triggered rebuild block (same "only reallocate on a real
+    /// topology change" convention its scratch buffers already follow) -- a track's/master's own
+    /// chain composition, and therefore the system-wide max latency, can only change when a
+    /// track/master is (re)constructed.
+    pub fn resize(&mut self, channels: usize, samples: usize) {
+        self.buffers = vec![vec![0.0; samples.max(1)]; channels];
+        self.write_pos = 0;
+        self.samples = samples;
+    }
+
+    /// In place. No-op when `samples == 0` (today, always) -- swaps each channel's current sample
+    /// for the one written `samples` frames ago at the same ring position, so 0 samples of
+    /// compensation is an exact passthrough by construction, no branch needed to special-case it.
+    pub fn process(&mut self, buf: &mut [Vec<f32>]) {
+        if self.samples == 0 {
+            return;
+        }
+        let cap = self.samples;
+        let frames = buf.first().map(|c| c.len()).unwrap_or(0);
+        let mut wp = self.write_pos;
+        for frame in 0..frames {
+            for (ch, ring) in buf.iter_mut().zip(self.buffers.iter_mut()) {
+                std::mem::swap(&mut ring[wp], &mut ch[frame]);
+            }
+            wp = (wp + 1) % cap;
+        }
+        self.write_pos = wp;
+    }
+}
+
+impl Default for LatencyCompensation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Pure arithmetic, independent of real stage types -- each entry gets `max(own_latencies) - own`,
+/// so every track/master ends up delayed by the same total amount. Extracted as its own function so
+/// it's directly unit-testable with synthetic latency values, without needing a real non-zero-
+/// latency stage to exist (none do yet -- see `dsp::ProcessingStage::latency_samples`'s own docs).
+pub fn compute_compensation(own_latencies: &[usize]) -> Vec<usize> {
+    let max = own_latencies.iter().copied().max().unwrap_or(0);
+    own_latencies.iter().map(|&own| max - own).collect()
 }
 
 /// Adds `src` (one track's planar samples at some pickoff point, `src.len()` channels) into `dst`
@@ -331,6 +410,53 @@ mod tests {
         mix_into_scaled(&src_a, &mut dst, 1, 1.0);
         mix_into_scaled(&src_b, &mut dst, 1, 1.0);
         assert_eq!(dst, vec![vec![3.0]]);
+    }
+
+    #[test]
+    fn compute_compensation_examples() {
+        assert_eq!(compute_compensation(&[0, 5, 3]), vec![5, 0, 2]);
+        assert_eq!(compute_compensation(&[0, 0, 0]), vec![0, 0, 0]);
+        assert_eq!(compute_compensation(&[7]), vec![0]);
+        assert_eq!(compute_compensation(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn latency_compensation_starts_at_zero_and_is_exact_passthrough() {
+        let mut comp = LatencyCompensation::new();
+        assert_eq!(comp.samples(), 0);
+        let mut samples = vec![vec![1.0, -0.5, 0.25]];
+        let original = samples.clone();
+        comp.process(&mut samples);
+        assert_eq!(samples, original);
+    }
+
+    #[test]
+    fn latency_compensation_delays_by_exactly_n_samples() {
+        let mut comp = LatencyCompensation::new();
+        comp.resize(1, 5);
+        assert_eq!(comp.samples(), 5);
+        let mut samples = vec![vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]];
+        comp.process(&mut samples);
+        let expected = {
+            let mut v = vec![0.0; 8];
+            v[5] = 1.0;
+            v
+        };
+        assert_eq!(samples[0], expected);
+    }
+
+    #[test]
+    fn latency_compensation_state_survives_across_periods() {
+        let mut comp = LatencyCompensation::new();
+        comp.resize(1, 5);
+        let mut period1 = vec![vec![1.0, 0.0, 0.0]];
+        comp.process(&mut period1);
+        assert_eq!(period1[0], vec![0.0, 0.0, 0.0], "impulse hasn't emerged yet within period 1");
+        let mut period2 = vec![vec![0.0, 0.0, 0.0]];
+        comp.process(&mut period2);
+        // The impulse was written at absolute frame 0; 5 samples later is absolute frame 5, which
+        // is period 2's 3rd sample (period 1 covers absolute frames 0-2, period 2 covers 3-5).
+        assert_eq!(period2[0], vec![0.0, 0.0, 1.0], "impulse emerges exactly 5 samples after it was written, spanning the period boundary");
     }
 
     /// End-to-end check of a track built via config with a real, explicit, reordered chain --

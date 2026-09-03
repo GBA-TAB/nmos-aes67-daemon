@@ -135,6 +135,20 @@ impl ProcessingStage {
             Self::Delay(s) => s.process(samples, sample_rate),
         }
     }
+
+    /// Inherent, unavoidable processing latency this stage's own algorithm introduces, in samples.
+    /// 0 for every kind today — Filter/EQ are direct-form biquads, Dynamics is a feed-forward
+    /// envelope follower, Phase is a sign flip: all sample-synchronous, no lookahead. Delay reports
+    /// 0 here too, deliberately: its `delay_ms` is a user-controlled creative effect, not incidental
+    /// algorithmic latency, and is never compensated for (confirmed with the user). This hook exists
+    /// for a *future* stage whose own algorithm has real inherent latency (e.g. a lookahead limiter,
+    /// a linear-phase EQ mode), which should return its own real sample count here so
+    /// `mixer::compute_compensation` can automatically keep every other track/master aligned with it.
+    pub fn latency_samples(&self) -> usize {
+        match self {
+            Self::Filter(_) | Self::Eq(_) | Self::Dynamics(_) | Self::Phase(_) | Self::Delay(_) => 0,
+        }
+    }
 }
 
 /// Per-channel filter state: cascaded high-pass then low-pass, each its own biquad.
@@ -446,6 +460,15 @@ mod tests {
             assert_eq!(kind.wire(), name);
             let parsed: StageKind = serde_json::from_value(serde_json::json!(name)).unwrap();
             assert_eq!(parsed, kind);
+        }
+    }
+
+    #[test]
+    fn every_stage_kind_reports_zero_latency_today() {
+        // Pin: every current stage is sample-synchronous (no lookahead/buffering that shifts time),
+        // including Delay -- its delay_ms is a deliberate effect, not latency to compensate for.
+        for kind in [StageKind::Filter, StageKind::Eq, StageKind::Dynamics, StageKind::Phase, StageKind::Delay] {
+            assert_eq!(ProcessingStage::default_on(kind, 2, SR).latency_samples(), 0);
         }
     }
 

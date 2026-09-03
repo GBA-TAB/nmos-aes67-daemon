@@ -547,6 +547,17 @@ pub(crate) fn chain_json(chain: &[crate::dsp::ProcessingStage]) -> serde_json::V
     serde_json::json!(chain.iter().enumerate().map(|(i, s)| chain_slot_json(s, i)).collect::<Vec<_>>())
 }
 
+/// `channel/{id}/compensation-delay-ms` / `master/{id}/compensation-delay-ms`'s own value --
+/// read-only (no PUT handling exists for this param; an unmatched param is already a silent no-op
+/// in this protocol), the automatic alignment delay `mixer::LatencyCompensation` currently has
+/// active for this resource, converted from samples to milliseconds (matching `delay_ms`'s own
+/// real-world-unit convention) using this mixer's own sample rate. Always 0 today -- see
+/// `dsp::ProcessingStage::latency_samples`'s own docs for why.
+fn compensation_delay_ms_json(state: &WsState, samples: &std::sync::atomic::AtomicUsize) -> serde_json::Value {
+    let ms = samples.load(Ordering::Relaxed) as f64 / state.mixer.sample_rate as f64 * 1000.0;
+    serde_json::json!(ms)
+}
+
 fn pickoff_wire(p: crate::mixer::PickoffPoint) -> &'static str {
     match p {
         crate::mixer::PickoffPoint::PreFader => "pre_fader",
@@ -662,6 +673,7 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
             publish(&state, &format!("{base}/input-meter"), serde_json::json!(*track.input_meter_db.lock().unwrap()));
             publish(&state, &format!("{base}/sends"), sends_json(track));
             publish(&state, &format!("{base}/chain"), chain_json(&track.chain));
+            publish(&state, &format!("{base}/compensation-delay-ms"), compensation_delay_ms_json(&state, &track.compensation_delay_samples));
         }
         for bus in &state.mixer.buses_snapshot() {
             // A bus is a pure summer now -- just its two meters, no fader/DSP pushes (see
@@ -675,6 +687,7 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
             publish(&state, &format!("{base}/peakmeter"), serde_json::json!(*master.meter_db.lock().unwrap()));
             publish(&state, &format!("{base}/input-meter"), serde_json::json!(*master.input_meter_db.lock().unwrap()));
             publish(&state, &format!("{base}/chain"), chain_json(&master.chain));
+            publish(&state, &format!("{base}/compensation-delay-ms"), compensation_delay_ms_json(&state, &master.compensation_delay_samples));
         }
         // channel-list/sum-list/master-list: how a client discovers what track/bus/master ids
         // exist at all (topology.rs's CREATE/DELETE also re-publish these immediately on success,
