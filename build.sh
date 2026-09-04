@@ -13,7 +13,13 @@ echo "Init git submodules ..."
 git submodule update --init --recursive
 
 cd 3rdparty/ravenna-alsa-lkm/driver
-git checkout aes67-daemon
+# The submodule's own default remote (see ../../../.gitmodules) is upstream bondagit/ravenna-alsa-lkm --
+# left as-is so it stays easy to track upstream. The driver actually built here comes from our own
+# fork instead, which carries changes upstream doesn't have yet (currently: real per-leg PTP status
+# for SMPTE 2022-7 redundancy, BCP-008 TX stream status bits, and a raised ALSA channel ceiling).
+git remote get-url fork >/dev/null 2>&1 || git remote add fork https://github.com/GBA-TAB/ravenna-alsa-lkm.git
+git fetch fork
+git checkout -B experimental-hw-timestamping fork/experimental-hw-timestamping
 make
 cd -
 
