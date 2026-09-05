@@ -79,7 +79,6 @@ async fn main() -> anyhow::Result<()> {
     // fall back to the configured ceiling and start with an empty mirror set, exactly as
     // `alsa_channels_fallback`'s own doc comment (config.rs) says it's for.
     let registration_client = reqwest::Client::new();
-    let registry_base = nmos::registration::registry_base(&state);
     let initial_state = match daemon_client.poll_once(&daemon_client::DaemonState::default()).await {
         Ok((new_state, source_changes, sink_changes)) => daemon_client::DaemonDiff { state: new_state, source_changes, sink_changes },
         Err(e) => {
@@ -92,7 +91,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let polling_baseline = initial_state.state.clone();
-    nmos::sync::apply_diff(&state, &registration_client, registry_base.as_deref(), &cfg.ip_addr, initial_state).await;
+    // Registration base is deliberately `None` here: this initial apply_diff only needs to
+    // populate state.sinks/sources in memory before the RX/TX threads start (see the comment
+    // above). If it also tried to register each entry's Source/Flow/Sender/Receiver against the
+    // registry right now, every one would fail with a 400 ("registration on unknown parent
+    // device") — registration::run()'s register_all() (spawned later, inside nmos::run() below)
+    // registers Node and Device first and only *then* walks state.sinks/sources, which by then are
+    // already populated from this call — that's what actually registers them, in the right order,
+    // exactly once.
+    nmos::sync::apply_diff(&state, &registration_client, None, &cfg.ip_addr, initial_state).await;
 
     {
         let state = state.clone();

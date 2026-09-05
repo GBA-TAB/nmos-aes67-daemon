@@ -18,7 +18,9 @@ async fn register_resource(client: &reqwest::Client, base: &str, rtype: &str, da
         .await
         .map_err(|e| anyhow::anyhow!("POST {base}/resource ({rtype}): {e}"))?;
     if !resp.status().is_success() {
-        anyhow::bail!("registering {rtype} failed: HTTP {}", resp.status());
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("registering {rtype} failed: HTTP {status}: {body}");
     }
     Ok(())
 }
