@@ -26,11 +26,16 @@ pub fn node_json(cfg: &Config, node_id: uuid::Uuid, ip: &str, version: &str) -> 
         "description": "mxl-test-app: a third-party MXL mixer app, for testing mxl-bridge",
         "tags": {},
         "href": format!("{base}/"),
-        // `instance_name` doubles as the reported hostname -- a real string is required by the
-        // schema (never null), and it's already a distinct-per-replica identifier (see
-        // config.rs's `instance_name` docs), so there's no need to also resolve the actual system
-        // hostname via libc just for this.
-        "hostname": cfg.instance_name,
+        // The real system hostname - not `instance_name` (a former choice here, reverted: IS-04's
+        // own schema intent for this field is the real physical/container host, which is exactly
+        // what a real cross-app topology consumer needs to correlate co-located MXL apps on one
+        // machine - visualUniverse-nmosrouter's "MXL-world topology" view (MxlTopologyBuilder)
+        // groups Devices into a Host tree keyed on this field, and `instance_name` masquerading as
+        // hostname made every replica of this app appear as its own phantom host instead of
+        // grouping correctly under the real one. `instance_name` still does its own distinct job
+        // uncontested - it's what `label` is built from (see below), so a replica stays fully
+        // distinguishable there.
+        "hostname": hostname(),
         "api": {
             "versions": ["v1.3"],
             "endpoints": [{ "host": ip, "port": cfg.ws_port, "protocol": "http", "authorization": false }]
@@ -63,7 +68,13 @@ pub fn device_json(
         "version": version,
         "label": format!("{} Device", cfg.nmos_label),
         "description": "",
-        "tags": {},
+        // Additive, non-standard tag naming which real MXL shared-memory domain (a directory -
+        // load-bearing, not cosmetic: two apps on the same host with different domains cannot see
+        // each other's flows) this Device's input/output grid entries actually read/write. Lets an
+        // external topology tool (visualUniverse-nmosrouter's "MXL-world topology" view) group
+        // Devices into the real Host/Domain/App/Flow graph without a second, MXL-specific
+        // discovery mechanism.
+        "tags": { "urn:x-mxl:tag:domain/v1.0": [cfg.mxl_domain] },
         "type": "urn:x-nmos:device:generic",
         "node_id": node_id.to_string(),
         "senders": sender_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
@@ -176,4 +187,14 @@ pub fn receiver_json(
         "caps": { "media_types": ["audio/float32"] },
         "subscription": { "sender_id": sender_id, "active": active }
     })
+}
+
+fn hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "mxl-test-app".to_string())
 }

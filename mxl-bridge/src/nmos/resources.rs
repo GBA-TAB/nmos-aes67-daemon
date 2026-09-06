@@ -58,7 +58,12 @@ pub fn device_json(state: &NmosState, ip: &str, sender_ids: &[uuid::Uuid], recei
         "version": state.version(),
         "label": format!("{} Device", state.cfg.nmos_label),
         "description": "",
-        "tags": {},
+        // Additive, non-standard tag naming which real MXL shared-memory domain (a directory -
+        // load-bearing, not cosmetic: two apps on the same host with different domains cannot see
+        // each other's flows) this Device's Sinks/Sources actually read/write. Lets an external
+        // topology tool (visualUniverse-nmosrouter's "MXL-world topology" view) group Devices into
+        // the real Host/Domain/App/Flow graph without a second, MXL-specific discovery mechanism.
+        "tags": { "urn:x-mxl:tag:domain/v1.0": [state.cfg.mxl_domain] },
         "type": "urn:x-nmos:device:generic",
         "node_id": state.node_id.to_string(),
         "senders": sender_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
