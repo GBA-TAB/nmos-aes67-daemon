@@ -389,6 +389,29 @@ new resource later `CREATE`d with the same client-chosen id.
   writes one new flow it alone owns, needing no new capability in `flow.rs`. Ties into the existing
   `PackedTxName`/`packed_tx_flow_id` convention already in `config.rs`/`ids.rs`: the gatherer would
   be what actually *produces* a well-known `packed-tx:<name>` flow from several sources.
+- **Wide-bundle grid entries exposed via `docker-entrypoint.sh`** (was already possible in
+  `config.json`, just not from the container env-var generator): a discussion of how to give IS-08
+  a genuinely channel-granular MXL-side equivalent (mirroring the real AMWA IS-08 "flow <-> mask"
+  split — see `decklink-mxl-gateway`'s own IS-08 work in the same broader session) turned out to
+  already be exactly what this module's grid/patch split *is*. `InputGridEntryConfig`/
+  `OutputGridEntryConfig` already took an arbitrary `channels` count per entry (not forced to 1),
+  and `flow.rs`'s `FlowReader`/`FlowWriter` already wrap MXL's own native multi-channel flow support
+  end to end (real planar per-channel read/write against one `channelCount`-sized flow) — so a grid
+  entry has *always* been able to be a genuinely wide bundle (one Receiver/Sender, N real channels)
+  with `patch.rs`'s existing per-channel `SourceRef::Input{entry_id, channel}` crosspoints doing the
+  channel-granular fan-out into tracks/buses/masters, exactly the "bundle flow + channel mask"
+  pattern IS-08 exists to provide, just without needing a second protocol layer since this app's
+  *entire* patch bay already works that way internally at every grid/track/bus/master boundary, not
+  only at the NMOS one. The one real gap was `docker-entrypoint.sh`'s env-var generator, which never
+  exposed a per-entry channel count — `INPUT_GRID_COUNT`/`OUTPUT_GRID_COUNT` always produced that
+  many *stereo* (the global `CHANNELS` default) entries, so a container-sized deployment could only
+  ever reach a many-small-Receivers topology, never a few-wide-bundles one, without hand-authoring
+  `config.json`. Fixed by adding `INPUT_GRID_CHANNELS`/`OUTPUT_GRID_CHANNELS` (default: `$CHANNELS`,
+  fully backward compatible) so e.g. `INPUT_GRID_COUNT=1 INPUT_GRID_CHANNELS=32` generates one
+  32-channel input-grid entry instead of 32 separate stereo ones. Verified live: generated a
+  1-entry/32-channel input grid and a 1-entry/16-channel output grid, confirmed via `mxl-info -l`/
+  `-f` that the output grid produced exactly **one** real 16-channel MXL flow (not 16 mono ones) and
+  the Node API listed exactly **one** NMOS Sender for it.
 
 ## 6. Persistence and redundancy
 

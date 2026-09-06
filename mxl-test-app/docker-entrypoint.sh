@@ -27,6 +27,19 @@
 # MASTER_COUNT, since "how much this device can receive/send over NMOS" is a deployment/capacity
 # decision, not a mixing-topology one. OUTPUT_<n>_TARGET pins a specific output-grid entry's flow
 # the same way BUS_<n>_TARGET used to.
+#
+# Each generated grid entry's own channel count is INPUT_GRID_CHANNELS/OUTPUT_GRID_CHANNELS
+# (default: $CHANNELS, i.e. stereo) -- *not* forced to 1. This is the knob that decides which of
+# two equally-valid topologies a deployment gets: many small entries (INPUT_GRID_COUNT=16,
+# INPUT_GRID_CHANNELS=2 -- one Receiver per stereo pair) vs. few wide ones (INPUT_GRID_COUNT=1,
+# INPUT_GRID_CHANNELS=32 -- one Receiver backed by one real 32-channel MXL flow, patch.rs's own
+# per-channel `SourceRef::Input{entry_id, channel}` crosspoints doing the fan-out into
+# tracks/buses/masters same as always). The wide form is the IS-08-analogous pattern discussed for
+# this app: one NMOS-facing bundle, channel-granular routing handled entirely inside patch.rs
+# rather than by minting a Receiver per stream. Neither form needed a code change to become
+# possible -- `InputGridEntryConfig`/`OutputGridEntryConfig` already took an arbitrary `channels`
+# count and `flow.rs`'s `FlowReader`/`FlowWriter` already wrap MXL's own native multi-channel flow
+# support end to end; this generator simply wasn't exposing that per-entry knob until now.
 
 set -eu
 
@@ -37,6 +50,11 @@ BUS_COUNT="${BUS_COUNT:-2}"
 MASTER_COUNT="${MASTER_COUNT:-}"
 INPUT_GRID_COUNT="${INPUT_GRID_COUNT:-0}"
 OUTPUT_GRID_COUNT="${OUTPUT_GRID_COUNT:-0}"
+# Per-entry channel count for every generated grid entry -- see the header comment above. Defaults
+# to $CHANNELS below once that's set (bash/dash can't forward-reference it here, so the fallback is
+# applied when each entry is actually built).
+INPUT_GRID_CHANNELS="${INPUT_GRID_CHANNELS:-}"
+OUTPUT_GRID_CHANNELS="${OUTPUT_GRID_CHANNELS:-}"
 # "simple" (default, today's gain->fader->mute/solo chain) or "full_channel" (adds every
 # processing stage in dsp.rs -- filter, EQ, both dynamics stages, phase, delay -- to every
 # generated track/master, as structural placeholders; see config.rs's ChannelTemplate docs). One
@@ -129,11 +147,16 @@ if [ -n "$MASTER_COUNT" ]; then
     done
 fi
 
+# Falls back to the global stereo default when unset, same convention as every other per-entry
+# "channels" field in config.rs.
+input_grid_channels="${INPUT_GRID_CHANNELS:-$CHANNELS}"
+output_grid_channels="${OUTPUT_GRID_CHANNELS:-$CHANNELS}"
+
 input_grid_json=""
 i=0
 while [ "$i" -lt "$INPUT_GRID_COUNT" ]; do
     # No "source" -- starts empty, waiting for IS-05 receiver activation (nmos/server.rs).
-    entry=$(printf '{"id":"nmos-in-%d","label":"NMOS Input %d"}' "$i" "$((i + 1))")
+    entry=$(printf '{"id":"nmos-in-%d","label":"NMOS Input %d","channels":%d}' "$i" "$((i + 1))" "$input_grid_channels")
     if [ -z "$input_grid_json" ]; then input_grid_json="$entry"; else input_grid_json="$input_grid_json,$entry"; fi
     i=$((i + 1))
 done
@@ -145,9 +168,9 @@ while [ "$i" -lt "$OUTPUT_GRID_COUNT" ]; do
     eval "target_value=\${$target_var:-}"
     target_json=$(target_json_fragment "$target_value")
     if [ -n "$target_json" ]; then
-        entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d",%s}' "$i" "$((i + 1))" "$target_json")
+        entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d","channels":%d,%s}' "$i" "$((i + 1))" "$output_grid_channels" "$target_json")
     else
-        entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d"}' "$i" "$((i + 1))")
+        entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d","channels":%d}' "$i" "$((i + 1))" "$output_grid_channels")
     fi
     if [ -z "$output_grid_json" ]; then output_grid_json="$entry"; else output_grid_json="$output_grid_json,$entry"; fi
     i=$((i + 1))
@@ -177,5 +200,5 @@ cat > "$CONFIG_PATH" <<EOF
 }
 EOF
 
-echo "generated ${CONFIG_PATH} (${TRACK_COUNT} tracks, ${BUS_COUNT} buses, masters '${MASTER_COUNT:-auto-paired}', ${INPUT_GRID_COUNT} input-grid, ${OUTPUT_GRID_COUNT} output-grid, template '${CHANNEL_TEMPLATE}', instance '${INSTANCE_NAME}')" >&2
+echo "generated ${CONFIG_PATH} (${TRACK_COUNT} tracks, ${BUS_COUNT} buses, masters '${MASTER_COUNT:-auto-paired}', ${INPUT_GRID_COUNT} input-grid x ${input_grid_channels}ch, ${OUTPUT_GRID_COUNT} output-grid x ${output_grid_channels}ch, template '${CHANNEL_TEMPLATE}', instance '${INSTANCE_NAME}')" >&2
 exec /app/mxl-test-app "$CONFIG_PATH"
