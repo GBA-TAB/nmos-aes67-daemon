@@ -8,10 +8,12 @@
 use crate::config::Config;
 use crate::patch::{InputGridEntry, OutputGridEntry};
 
-/// mxl-bridge's own private-use transport type for MXL-backed resources (see its mxl_flow.rs) —
-/// reused here rather than inventing a second one, since interoperating with mxl-bridge is this
-/// app's whole purpose.
-pub const TRANSPORT_TYPE: &str = "urn:x-mxl:transport:flow";
+/// The real, AMWA-registered transport type for MXL flows - kept identical to `mxl-bridge`'s own
+/// `TRANSPORT_TYPE` (see that project's own doc comment for the full investigation/fix), since
+/// interoperating with mxl-bridge - discovering its real Senders via `discovery.rs`'s exact-match
+/// filter on this string - is this app's whole purpose. Was a private `urn:x-mxl:transport:flow`
+/// string until fixed 2026-09-11 alongside mxl-bridge itself.
+pub const TRANSPORT_TYPE: &str = "urn:x-nmos:transport:mxl";
 
 fn base_url(cfg: &Config, ip: &str) -> String {
     format!("http://{ip}:{}", cfg.ws_port)

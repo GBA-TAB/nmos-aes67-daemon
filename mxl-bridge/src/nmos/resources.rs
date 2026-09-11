@@ -2,10 +2,17 @@ use crate::config::Config;
 
 use super::state::{version_string, NmosState, SinkEntrySnapshot, SourceEntrySnapshot};
 
-/// mxl-bridge's private-use transport type for MXL-backed resources — there's no AMWA-registered
-/// URN for this (see README's IS-05 design note), fine within this closed daemon/orchestrator
-/// ecosystem, would need proper registration to interoperate with third-party controllers.
-pub const TRANSPORT_TYPE: &str = "urn:x-mxl:transport:flow";
+/// The real, AMWA-registered transport type for MXL flows - confirmed by reading the official
+/// nmos-testing tool's own source (`IS04Utils.py`/`IS05Utils.py`, `~/DEV/nmos/nmos-testing-master`),
+/// which recognizes exactly this string and knows to generate/validate a real `mxl_flow_id`
+/// transport parameter for it. This was previously a private `urn:x-mxl:transport:flow` string -
+/// the *original* source of that convention, in fact (`decklink-mxl-gateway` and `mxl-signal-gen`
+/// both copied it from here, unverified against any real spec, until fixed 2026-09-11) - so fixing
+/// it here matters beyond this project alone: `mxl-test-app/src/nmos/discovery.rs` filters
+/// incoming Senders by an exact match on this string, and would have silently stopped discovering
+/// Senders from those two now-corrected projects had this not been fixed too. See
+/// `decklink-mxl-gateway`'s `BUILDING-AN-MXL-NMOS-NODE.md` for the full investigation.
+pub const TRANSPORT_TYPE: &str = "urn:x-nmos:transport:mxl";
 
 fn base_url(cfg: &Config, ip: &str) -> String {
     format!("http://{ip}:{}", cfg.nmos_node_port)

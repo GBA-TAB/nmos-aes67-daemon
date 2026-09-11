@@ -7,7 +7,7 @@
 //! created. Every entry it creates gets its own stable Receiver id too, same as every other
 //! input-grid entry (see PICKOFFS.md's own intro).
 //!
-//! Only Senders whose `transport` is `urn:x-mxl:transport:flow` (`resources::TRANSPORT_TYPE` —
+//! Only Senders whose `transport` is `urn:x-nmos:transport:mxl` (`resources::TRANSPORT_TYPE` —
 //! mxl-bridge's own mirrored Sinks, any mxl-test-app instance's own output-grid Senders, or any
 //! other MXL app that advertises one) are candidates: a real AES67/2110 Sender's `flow_id` isn't a
 //! raw MXL flow this app could open directly — that still needs mxl-bridge's own on-demand
