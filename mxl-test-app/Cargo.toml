@@ -17,3 +17,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+tower-http = { version = "0.7.1", features = ["cors"] }

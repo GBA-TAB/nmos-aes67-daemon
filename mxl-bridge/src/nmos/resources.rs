@@ -79,6 +79,11 @@ pub fn device_json(state: &NmosState, ip: &str, sender_ids: &[uuid::Uuid], recei
             "href": format!("{base}/x-nmos/connection/v1.1/"),
             "type": "urn:x-nmos:control:sr-ctrl/v1.1",
             "authorization": false
+        }, {
+            // Kept alongside v1.1, not replacing it - see `TRANSPORT_TYPE`'s doc comment for why.
+            "href": format!("{base}/x-nmos/connection/v1.2/"),
+            "type": "urn:x-nmos:control:sr-ctrl/v1.2",
+            "authorization": false
         }]
     })
 }

@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use tower_http::cors::CorsLayer;
 
 use super::is08;
 use super::registration;
@@ -13,39 +14,106 @@ use super::state::{NmosState, SinkEntrySnapshot, SinkLeaseAction, SourceEntrySna
 
 type S = Arc<NmosState>;
 
+/// This whole router, and every fix in it, mirrors `decklink-mxl-gateway`'s identical hardening
+/// pass (2026-09-11) against AMWA's official nmos-testing tool - see that project's own
+/// `BUILDING-AN-MXL-NMOS-NODE.md` for the full investigation behind each one. Summary: every
+/// endpoint needs both a trailing-slash and a bare form (the tool is not internally consistent
+/// about which it uses, even across its own checks for the same endpoint); CORS headers were
+/// entirely absent; unmatched paths need a real JSON 404, not axum's bare default; and
+/// `urn:x-nmos:transport:mxl` (see `resources::TRANSPORT_TYPE`) is only spec-valid from IS-05 v1.2
+/// onward, so v1.2 is now served alongside v1.1 with the exact same handlers.
 pub fn router(state: S) -> Router {
     Router::new()
         .route("/x-nmos/", get(|| list(&["node/", "connection/", "channelmapping/"])))
+        .route("/x-nmos", get(|| list(&["node/", "connection/", "channelmapping/"])))
+        .route("/x-nmos/connection/", get(|| list(&["v1.1/", "v1.2/"])))
+        .route("/x-nmos/connection", get(|| list(&["v1.1/", "v1.2/"])))
         .route("/x-nmos/node/", get(|| list(&["v1.3/"])))
+        .route("/x-nmos/node", get(|| list(&["v1.3/"])))
         .route("/x-nmos/node/v1.3/", get(|| list(&["self", "devices/", "sources/", "flows/", "senders/", "receivers/"])))
+        .route("/x-nmos/node/v1.3", get(|| list(&["self", "devices/", "sources/", "flows/", "senders/", "receivers/"])))
         .route("/x-nmos/node/v1.3/self", get(node_self))
         .route("/x-nmos/node/v1.3/devices/", get(devices_list))
+        .route("/x-nmos/node/v1.3/devices", get(devices_list))
         .route("/x-nmos/node/v1.3/devices/:id", get(device_get))
         .route("/x-nmos/node/v1.3/sources/", get(sources_list))
+        .route("/x-nmos/node/v1.3/sources", get(sources_list))
         .route("/x-nmos/node/v1.3/sources/:id", get(source_get))
         .route("/x-nmos/node/v1.3/flows/", get(flows_list))
+        .route("/x-nmos/node/v1.3/flows", get(flows_list))
         .route("/x-nmos/node/v1.3/flows/:id", get(flow_get))
         .route("/x-nmos/node/v1.3/senders/", get(senders_list))
+        .route("/x-nmos/node/v1.3/senders", get(senders_list))
         .route("/x-nmos/node/v1.3/senders/:id", get(sender_get))
         .route("/x-nmos/node/v1.3/receivers/", get(receivers_list))
+        .route("/x-nmos/node/v1.3/receivers", get(receivers_list))
         .route("/x-nmos/node/v1.3/receivers/:id", get(receiver_get))
-        .route("/x-nmos/connection/v1.1/", get(|| list(&["single/"])))
-        .route("/x-nmos/connection/v1.1/single/", get(|| list(&["senders/", "receivers/"])))
-        .route("/x-nmos/connection/v1.1/single/senders/", get(sender_ids))
-        .route("/x-nmos/connection/v1.1/single/senders/:id/", get(|| list(&["constraints/", "staged/", "active/", "transportfile", "transporttype"])))
-        .route("/x-nmos/connection/v1.1/single/senders/:id/constraints", get(sender_constraints))
-        .route("/x-nmos/connection/v1.1/single/senders/:id/staged", get(sender_staged).patch(sender_patch))
-        .route("/x-nmos/connection/v1.1/single/senders/:id/active", get(sender_staged))
-        .route("/x-nmos/connection/v1.1/single/senders/:id/transporttype", get(sender_transporttype))
-        .route("/x-nmos/connection/v1.1/single/senders/:id/transportfile", get(sender_transportfile))
-        .route("/x-nmos/connection/v1.1/single/receivers/", get(receiver_ids))
-        .route("/x-nmos/connection/v1.1/single/receivers/:id/", get(|| list(&["constraints/", "staged/", "active/", "transporttype"])))
-        .route("/x-nmos/connection/v1.1/single/receivers/:id/constraints", get(receiver_constraints))
-        .route("/x-nmos/connection/v1.1/single/receivers/:id/staged", get(receiver_staged).patch(receiver_patch))
-        .route("/x-nmos/connection/v1.1/single/receivers/:id/active", get(receiver_staged))
-        .route("/x-nmos/connection/v1.1/single/receivers/:id/transporttype", get(receiver_transporttype))
+        .route("/x-nmos/connection/v1.1/", get(|| list(&["bulk/", "single/"])))
+        .route("/x-nmos/connection/v1.1", get(|| list(&["bulk/", "single/"])))
+        .nest("/x-nmos/connection/v1.1/single", connection_router())
+        .route("/x-nmos/connection/v1.1/bulk/", get(|| async { bulk_not_implemented() }))
+        .route("/x-nmos/connection/v1.1/bulk", get(|| async { bulk_not_implemented() }))
+        .route("/x-nmos/connection/v1.1/bulk/senders", get(|| async { bulk_not_implemented() }))
+        .route("/x-nmos/connection/v1.1/bulk/receivers", get(|| async { bulk_not_implemented() }))
+        .route("/x-nmos/connection/v1.2/", get(|| list(&["bulk/", "single/"])))
+        .route("/x-nmos/connection/v1.2", get(|| list(&["bulk/", "single/"])))
+        .nest("/x-nmos/connection/v1.2/single", connection_router())
+        .route("/x-nmos/connection/v1.2/bulk/", get(|| async { bulk_not_implemented() }))
+        .route("/x-nmos/connection/v1.2/bulk", get(|| async { bulk_not_implemented() }))
+        .route("/x-nmos/connection/v1.2/bulk/senders", get(|| async { bulk_not_implemented() }))
+        .route("/x-nmos/connection/v1.2/bulk/receivers", get(|| async { bulk_not_implemented() }))
         .merge(is08::router())
+        .fallback(|| async { not_found() })
         .with_state(state)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::PUT,
+                    axum::http::Method::PATCH,
+                    axum::http::Method::DELETE,
+                    axum::http::Method::OPTIONS,
+                    axum::http::Method::HEAD,
+                ])
+                .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION, axum::http::header::ACCEPT]),
+        )
+}
+
+fn bulk_not_implemented() -> axum::response::Response {
+    (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"code": 405, "error": "Bulk resource control is not implemented on this Node - use the single/ interface", "debug": null})))
+        .into_response()
+}
+
+/// The IS-05 Connection API's `single/` subtree, shared byte-for-byte between the `v1.1` and `v1.2`
+/// mounts above.
+fn connection_router() -> Router<S> {
+    Router::new()
+        .route("/", get(|| list(&["senders/", "receivers/"])))
+        .route("/senders/", get(sender_ids))
+        .route("/senders", get(sender_ids))
+        .route("/senders/:id/", get(|| list(&["constraints/", "staged/", "active/", "transportfile", "transporttype"])))
+        .route("/senders/:id", get(|| list(&["constraints/", "staged/", "active/", "transportfile", "transporttype"])))
+        .route("/senders/:id/constraints/", get(sender_constraints))
+        .route("/senders/:id/constraints", get(sender_constraints))
+        .route("/senders/:id/staged/", get(sender_staged).patch(sender_patch))
+        .route("/senders/:id/staged", get(sender_staged).patch(sender_patch))
+        .route("/senders/:id/active/", get(sender_staged))
+        .route("/senders/:id/active", get(sender_staged))
+        .route("/senders/:id/transporttype", get(sender_transporttype))
+        .route("/senders/:id/transportfile", get(sender_transportfile))
+        .route("/receivers/", get(receiver_ids))
+        .route("/receivers", get(receiver_ids))
+        .route("/receivers/:id/", get(|| list(&["constraints/", "staged/", "active/", "transporttype"])))
+        .route("/receivers/:id", get(|| list(&["constraints/", "staged/", "active/", "transporttype"])))
+        .route("/receivers/:id/constraints/", get(receiver_constraints))
+        .route("/receivers/:id/constraints", get(receiver_constraints))
+        .route("/receivers/:id/staged/", get(receiver_staged).patch(receiver_patch))
+        .route("/receivers/:id/staged", get(receiver_staged).patch(receiver_patch))
+        .route("/receivers/:id/active/", get(receiver_staged))
+        .route("/receivers/:id/active", get(receiver_staged))
+        .route("/receivers/:id/transporttype", get(receiver_transporttype))
 }
 
 async fn list(items: &[&str]) -> Json<Vec<String>> {
