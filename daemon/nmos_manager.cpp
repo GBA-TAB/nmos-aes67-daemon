@@ -279,6 +279,10 @@ void NmosManager::registry_browse_callback(AvahiServiceBrowser* b,
         mgr.discovered_registry_address_.clear();
         mgr.discovered_registry_port_ = 0;
       }
+      // The registry we were actually using is the one that just vanished from mDNS (or we had
+      // none yet) - clear the healthy flag so the next discovered registry is accepted rather
+      // than ignored as "we already have a healthy one".
+      mgr.registry_healthy_ = false;
       {
         std::unique_lock<std::mutex> lock(mgr.events_mutex_);
         mgr.pending_events_.push({EventType::RegistryLost, 0});
@@ -313,19 +317,34 @@ void NmosManager::registry_resolve_callback(AvahiServiceResolver* r,
   if (event == AVAHI_RESOLVER_FOUND) {
     char addr[AVAHI_ADDRESS_STR_MAX];
     avahi_address_snprint(addr, sizeof(addr), address);
-    BOOST_LOG_TRIVIAL(info)
-        << "NmosManager:: DNS-SD resolved NMOS registry \"" << name
-        << "\" at " << addr << ":" << port;
+
+    bool accepted = false;
     {
       std::lock_guard<std::mutex> lock(mgr.registry_disc_mutex_);
-      mgr.discovered_registry_address_ = addr;
-      mgr.discovered_registry_port_    = port;
+      bool same_as_current = mgr.discovered_registry_address_ == addr &&
+                              mgr.discovered_registry_port_ == port;
+      if (mgr.registry_healthy_.load() &&
+          !mgr.discovered_registry_address_.empty() && !same_as_current) {
+        BOOST_LOG_TRIVIAL(info)
+            << "NmosManager:: DNS-SD found NMOS registry \"" << name
+            << "\" at " << addr << ":" << port
+            << " but the current registry connection is healthy - ignoring";
+      } else {
+        mgr.discovered_registry_address_ = addr;
+        mgr.discovered_registry_port_    = port;
+        accepted = true;
+      }
     }
-    {
-      std::unique_lock<std::mutex> lock(mgr.events_mutex_);
-      mgr.pending_events_.push({EventType::RegistryUpdated, 0});
+    if (accepted) {
+      BOOST_LOG_TRIVIAL(info)
+          << "NmosManager:: DNS-SD resolved NMOS registry \"" << name
+          << "\" at " << addr << ":" << port;
+      {
+        std::unique_lock<std::mutex> lock(mgr.events_mutex_);
+        mgr.pending_events_.push({EventType::RegistryUpdated, 0});
+      }
+      mgr.events_cv_.notify_one();
     }
-    mgr.events_cv_.notify_one();
   } else {
     BOOST_LOG_TRIVIAL(warning)
         << "NmosManager:: DNS-SD failed to resolve NMOS registry \"" << name << "\"";
@@ -2608,6 +2627,7 @@ bool NmosManager::heartbeat() {
   auto res = cli.Post(path.c_str(), "", "application/json");
   if (!res) {
     BOOST_LOG_TRIVIAL(warning) << "NmosManager:: heartbeat failed (no response)";
+    registry_healthy_ = false;
     return false;
   }
   if (res->status == 404) {
@@ -2617,8 +2637,10 @@ bool NmosManager::heartbeat() {
   if (res->status != 200) {
     BOOST_LOG_TRIVIAL(warning) << "NmosManager:: heartbeat returned HTTP "
                                << res->status;
+    registry_healthy_ = false;
     return false;
   }
+  registry_healthy_ = true;
   return true;
 }
 
@@ -2795,8 +2817,15 @@ bool NmosManager::full_registration() {
   BOOST_LOG_TRIVIAL(info) << "NmosManager:: registering with registry at "
                           << effective_registry_address() << ":"
                           << effective_registry_port();
-  for (const auto& [type, json] : to_push)
-    register_resource(type, json);
+  // The node resource's own result stands in for "is this registry actually reachable and
+  // accepting us" - it's always pushed first and is the resource the health-status logic in
+  // registry_resolve_callback/heartbeat() cares about.
+  bool node_ok = false;
+  for (const auto& [type, json] : to_push) {
+    bool ok = register_resource(type, json);
+    if (type == "node") node_ok = ok;
+  }
+  registry_healthy_ = node_ok;
 
   return true;
 }

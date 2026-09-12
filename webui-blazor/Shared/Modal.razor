@@ -1,0 +1,19 @@
+@* Hand-rolled overlay + centered box - replaces react-modal per the migration plan's "lightweight"
+   goal (react-modal today is just centering + an overlay, easy to replicate directly). *@
+
+@if (Visible)
+{
+    <div class="modal-overlay" @onclick="OnOverlayClick">
+        <div class="modal-content" @onclick:stopPropagation="true">
+            @ChildContent
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public bool Visible { get; set; }
+    [Parameter] public EventCallback OnRequestClose { get; set; }
+    [Parameter] public RenderFragment? ChildContent { get; set; }
+
+    private Task OnOverlayClick() => OnRequestClose.InvokeAsync();
+}

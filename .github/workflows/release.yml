@@ -14,20 +14,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup node
-        uses: actions/setup-node@v2
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
         with:
-          node-version: '24'
+          dotnet-version: '8.0.x'
 
-      - name: Install dependencies
+      - name: Build webui (Blazor WebAssembly)
         run: |
-          cd webui/
-          npm install
-
-      - name: Build webui
-        run: |
-          cd webui/
-          npm run build
+          cd webui-blazor/
+          dotnet publish -c Release -o publish
+          mkdir -p ../webui/dist
+          cp -r publish/wwwroot/. ../webui/dist/
 
       - name: Bundle webui release
         run: |

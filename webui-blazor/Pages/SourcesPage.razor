@@ -1,0 +1,206 @@
+@page "/Sources"
+@using AesDaemonWebUI.Models
+@using AesDaemonWebUI.Services
+@inject DaemonApiClient Api
+
+<div id="sources">
+    @if (_loading)
+    {
+        <p><em>Loading...</em></p>
+    }
+    else
+    {
+        <div id="sources-table">
+            <table class="table-stream"><tbody>
+                @if (_sources.Count > 0)
+                {
+                    <tr class="tr-stream">
+                        <th>ID</th>
+                        <th>Name</th>
+                        <th>NMOS Name</th>
+                        <th>Address</th>
+                        <th>Port</th>
+                        <th>Channels</th>
+                        <th>Leg</th>
+                    </tr>
+                    @foreach (var source in _sources)
+                    {
+                        <SourceRow @key="source.Id" Source="source" Hostname="@_hostname" OnInfoClick="OnInfoClick" OnEditClick="OnEditClick" OnTrashClick="OnTrashClick" />
+                    }
+                }
+                else
+                {
+                    <tr><th>No sources configured</th></tr>
+                }
+            </tbody></table>
+            &nbsp;
+            <span class="pointer-area" @onclick="Reload"><img width="30" height="30" src="img/reload.png" alt="" /></span>
+            &nbsp;&nbsp;
+            @if (_sources.Count < 64)
+            {
+                <span class="pointer-area" @onclick="AddNew"><img width="30" height="30" src="img/plus.png" alt="" /></span>
+            }
+        </div>
+    }
+</div>
+
+@if (_infoVisible)
+{
+    <SourceInfoModal Visible="true" Title="Local Source Info" Id="@_infoId" SourceKind="local" Name="@_infoName" Sdp="@_infoSdp" OnClose="CloseInfo" />
+}
+
+@if (_editVisible)
+{
+    <SourceEditModal Title="@_editTitle" IsEdit="_isEdit" Source="_editSource" AllSources="_sources" TicFrameSizeAt1Fs="_ticFrameSizeAt1fs" SampleRate="_sampleRate" OnClose="CloseEdit" OnApplied="ApplyEdit" />
+}
+
+@if (_removeVisible)
+{
+    <ConfirmModal Visible="true" Title="@($"Remove source {_removeSource?.Id}")" Busy="_removing" ErrorMessage="_removeError" OnConfirm="ConfirmRemove" OnCancel="CloseEdit" />
+}
+
+@code {
+    private List<SourceInfo> _sources = new();
+    private bool _loading = true;
+    private int _ticFrameSizeAt1fs;
+    private int _sampleRate;
+    private string _hostname = "";
+
+    private bool _infoVisible;
+    private string _infoId = "";
+    private string _infoName = "";
+    private string _infoSdp = "";
+
+    private bool _editVisible;
+    private bool _isEdit;
+    private string _editTitle = "";
+    private SourceInfo _editSource = new();
+
+    private bool _removeVisible;
+    private bool _removing;
+    private string? _removeError;
+    private SourceInfo? _removeSource;
+
+    protected override async Task OnInitializedAsync() => await FetchSources();
+
+    private async Task FetchSources()
+    {
+        _loading = true;
+        try
+        {
+            var sourcesTask = Api.GetSourcesAsync();
+            var config = await Api.GetConfigAsync();
+            _ticFrameSizeAt1fs = config.TicFrameSizeAt1Fs;
+            _sampleRate = config.SampleRate;
+            _hostname = config.NmosLabel;
+            _sources = (await sourcesTask).OrderBy(s => s.Id).ToList();
+        }
+        catch (DaemonApiException)
+        {
+            // Leave the last-known list in place rather than blanking the page.
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private Task Reload() => FetchSources();
+
+    private void OnInfoClick((int Id, string Sdp) args)
+    {
+        var source = _sources.FirstOrDefault(s => s.Id == args.Id);
+        if (source == null)
+        {
+            return;
+        }
+        _infoId = source.Id.ToString();
+        _infoName = source.Name;
+        _infoSdp = args.Sdp;
+        _infoVisible = true;
+    }
+
+    private void OnEditClick(int id)
+    {
+        var source = _sources.FirstOrDefault(s => s.Id == id);
+        if (source == null)
+        {
+            return;
+        }
+        _editTitle = $"Edit Source {id}";
+        _editSource = source;
+        _isEdit = true;
+        _editVisible = true;
+    }
+
+    private void OnTrashClick(int id)
+    {
+        _removeSource = _sources.FirstOrDefault(s => s.Id == id);
+        _removeError = null;
+        _removeVisible = _removeSource != null;
+    }
+
+    private void AddNew()
+    {
+        int id;
+        for (id = 0; id < 63; id++)
+        {
+            if (id >= _sources.Count || _sources[id].Id != id)
+            {
+                break;
+            }
+        }
+        var channelStart = AudioPacketMath.FindNextFreeChannelStart(_sources.Select(s => s.Map), 2);
+        _editSource = new SourceInfo
+        {
+            Id = id,
+            Enabled = true,
+            Name = $"ALSA Source {id}",
+            Io = "Audio Device",
+            MaxSamplesPerPacket = 48,
+            Codec = "L24",
+            Ttl = 15,
+            PayloadType = 98,
+            Dscp = 34,
+            RefclkPtpTraceable = false,
+            Map = new List<int> { channelStart, channelStart + 1 },
+        };
+        _editTitle = $"Add Source {id}";
+        _isEdit = false;
+        _editVisible = true;
+    }
+
+    private void CloseInfo() => _infoVisible = false;
+
+    private async Task CloseEdit()
+    {
+        _editVisible = false;
+        _removeVisible = false;
+        await FetchSources();
+    }
+
+    private Task ApplyEdit() => CloseEdit();
+
+    private async Task ConfirmRemove()
+    {
+        if (_removeSource == null)
+        {
+            return;
+        }
+        _removing = true;
+        _removeError = null;
+        try
+        {
+            await Api.DeleteSourceAsync(_removeSource.Id);
+            await CloseEdit();
+        }
+        catch (DaemonApiException ex)
+        {
+            _removeError = $"Remove Source failed: {ex.Message}";
+        }
+        finally
+        {
+            _removing = false;
+        }
+    }
+}

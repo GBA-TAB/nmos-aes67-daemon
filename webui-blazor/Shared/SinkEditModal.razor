@@ -1,0 +1,238 @@
+@* Ports SinkEdit.jsx. Like SourceEditModal, rendered by the parent only while open, so
+   OnInitializedAsync is exactly the original's componentDidMount. *@
+@using AesDaemonWebUI.Models
+@using AesDaemonWebUI.Services
+@inject DaemonApiClient Api
+
+<Modal Visible="true" OnRequestClose="Cancel">
+    <h2 style="text-align:center">@Title</h2>
+    <table><tbody>
+        <tr>
+            <th align="left"><font color="grey">ID</font></th>
+            <th align="left"><input type="number" class="input-number" value="@_id" disabled /></th>
+        </tr>
+        <tr>
+            <th align="left"><label>Name</label></th>
+            <th align="left"><input value="@_name" @oninput="OnNameChanged" /></th>
+        </tr>
+        <tr height="35">
+            <th align="left"><label>Use SDP</label></th>
+            <th align="left"><input type="checkbox" checked="@_useSdp" @onchange="OnUseSdpChanged" /></th>
+        </tr>
+        <tr>
+            <th align="left"><font color="@(_useSdp ? "grey" : "black")">Source URL</font></th>
+            <th align="left">
+                <input type="url" size="30" value="@_source" disabled="@_useSdp" @oninput="OnSourceChanged" />
+                @if (_sourceErr)
+                {
+                    <span class="validation-message">Must be a valid URL</span>
+                }
+            </th>
+        </tr>
+        <tr>
+            <th align="left"><font color="@(!_useSdp ? "grey" : "black")">Remote Source SDP</font></th>
+            <th align="left">
+                <select value="@_sdp" @onchange="OnRemoteSourceSdpChanged" disabled="@(!_useSdp)">
+                    <option value="">-- select a remote source SDP --</option>
+                    @foreach (var s in _remoteSources)
+                    {
+                        <option value="@s.Sdp">@s.Source from @s.Address - @s.Name</option>
+                    }
+                </select>
+            </th>
+        </tr>
+        <tr>
+            <th align="left"><font color="@(!_useSdp ? "grey" : "black")">SDP</font></th>
+            <th align="left"><textarea rows="15" cols="55" value="@_sdp" disabled="@(!_useSdp)" @oninput="e => _sdp = e.Value?.ToString() ?? string.Empty"></textarea></th>
+        </tr>
+        <tr>
+            <th align="left"><label>Delay (samples)</label></th>
+            <th align="left">
+                <select @bind="_delay">
+                    <option value="192">192 - 4ms@@48kHz</option>
+                    <option value="384">384 - 8ms@@48kHz</option>
+                    <option value="576">576 - 12ms@@48kHz</option>
+                    <option value="768">768 - 16ms@@48kHz</option>
+                    <option value="960">960 - 20ms@@48kHz</option>
+                </select>
+            </th>
+        </tr>
+        <tr height="35">
+            <th align="left"><label>Ignore RefClk GMID</label></th>
+            <th align="left"><input type="checkbox" checked="@_ignoreRefclkGmid" @onchange="e => _ignoreRefclkGmid = (bool)e.Value!" /></th>
+        </tr>
+        <tr>
+            <th align="left"><label>Channels</label></th>
+            <th align="left">
+                <input type="number" class="input-number" min="1" max="64" value="@_channels" @oninput="OnChannelsChanged" />
+            </th>
+        </tr>
+        <tr>
+            <th align="left">Audio Channels map</th>
+            <th align="left">
+                <select value="@(_map.Count > 0 ? _map[0] : 0)" @onchange="OnChannelsMapChanged">
+                    @foreach (var (start, inUse) in _audioMap)
+                    {
+                        <option value="@start" disabled="@(inUse && start != (_map.Count > 0 ? _map[0] : -1))">@ChannelMapLabel(start)@(inUse ? " - in use" : "")</option>
+                    }
+                </select>
+            </th>
+        </tr>
+    </tbody></table>
+    <br />
+    <div style="text-align:center">
+        <button @onclick="Submit" disabled="@(!IsValid || _submitting)">Submit</button>
+        &nbsp;&nbsp;&nbsp;&nbsp;
+        <button @onclick="Cancel">Cancel</button>
+    </div>
+    @if (!string.IsNullOrEmpty(_errorMessage))
+    {
+        <p class="status-error" style="text-align:center">@_errorMessage</p>
+    }
+</Modal>
+
+@code {
+    [Parameter, EditorRequired] public string Title { get; set; } = "";
+    [Parameter] public bool IsEdit { get; set; }
+    [Parameter, EditorRequired] public SinkInfo Sink { get; set; } = new();
+    [Parameter] public List<SinkInfo> AllSinks { get; set; } = new();
+    [Parameter] public EventCallback OnClose { get; set; }
+    [Parameter] public EventCallback OnApplied { get; set; }
+
+    private int _id;
+    private string _name = "";
+    private string _io = "";
+    private int _delay;
+    private bool _ignoreRefclkGmid;
+    private bool _useSdp;
+    private string _source = "";
+    private string _sdp = "";
+    private int _channels;
+    private List<int> _map = new();
+    private List<(int Start, bool InUse)> _audioMap = new();
+    private HashSet<int> _usedByOthers = new();
+    private List<RemoteSource> _remoteSources = new();
+    private bool _submitting;
+    private string? _errorMessage;
+
+    private bool _nameErr;
+    private bool _sourceErr;
+
+    private bool IsValid => !_nameErr && !_sourceErr &&
+        (_useSdp || !string.IsNullOrEmpty(_source)) &&
+        (!_useSdp || !string.IsNullOrEmpty(_sdp));
+
+    protected override async Task OnInitializedAsync()
+    {
+        _id = Sink.Id;
+        _name = Sink.Name;
+        _io = Sink.Io;
+        _delay = Sink.Delay;
+        _ignoreRefclkGmid = Sink.IgnoreRefclkGmid;
+        _useSdp = Sink.UseSdp;
+        _source = Sink.Source;
+        _sdp = Sink.Sdp;
+        _map = new List<int>(Sink.Map);
+        _channels = _map.Count;
+        // Every other sink's channels are "already patched" and should show as such rather than
+        // silently letting this one collide with them - excludes this sink's own current
+        // assignment so re-selecting its existing range isn't flagged as a conflict with itself.
+        _usedByOthers = AllSinks.Where(s => s.Id != Sink.Id).SelectMany(s => s.Map).ToHashSet();
+        RebuildAudioMap();
+
+        try
+        {
+            _remoteSources = await Api.GetRemoteSourcesAsync();
+        }
+        catch (DaemonApiException)
+        {
+            // Leave the dropdown empty - the rest of the form must still work.
+        }
+    }
+
+    private void RebuildAudioMap()
+    {
+        _audioMap = Enumerable.Range(0, 64 - _channels + 1)
+            .Select(start => (start, InUse: Enumerable.Range(start, _channels).Any(_usedByOthers.Contains)))
+            .ToList();
+    }
+
+    private void OnNameChanged(ChangeEventArgs e)
+    {
+        _name = e.Value?.ToString() ?? "";
+        _nameErr = string.IsNullOrEmpty(_name);
+    }
+
+    private void OnUseSdpChanged(ChangeEventArgs e)
+    {
+        _useSdp = (bool)e.Value!;
+    }
+
+    private void OnSourceChanged(ChangeEventArgs e)
+    {
+        _source = e.Value?.ToString() ?? "";
+        _sourceErr = !string.IsNullOrEmpty(_source) && !Uri.TryCreate(_source, UriKind.Absolute, out _);
+    }
+
+    private void OnRemoteSourceSdpChanged(ChangeEventArgs e)
+    {
+        var value = e.Value?.ToString();
+        if (!string.IsNullOrEmpty(value))
+        {
+            _sdp = value;
+        }
+    }
+
+    private void OnChannelsChanged(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out var channels) && channels >= 1 && channels <= 64)
+        {
+            var start = _map.Count > 0 ? _map[0] : 0;
+            _channels = channels;
+            _map = Enumerable.Range(0, channels).Select(v => v + start).ToList();
+            RebuildAudioMap();
+        }
+    }
+
+    private void OnChannelsMapChanged(ChangeEventArgs e)
+    {
+        var start = int.Parse(e.Value?.ToString() ?? "0");
+        _map = Enumerable.Range(0, _channels).Select(v => v + start).ToList();
+    }
+
+    private string ChannelMapLabel(int v) => _channels > 1
+        ? $"ALSA Input {v + 1} -> ALSA Input {v + _channels}"
+        : $"ALSA Input {v + 1}";
+
+    private async Task Submit()
+    {
+        _submitting = true;
+        _errorMessage = null;
+        try
+        {
+            await Api.PutSinkAsync(_id, new SinkInfo
+            {
+                Id = _id,
+                Name = _name,
+                Io = _io,
+                UseSdp = _useSdp,
+                Source = _source,
+                Sdp = _sdp,
+                Delay = _delay,
+                IgnoreRefclkGmid = _ignoreRefclkGmid,
+                Map = _map,
+            });
+            await OnApplied.InvokeAsync();
+        }
+        catch (DaemonApiException ex)
+        {
+            _errorMessage = $"{(IsEdit ? "Update" : "Add")} Sink failed: {ex.Message}";
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+
+    private Task Cancel() => OnClose.InvokeAsync();
+}

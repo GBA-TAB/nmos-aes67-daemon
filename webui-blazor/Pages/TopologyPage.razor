@@ -1,0 +1,277 @@
+@page "/Topology"
+@using System.Text.RegularExpressions
+@using AesDaemonWebUI.Models
+@using AesDaemonWebUI.Services
+@inject DaemonApiClient Api
+@implements IAsyncDisposable
+
+<div id="topology">
+    @if (_loading && _sinks.Count == 0)
+    {
+        <p><em>Loading...</em></p>
+    }
+    else
+    {
+        var view = BuildView();
+
+        <div class="topo-section">
+            <h3>Active Connections</h3>
+            @if (view.Pipes.Count == 0)
+            {
+                <p class="topo-empty">No sinks are connected to a source.</p>
+            }
+            else
+            {
+                <table class="table-stream"><tbody>
+                    <tr class="tr-stream">
+                        <th>Source</th>
+                        <th></th>
+                        <th>Sink</th>
+                        <th>Status</th>
+                    </tr>
+                    @foreach (var p in view.Pipes)
+                    {
+                        <tr class="tr-stream">
+                            <td>
+                                <strong>@(p.Source != null ? p.Source.Name : ExtractIp(p.SourceUrl))</strong>
+                                &nbsp;
+                                <span class="topo-badge @(p.IsLocal ? "topo-local" : "topo-remote")">@(p.IsLocal ? "local" : "remote")</span>
+                                <br />
+                                <small>@(p.Source != null ? p.Source.Address : p.SourceUrl)</small>
+                                @if (p.Source != null)
+                                {
+                                    <small> &middot; @p.Source.Codec &middot; @p.Sink.Map.Count ch</small>
+                                }
+                            </td>
+                            <td class="topo-arrow">&rarr;</td>
+                            <td>
+                                <strong>@p.Sink.Name</strong><br />
+                                <small>@p.Sink.Io &middot; @p.Sink.Delay ms</small>
+                            </td>
+                            <td>@StatusBadgeMarkup(p.Flags)</td>
+                        </tr>
+                    }
+                </tbody></table>
+            }
+        </div>
+
+        @if (view.IdleLocalSources.Count > 0)
+        {
+            <div class="topo-section">
+                <h3>Local Sources &mdash; not received by any sink</h3>
+                <table class="table-stream"><tbody>
+                    <tr class="tr-stream">
+                        <th>ID</th><th>Name</th><th>Address</th><th>Codec</th><th>Ch</th>
+                    </tr>
+                    @foreach (var s in view.IdleLocalSources)
+                    {
+                        <tr class="tr-stream">
+                            <td>@s.Id</td>
+                            <td>@s.Name</td>
+                            <td>@s.Address</td>
+                            <td>@s.Codec</td>
+                            <td>@s.Map.Count</td>
+                        </tr>
+                    }
+                </tbody></table>
+            </div>
+        }
+
+        @if (view.IdleRemoteSources.Count > 0)
+        {
+            <div class="topo-section">
+                <h3>Remote Sources &mdash; visible but not connected</h3>
+                <table class="table-stream"><tbody>
+                    <tr class="tr-stream">
+                        <th>Name</th><th>Address</th><th>Domain</th><th>Last seen</th>
+                    </tr>
+                    @foreach (var s in view.IdleRemoteSources)
+                    {
+                        <tr class="tr-stream">
+                            <td>@s.Name</td>
+                            <td>@s.Address</td>
+                            <td>@s.Domain</td>
+                            <td>@(s.LastSeen)s ago</td>
+                        </tr>
+                    }
+                </tbody></table>
+            </div>
+        }
+
+        @if (view.IdleSinks.Count > 0)
+        {
+            <div class="topo-section">
+                <h3>Sinks &mdash; not connected</h3>
+                <table class="table-stream"><tbody>
+                    <tr class="tr-stream">
+                        <th>ID</th><th>Name</th><th>Device</th><th>Ch</th>
+                    </tr>
+                    @foreach (var s in view.IdleSinks)
+                    {
+                        <tr class="tr-stream">
+                            <td>@s.Id</td>
+                            <td>@s.Name</td>
+                            <td>@s.Io</td>
+                            <td>@s.Map.Count</td>
+                        </tr>
+                    }
+                </tbody></table>
+            </div>
+        }
+
+        <span class="pointer-area" @onclick="FetchAll"><img width="30" height="30" src="img/reload.png" alt="" /></span>
+    }
+</div>
+
+@code {
+    private const int PollSeconds = 5;
+    private static readonly Regex IpFromUrlRegex = new(@"//([\d.]+)");
+
+    private record Pipe(SinkInfo Sink, SourceInfo? Source, string SourceUrl, bool IsLocal, SinkFlags? Flags);
+    private record View(List<Pipe> Pipes, List<SourceInfo> IdleLocalSources, List<RemoteSource> IdleRemoteSources, List<SinkInfo> IdleSinks);
+
+    private List<SourceInfo> _localSources = new();
+    private List<SinkInfo> _sinks = new();
+    private List<RemoteSource> _remoteSources = new();
+    private Dictionary<int, SinkStatus?> _sinkStatuses = new();
+    private bool _loading = true;
+
+    private PeriodicTimer? _timer;
+    private readonly CancellationTokenSource _cts = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await FetchAll();
+        _ = PollLoop();
+    }
+
+    private async Task PollLoop()
+    {
+        _timer = new PeriodicTimer(TimeSpan.FromSeconds(PollSeconds));
+        try
+        {
+            while (await _timer.WaitForNextTickAsync(_cts.Token))
+            {
+                await FetchAll();
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task FetchAll()
+    {
+        _loading = true;
+        try
+        {
+            var sourcesTask = Api.GetSourcesAsync();
+            var sinksTask = Api.GetSinksAsync();
+            var remoteTask = Api.GetRemoteSourcesAsync();
+
+            _localSources = await SafeAwait(sourcesTask, new List<SourceInfo>());
+            _sinks = await SafeAwait(sinksTask, new List<SinkInfo>());
+            _remoteSources = await SafeAwait(remoteTask, new List<RemoteSource>());
+
+            var statusTasks = _sinks.Select(async sink =>
+            {
+                try
+                {
+                    return (sink.Id, (SinkStatus?)await Api.GetSinkStatusAsync(sink.Id));
+                }
+                catch (DaemonApiException)
+                {
+                    return (sink.Id, (SinkStatus?)null);
+                }
+            });
+            _sinkStatuses = (await Task.WhenAll(statusTasks)).ToDictionary(p => p.Id, p => p.Item2);
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private static async Task<T> SafeAwait<T>(Task<T> task, T fallback)
+    {
+        try
+        {
+            return await task;
+        }
+        catch (DaemonApiException)
+        {
+            return fallback;
+        }
+    }
+
+    private View BuildView()
+    {
+        var connectedLocalSrcIds = new HashSet<int>();
+        var connectedRemoteSrcIds = new HashSet<string>();
+        var connectedSinkIds = new HashSet<int>();
+        var pipes = new List<Pipe>();
+
+        foreach (var sink in _sinks)
+        {
+            if (string.IsNullOrEmpty(sink.Source))
+            {
+                continue;
+            }
+            var sinkIp = ExtractIp(sink.Source);
+
+            var localMatch = _localSources.FirstOrDefault(s => s.Address == sinkIp);
+            var remoteMatch = localMatch == null ? _remoteSources.FirstOrDefault(s => s.Address == sinkIp) : null;
+            _sinkStatuses.TryGetValue(sink.Id, out var status);
+
+            pipes.Add(new Pipe(sink, localMatch, sink.Source, localMatch != null, status?.SinkFlags));
+
+            connectedSinkIds.Add(sink.Id);
+            if (localMatch != null)
+            {
+                connectedLocalSrcIds.Add(localMatch.Id);
+            }
+            if (remoteMatch != null)
+            {
+                connectedRemoteSrcIds.Add(remoteMatch.Id);
+            }
+        }
+
+        var idleLocalSources = _localSources.Where(s => !connectedLocalSrcIds.Contains(s.Id)).ToList();
+        var idleRemoteSources = _remoteSources.Where(s => !connectedRemoteSrcIds.Contains(s.Id)).ToList();
+        var idleSinks = _sinks.Where(s => !connectedSinkIds.Contains(s.Id)).ToList();
+
+        return new View(pipes, idleLocalSources, idleRemoteSources, idleSinks);
+    }
+
+    private static string ExtractIp(string url)
+    {
+        var m = IpFromUrlRegex.Match(url);
+        return m.Success ? m.Groups[1].Value : url;
+    }
+
+    private static MarkupString StatusBadgeMarkup(SinkFlags? flags)
+    {
+        if (flags == null)
+        {
+            return new MarkupString("<span class=\"topo-badge topo-unknown\">?</span>");
+        }
+        if (flags.ReceivingRtpPacket)
+        {
+            return new MarkupString("<span class=\"topo-badge topo-active\">&#9679; receiving</span>");
+        }
+        if (flags.Muted)
+        {
+            return new MarkupString("<span class=\"topo-badge topo-muted\">&#9678; muted</span>");
+        }
+        return new MarkupString("<span class=\"topo-badge topo-wait\">&#9675; waiting</span>");
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        _timer?.Dispose();
+        _cts.Dispose();
+        await Task.CompletedTask;
+    }
+}

@@ -1,0 +1,48 @@
+@* Ports SourceInfo.jsx - read-only SDP viewer shared by the local Sources list and the Browser
+   (RemoteSources) page, matching the original's reuse of one component for both. *@
+
+<Modal Visible="Visible" OnRequestClose="OnCloseClick">
+    <h2 style="text-align:center">@Title</h2>
+    <table><tbody>
+        <tr>
+            <th align="left"><label>ID</label></th>
+            <th align="left"><input value="@Id" readonly /></th>
+        </tr>
+        <tr>
+            <th align="left"><label>Source</label></th>
+            <th align="left"><input value="@SourceKind" readonly /></th>
+        </tr>
+        <tr>
+            <th align="left"><label>Name</label></th>
+            <th align="left"><input value="@Name" readonly /></th>
+        </tr>
+        @if (SourceKind == "mDNS")
+        {
+            <tr>
+                <th align="left"><label>Domain</label></th>
+                <th align="left"><input value="@Domain" readonly /></th>
+            </tr>
+        }
+        <tr>
+            <th align="left"><label>SDP</label></th>
+            <th align="left"><textarea rows="15" cols="55" readonly>@Sdp</textarea></th>
+        </tr>
+    </tbody></table>
+    <br />
+    <div style="text-align:center">
+        <button @onclick="OnCloseClick">Close</button>
+    </div>
+</Modal>
+
+@code {
+    [Parameter] public bool Visible { get; set; }
+    [Parameter] public string Title { get; set; } = "";
+    [Parameter] public string Id { get; set; } = "";
+    [Parameter] public string SourceKind { get; set; } = ""; // "local", "SAP", or "mDNS"
+    [Parameter] public string Name { get; set; } = "";
+    [Parameter] public string Domain { get; set; } = "";
+    [Parameter] public string Sdp { get; set; } = "";
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private Task OnCloseClick() => OnClose.InvokeAsync();
+}

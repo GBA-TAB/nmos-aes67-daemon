@@ -23,17 +23,17 @@ git checkout -B experimental-hw-timestamping fork/experimental-hw-timestamping
 make
 cd -
 
-cd webui
-echo "Downloading current webui release ..."
-wget --timestamping https://github.com/bondagit/aes67-linux-daemon/releases/latest/download/webui.tar.gz
-if [ -f webui.tar.gz ]; then
-  tar -xzvf webui.tar.gz
-else
-  echo "Building and installing webui ..."
-  # npm install react-modal react-toastify react-router-dom
-  npm ci
-  npm run build
-fi
+echo "Building webui (Blazor WebAssembly) ..."
+# `dotnet publish -o` lands the real static site one level deeper, at <out>/wwwroot/ (alongside
+# non-web files like web.config) - not directly at <out>/ - so copy that up into webui/dist, which
+# is what daemon.conf's http_base_dir already points at.
+cd webui-blazor
+rm -rf publish
+dotnet publish -c Release -o publish
+rm -rf ../webui/dist
+mkdir -p ../webui/dist
+cp -r publish/wwwroot/. ../webui/dist/
+rm -rf publish
 cd ..
 
 cd daemon

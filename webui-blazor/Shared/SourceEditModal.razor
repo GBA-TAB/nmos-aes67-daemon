@@ -1,0 +1,309 @@
+@* Ports SourceEdit.jsx. Rendered by the parent page only while open (mirrors the original's
+   `{isOpen ? <SourceEdit .../> : undefined}` pattern), so OnInitialized is exactly the original's
+   componentDidMount - a fresh instance per open, no reset-on-reopen logic needed. *@
+@using AesDaemonWebUI.Models
+@using AesDaemonWebUI.Services
+@using System.Text.RegularExpressions
+@inject DaemonApiClient Api
+
+<Modal Visible="true" OnRequestClose="Cancel">
+    <h2 style="text-align:center">@Title</h2>
+    <table><tbody>
+        <tr>
+            <th align="left"><font color="grey">ID</font></th>
+            <th align="left"><input type="number" class="input-number" value="@_id" disabled /></th>
+        </tr>
+        <tr height="35">
+            <th align="left"><label>Enabled</label></th>
+            <th align="left"><input type="checkbox" checked="@_enabled" @onchange="e => _enabled = (bool)e.Value!" /></th>
+        </tr>
+        <tr>
+            <th align="left"><label>Name</label></th>
+            <th align="left"><input value="@_name" @oninput="OnNameChanged" /></th>
+        </tr>
+        <tr>
+            <th align="left"><label>Max samples per packet</label></th>
+            <th align="left">
+                <select value="@_maxSamplesPerPacket" @onchange="OnMaxSamplesPerPacketChanged">
+                    @foreach (var samples in PacketSizeOptions)
+                    {
+                        <option value="@samples" disabled="@(!AudioPacketMath.CheckMaxSamplesPerPacket(samples, TicFrameSizeAt1Fs, SampleRate))">@samples - @AudioPacketMath.GetPacketDuration(samples, SampleRate)</option>
+                    }
+                </select>
+            </th>
+        </tr>
+        <tr>
+            <th align="left"><label>Codec</label></th>
+            <th align="left">
+                <select value="@_codec" @onchange="OnCodecChanged">
+                    <option value="L16">L16</option>
+                    <option value="L24">L24</option>
+                    <option value="AM824">AM824</option>
+                </select>
+            </th>
+        </tr>
+        <tr>
+            <th align="left"><label>RTP address</label></th>
+            <th align="left">
+                <input type="text" minlength="7" maxlength="15" size="15" value="@_address" @oninput="OnAddressChanged" />
+                @if (_addressErr)
+                {
+                    <span class="validation-message">Must be empty or a valid IPv4 address</span>
+                }
+            </th>
+        </tr>
+        <tr>
+            <th align="left"><label>Payload Type</label></th>
+            <th align="left">
+                <input type="number" class="input-number" value="@_payloadType" @oninput="OnPayloadTypeChanged" />
+                @if (_payloadTypeErr)
+                {
+                    <span class="validation-message">77-127</span>
+                }
+            </th>
+        </tr>
+        <tr>
+            <th align="left"><label>TTL</label></th>
+            <th align="left">
+                <input type="number" class="input-number" value="@_ttl" @oninput="OnTtlChanged" />
+                @if (_ttlErr)
+                {
+                    <span class="validation-message">1-255</span>
+                }
+            </th>
+        </tr>
+        <tr>
+            <th align="left"><label>DSCP</label></th>
+            <th align="left">
+                <select @bind="_dscp">
+                    <option value="56">56 (CS7)</option>
+                    <option value="48">48 (CS6)</option>
+                    <option value="46">46 (EF)</option>
+                    <option value="36">36 (AF42)</option>
+                    <option value="34">34 (AF41)</option>
+                    <option value="0">0 (BE)</option>
+                </select>
+            </th>
+        </tr>
+        <tr height="35">
+            <th align="left"><label>RefClk PTP traceable</label></th>
+            <th align="left"><input type="checkbox" checked="@_refclkPtpTraceable" @onchange="e => _refclkPtpTraceable = (bool)e.Value!" /></th>
+        </tr>
+        <tr>
+            <th align="left"><label>Channels</label></th>
+            <th align="left">
+                <input type="number" class="input-number" min="1" max="@_maxChannels" value="@_channels" @oninput="OnChannelsChanged" />
+                @if (_channelsErr)
+                {
+                    <span class="validation-message">1-@_maxChannels</span>
+                }
+            </th>
+        </tr>
+        <tr>
+            <th align="left">Audio Channels map</th>
+            <th align="left">
+                <select value="@(_map.Count > 0 ? _map[0] : 0)" @onchange="OnChannelsMapChanged">
+                    @foreach (var (start, inUse) in _audioMap)
+                    {
+                        <option value="@start" disabled="@(inUse && start != (_map.Count > 0 ? _map[0] : -1))">@ChannelMapLabel(start)@(inUse ? " - in use" : "")</option>
+                    }
+                </select>
+            </th>
+        </tr>
+    </tbody></table>
+    <br />
+    <div style="text-align:center">
+        <button @onclick="Submit" disabled="@(!IsValid || _submitting)">Submit</button>
+        &nbsp;&nbsp;&nbsp;&nbsp;
+        <button @onclick="Cancel">Cancel</button>
+    </div>
+    @if (!string.IsNullOrEmpty(_errorMessage))
+    {
+        <p class="status-error" style="text-align:center">@_errorMessage</p>
+    }
+</Modal>
+
+@code {
+    private static readonly int[] PacketSizeOptions = { 6, 12, 16, 48, 96, 192 };
+    private static readonly Regex Ipv4Regex = new(@"^$|^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$");
+
+    [Parameter, EditorRequired] public string Title { get; set; } = "";
+    [Parameter] public bool IsEdit { get; set; }
+    [Parameter, EditorRequired] public SourceInfo Source { get; set; } = new();
+    [Parameter] public List<SourceInfo> AllSources { get; set; } = new();
+    [Parameter] public int TicFrameSizeAt1Fs { get; set; }
+    [Parameter] public int SampleRate { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+    [Parameter] public EventCallback OnApplied { get; set; }
+
+    private int _id;
+    private bool _enabled;
+    private string _name = "";
+    private string _io = "";
+    private string _codec = "";
+    private string _address = "";
+    private int _ttl;
+    private int _payloadType;
+    private int _dscp;
+    private bool _refclkPtpTraceable;
+    private int _channels;
+    private List<int> _map = new();
+    private List<(int Start, bool InUse)> _audioMap = new();
+    private HashSet<int> _usedByOthers = new();
+    private int _maxSamplesPerPacket;
+    private int _maxChannels;
+    private bool _submitting;
+    private string? _errorMessage;
+
+    private bool _nameErr;
+    private bool _addressErr;
+    private bool _ttlErr;
+    private bool _payloadTypeErr;
+    private bool _channelsErr;
+
+    private bool IsValid => !_nameErr && !_addressErr && !_ttlErr && !_payloadTypeErr && !_channelsErr;
+
+    protected override void OnInitialized()
+    {
+        _id = Source.Id;
+        _enabled = Source.Enabled;
+        _name = Source.Name;
+        _io = Source.Io;
+        _codec = Source.Codec;
+        _address = Source.Address;
+        _ttl = Source.Ttl;
+        _payloadType = Source.PayloadType;
+        _dscp = Source.Dscp;
+        _refclkPtpTraceable = Source.RefclkPtpTraceable;
+        _map = new List<int>(Source.Map);
+        _channels = _map.Count;
+        _maxSamplesPerPacket = AudioPacketMath.GetMaxSamplesPerPacket(Source.MaxSamplesPerPacket, TicFrameSizeAt1Fs, SampleRate);
+        _maxChannels = AudioPacketMath.GetMaxChannels(_codec, _maxSamplesPerPacket);
+        // Every other source's channels are "already patched" and should show as such rather than
+        // silently letting this one collide with them - excludes this source's own current
+        // assignment so re-selecting its existing range isn't flagged as a conflict with itself.
+        _usedByOthers = AllSources.Where(s => s.Id != Source.Id).SelectMany(s => s.Map).ToHashSet();
+        RebuildAudioMap();
+    }
+
+    private void RebuildAudioMap()
+    {
+        _audioMap = Enumerable.Range(0, 64 - _channels + 1)
+            .Select(start => (start, InUse: Enumerable.Range(start, _channels).Any(_usedByOthers.Contains)))
+            .ToList();
+    }
+
+    private void OnNameChanged(ChangeEventArgs e)
+    {
+        _name = e.Value?.ToString() ?? "";
+        _nameErr = string.IsNullOrEmpty(_name);
+    }
+
+    private void OnMaxSamplesPerPacketChanged(ChangeEventArgs e)
+    {
+        var samples = int.Parse(e.Value?.ToString() ?? "0");
+        _maxSamplesPerPacket = samples;
+        _maxChannels = AudioPacketMath.GetMaxChannels(_codec, samples);
+        _channelsErr = _channels > _maxChannels;
+    }
+
+    private void OnCodecChanged(ChangeEventArgs e)
+    {
+        _codec = e.Value?.ToString() ?? "";
+        _maxChannels = AudioPacketMath.GetMaxChannels(_codec, _maxSamplesPerPacket);
+        _channelsErr = _channels > _maxChannels;
+    }
+
+    private void OnAddressChanged(ChangeEventArgs e)
+    {
+        _address = e.Value?.ToString() ?? "";
+        _addressErr = !Ipv4Regex.IsMatch(_address);
+    }
+
+    private void OnPayloadTypeChanged(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out var v))
+        {
+            _payloadType = v;
+            _payloadTypeErr = v is < 77 or > 127;
+        }
+        else
+        {
+            _payloadTypeErr = true;
+        }
+    }
+
+    private void OnTtlChanged(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out var v))
+        {
+            _ttl = v;
+            _ttlErr = v is < 1 or > 255;
+        }
+        else
+        {
+            _ttlErr = true;
+        }
+    }
+
+    private void OnChannelsChanged(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out var channels) && channels >= 1 && channels <= _maxChannels)
+        {
+            var start = _map.Count > 0 ? _map[0] : 0;
+            _channels = channels;
+            _map = Enumerable.Range(0, channels).Select(v => v + start).ToList();
+            RebuildAudioMap();
+            _channelsErr = false;
+        }
+        else
+        {
+            _channelsErr = true;
+        }
+    }
+
+    private void OnChannelsMapChanged(ChangeEventArgs e)
+    {
+        var start = int.Parse(e.Value?.ToString() ?? "0");
+        _map = Enumerable.Range(0, _channels).Select(v => v + start).ToList();
+    }
+
+    private string ChannelMapLabel(int v) => _channels > 1
+        ? $"ALSA Output {v + 1} -> ALSA Output {v + _channels}"
+        : $"ALSA Output {v + 1}";
+
+    private async Task Submit()
+    {
+        _submitting = true;
+        _errorMessage = null;
+        try
+        {
+            await Api.PutSourceAsync(_id, new SourceInfo
+            {
+                Id = _id,
+                Enabled = _enabled,
+                Name = _name,
+                Io = _io,
+                MaxSamplesPerPacket = _maxSamplesPerPacket,
+                Codec = _codec,
+                Address = _address,
+                Ttl = _ttl,
+                PayloadType = _payloadType,
+                Dscp = _dscp,
+                RefclkPtpTraceable = _refclkPtpTraceable,
+                Map = _map,
+            });
+            await OnApplied.InvokeAsync();
+        }
+        catch (DaemonApiException ex)
+        {
+            _errorMessage = $"{(IsEdit ? "Update" : "Add")} Source failed: {ex.Message}";
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+
+    private Task Cancel() => OnClose.InvokeAsync();
+}

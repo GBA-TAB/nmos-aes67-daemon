@@ -1,0 +1,29 @@
+@* Generic Submit/Cancel confirmation dialog - ports SourceRemove.jsx/SinkRemove.jsx, which were
+   identical apart from their title text, into one reusable component. *@
+
+<Modal Visible="Visible" OnRequestClose="OnCancelClick">
+    <h2 style="text-align:center">@Title</h2>
+    <h3 style="text-align:center">Do you want to proceed ?</h3>
+    <br />
+    <div style="text-align:center">
+        <button @onclick="OnConfirmClick" disabled="@Busy">Submit</button>
+        &nbsp;&nbsp;&nbsp;&nbsp;
+        <button @onclick="OnCancelClick">Cancel</button>
+    </div>
+    @if (!string.IsNullOrEmpty(ErrorMessage))
+    {
+        <p class="status-error" style="text-align:center">@ErrorMessage</p>
+    }
+</Modal>
+
+@code {
+    [Parameter] public bool Visible { get; set; }
+    [Parameter] public string Title { get; set; } = "";
+    [Parameter] public bool Busy { get; set; }
+    [Parameter] public string? ErrorMessage { get; set; }
+    [Parameter] public EventCallback OnConfirm { get; set; }
+    [Parameter] public EventCallback OnCancel { get; set; }
+
+    private Task OnConfirmClick() => OnConfirm.InvokeAsync();
+    private Task OnCancelClick() => OnCancel.InvokeAsync();
+}

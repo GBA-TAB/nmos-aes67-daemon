@@ -1,0 +1,98 @@
+@* Ports Sources.jsx's SourceEntry - fetches its own SDP (for address/port display) and status
+   (for the 2022-7 leg badge) independently per row, matching the original's per-row fetch. *@
+@using System.Text.RegularExpressions
+@using AesDaemonWebUI.Models
+@using AesDaemonWebUI.Services
+@inject DaemonApiClient Api
+
+<tr class="tr-stream">
+    <td><label>@Source.Id</label></td>
+    <td><label>@Source.Name</label></td>
+    <td><label>@NmosLabelHelper.MakeLabel(Hostname, Source.Map)</label></td>
+    <td><label>@_address</label></td>
+    <td><label>@_port</label></td>
+    <td align="center"><label>@Source.Map.Count</label></td>
+    <td align="center">
+        @{ var badge = TxLegBadge(); }
+        @if (badge != null)
+        {
+            <span class="topo-badge @badge.Value.Css">@badge.Value.Text</span>
+        }
+    </td>
+    <td><span class="pointer-area" @onclick="() => OnInfoClick.InvokeAsync((Source.Id, _sdp))"><img width="20" height="20" src="img/info.png" alt="" /></span></td>
+    <td><span class="pointer-area" @onclick="() => OnEditClick.InvokeAsync(Source.Id)"><img width="20" height="20" src="img/edit.png" alt="" /></span></td>
+    <td><span class="pointer-area" @onclick="() => OnTrashClick.InvokeAsync(Source.Id)"><img width="20" height="20" src="img/trash.png" alt="" /></span></td>
+</tr>
+
+@code {
+    private static readonly Regex AddressRegex = new(@"c=IN IP4 ([0-9.]+)");
+    private static readonly Regex PortRegex = new(@"m=audio ([0-9]+)");
+
+    [Parameter, EditorRequired] public SourceInfo Source { get; set; } = new();
+    [Parameter] public string Hostname { get; set; } = "";
+    [Parameter] public EventCallback<(int Id, string Sdp)> OnInfoClick { get; set; }
+    [Parameter] public EventCallback<int> OnEditClick { get; set; }
+    [Parameter] public EventCallback<int> OnTrashClick { get; set; }
+
+    private string _address = "n/a";
+    private string _port = "n/a";
+    private string _sdp = "";
+    private SourceStatus? _status;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _sdp = await Api.GetSourceSdpAsync(Source.Id);
+            var addrMatch = AddressRegex.Match(_sdp);
+            var portMatch = PortRegex.Match(_sdp);
+            if (addrMatch.Success)
+            {
+                _address = addrMatch.Groups[1].Value;
+            }
+            if (portMatch.Success)
+            {
+                _port = portMatch.Groups[1].Value;
+            }
+        }
+        catch (DaemonApiException)
+        {
+        }
+
+        try
+        {
+            _status = await Api.GetSourceStatusAsync(Source.Id);
+        }
+        catch (DaemonApiException)
+        {
+            _status = null;
+        }
+    }
+
+    private (string Css, string Text)? TxLegBadge()
+    {
+        if (_status == null)
+        {
+            return null;
+        }
+        var primary = _status.SourceFlags.Transmitting;
+        var leg2 = _status.Leg2;
+        if (!leg2.Present)
+        {
+            return primary ? ("topo-active", "red ●") : ("topo-wait", "red ○");
+        }
+        if (primary && leg2.Transmitting)
+        {
+            return ("topo-active", "red+blue ●");
+        }
+        if (primary)
+        {
+            return ("topo-muted", "red only");
+        }
+        if (leg2.Transmitting)
+        {
+            return ("topo-muted", "blue only");
+        }
+        return ("topo-wait", "no signal");
+    }
+}

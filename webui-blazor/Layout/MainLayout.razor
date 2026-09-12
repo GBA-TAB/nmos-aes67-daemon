@@ -1,0 +1,41 @@
+@inherits LayoutComponentBase
+@inject AesDaemonWebUI.Services.DaemonApiClient Api
+
+<PageTitle>@HeaderTitle</PageTitle>
+
+<div class="app-shell">
+    <h1>@HeaderTitle</h1>
+    <h3>@HeaderSubtitle</h3>
+    <TabStrip />
+    <div class="tab-body">
+        @Body
+    </div>
+</div>
+
+@code {
+    // Follows the daemon's own NMOS node name (nmos_label) instead of a static string, so it's
+    // obvious which 2110 node this is when multiple daemon instances are open - falls back to a
+    // generic default only while /api/config hasn't resolved yet, or if nmos_label is genuinely
+    // empty. Also drives the browser tab title via PageTitle above, matching the same requirement.
+    private string HeaderTitle = "AES67 Daemon";
+    private string HeaderSubtitle = "";
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            var config = await Api.GetConfigAsync();
+            if (!string.IsNullOrWhiteSpace(config.NmosLabel))
+            {
+                HeaderTitle = config.NmosLabel;
+            }
+            // Matches ConfigTabs.jsx's original "Running on {node_id} - {ip}" subtitle exactly.
+            HeaderSubtitle = $"Running on {config.NodeId} - {config.IpAddr}";
+        }
+        catch (AesDaemonWebUI.Services.DaemonApiException)
+        {
+            // Leave the generic fallback title/subtitle in place - the shell itself must not fail
+            // to render just because the daemon's config couldn't be fetched yet.
+        }
+    }
+}

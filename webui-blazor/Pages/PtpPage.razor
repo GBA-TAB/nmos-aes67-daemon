@@ -1,0 +1,228 @@
+@page "/PTP"
+@using AesDaemonWebUI.Models
+@using AesDaemonWebUI.Services
+@inject DaemonApiClient Api
+@inject PtpTelemetryService Telemetry
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+<div class="ptp">
+    @if (_configLoading)
+    {
+        <p><em>Loading...</em></p>
+    }
+    else
+    {
+        <EditForm Model="@_config" OnValidSubmit="SubmitConfig">
+            <DataAnnotationsValidator />
+            <h3>Config</h3>
+            <table><tbody>
+                <tr>
+                    <th align="left"><label>Type</label></th>
+                    <th align="left"><label>PTPv2</label></th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Domain</label></th>
+                    <th align="left">
+                        <select value="@DomainSelectValue" @onchange="OnDomainSelectChanged">
+                            <option value="0">0 — IEEE standard</option>
+                            <option value="127">127 — broadcast/AV</option>
+                            @if (DomainSelectValue == "custom")
+                            {
+                                <option value="custom">@_config.Domain — custom</option>
+                            }
+                        </select>
+                        @if (DomainSelectValue == "custom")
+                        {
+                            <InputNumber class="input-number" style="margin-left:6px" @bind-Value="_config.Domain" />
+                        }
+                        <ValidationMessage For="() => _config.Domain" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>DSCP</label></th>
+                    <th align="left">
+                        <InputSelect @bind-Value="_config.Dscp">
+                            <option value="56">56 (CS7)</option>
+                            <option value="48">48 (CS6)</option>
+                            <option value="46">46 (EF)</option>
+                            <option value="36">36 (AF42)</option>
+                            <option value="34">34 (AF41)</option>
+                            <option value="0">0 (BE)</option>
+                        </InputSelect>
+                    </th>
+                </tr>
+                <tr>
+                    <th><button type="submit">Submit</button></th>
+                </tr>
+            </tbody></table>
+        </EditForm>
+        @if (!string.IsNullOrEmpty(_configStatusMessage))
+        {
+            <p class="@(_configStatusIsError ? "status-error" : "status-success")">@_configStatusMessage</p>
+        }
+    }
+
+    <br />
+
+    @if (!Telemetry.HasStatus)
+    {
+        <p><em>Loading...</em></p>
+    }
+    else
+    {
+        <h3>Status</h3>
+        <table><tbody>
+            <tr>
+                <th align="left"><label>Mode</label></th>
+                <th align="left"><input value="Slave" disabled /></th>
+            </tr>
+            <tr>
+                <th align="left"><label>Status</label></th>
+                <th align="left"><input value="@Telemetry.Status.Status" disabled style="@StatusStyle(Telemetry.Status.Status)" /></th>
+            </tr>
+            <tr>
+                <th align="left"><label>GMID</label></th>
+                <th align="left"><input value="@Telemetry.Status.Gmid" disabled style="font-family:monospace;width:16em" /></th>
+            </tr>
+            <tr>
+                <th align="left"><label>Jitter (ns)</label></th>
+                <th align="left"><input value="@Telemetry.Status.Jitter" disabled /></th>
+            </tr>
+            <tr>
+                <th align="left"><label>Active leg</label></th>
+                <th align="left"><input value="@(Telemetry.Status.ActiveLeg == 0 ? "Red (primary)" : "Blue (secondary)")" disabled /></th>
+            </tr>
+            <tr>
+                <th align="left"><label>Red leg</label></th>
+                <th align="left">
+                    <input value="@Telemetry.Status.Leg0Status" disabled style="@LegStyle(Telemetry.Status.Leg0Status)" />
+                    <input value="@Telemetry.Status.Leg0Gmid" disabled style="font-family:monospace;width:16em;margin-left:6px" />
+                </th>
+            </tr>
+            <tr>
+                <th align="left"><label>Blue leg</label></th>
+                <th align="left">
+                    <input value="@Telemetry.Status.Leg1Status" disabled style="@LegStyle(Telemetry.Status.Leg1Status)" />
+                    <input value="@Telemetry.Status.Leg1Gmid" disabled style="font-family:monospace;width:16em;margin-left:6px" />
+                </th>
+            </tr>
+        </tbody></table>
+        @if (!Telemetry.Status.LegsAligned)
+        {
+            <p style="color:#b91c1c;font-weight:600;margin-top:8px">
+                ⚠ Red and Blue are locked to different grandmasters - seamless 2022-7 switching cannot be trusted until they match.
+            </p>
+        }
+        @if (Telemetry.JitterHistory.Count > 0)
+        {
+            <div style="margin-top:8px">
+                <small style="color:#888">Jitter history · @Telemetry.JitterHistory.Count samples</small>
+                <canvas @ref="_canvasRef" width="380" height="90" style="display:block;width:380px;height:90px;margin-top:4px;border-radius:4px"></canvas>
+                @if (Telemetry.JitterHistory.Count < 2)
+                {
+                    <small style="color:#bbb;display:block">collecting…</small>
+                }
+            </div>
+        }
+    }
+</div>
+
+@code {
+    private bool _configLoading = true;
+    private string? _configStatusMessage;
+    private bool _configStatusIsError;
+
+    private PtpConfig _config = new();
+
+    private ElementReference _canvasRef;
+    private IJSObjectReference? _jsModule;
+
+    private string DomainSelectValue => (_config.Domain == 0 || _config.Domain == 127) ? _config.Domain.ToString() : "custom";
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadConfig();
+        Telemetry.Changed += OnTelemetryChanged;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _jsModule = await JS.InvokeAsync<IJSObjectReference>("import", "./js/jitterChart.js");
+        }
+        if (_jsModule != null && Telemetry.JitterHistory.Count >= 2)
+        {
+            await _jsModule.InvokeVoidAsync("drawJitterChart", _canvasRef, Telemetry.JitterHistory);
+        }
+    }
+
+    private void OnTelemetryChanged() => InvokeAsync(StateHasChanged);
+
+    private async Task LoadConfig()
+    {
+        _configLoading = true;
+        try
+        {
+            _config = await Api.GetPtpConfigAsync();
+        }
+        catch (DaemonApiException)
+        {
+            // Leave defaults in place - the page must still render.
+        }
+        finally
+        {
+            _configLoading = false;
+        }
+    }
+
+    private void OnDomainSelectChanged(ChangeEventArgs e)
+    {
+        var value = e.Value?.ToString();
+        if (value != "custom" && int.TryParse(value, out var domain))
+        {
+            _config.Domain = domain;
+        }
+    }
+
+    private async Task SubmitConfig()
+    {
+        try
+        {
+            await Api.SetPtpConfigAsync(_config);
+            _configStatusMessage = "PTP config updated";
+            _configStatusIsError = false;
+        }
+        catch (DaemonApiException ex)
+        {
+            _configStatusMessage = $"Failed to update PTP config: {ex.Message}";
+            _configStatusIsError = true;
+        }
+    }
+
+    private static string StatusStyle(string status) => status switch
+    {
+        "locked" => "color:#16a34a;font-weight:600",
+        "locking" => "color:#b45309;font-weight:600",
+        _ => "color:#b91c1c;font-weight:600",
+    };
+
+    private static string LegStyle(string status) => StatusStyle(status) + ";width:6em";
+
+    public async ValueTask DisposeAsync()
+    {
+        Telemetry.Changed -= OnTelemetryChanged;
+        if (_jsModule != null)
+        {
+            try
+            {
+                await _jsModule.DisposeAsync();
+            }
+            catch (JSDisconnectedException)
+            {
+                // The circuit/page is already gone - nothing to clean up.
+            }
+        }
+    }
+}

@@ -1,0 +1,345 @@
+@page "/ChannelMap"
+@using AesDaemonWebUI.Models
+@using AesDaemonWebUI.Services
+@inject DaemonApiClient Api
+@inject ChannelMappingApiClient ChannelMap
+@implements IAsyncDisposable
+
+<div id="channelmap">
+    @if (_loading && _view.Channels.Count == 0)
+    {
+        <p><em>Loading...</em></p>
+    }
+    else
+    {
+        <h3>Channel Map</h3>
+        <div style="margin-bottom:8px">
+            <button disabled="@(_view_ == ViewMode.Alsa)" @onclick='() => SetView(ViewMode.Alsa)'>ALSA view</button>
+            <button disabled="@(_view_ == ViewMode.Stream)" @onclick='() => SetView(ViewMode.Stream)'>Stream view</button>
+        </div>
+        <table class="table-stream"><tbody>
+            <tr class="tr-stream">
+                <th>Stream Rx</th><th>Leg</th><th>Capture</th><th>Playback</th><th>Stream Tx</th>
+            </tr>
+            @if (_view_ == ViewMode.Alsa)
+            {
+                @foreach (var ch in _view.Channels)
+                {
+                    var playbackValue = _view.PlaybackSelection.GetValueOrDefault(ch, "");
+                    var captureValue = _view.CaptureSelection.GetValueOrDefault(ch, "");
+                    var sep = playbackValue.LastIndexOf("::", StringComparison.Ordinal);
+                    var inputUuid = sep >= 0 ? playbackValue[..sep] : null;
+                    var sinkId = inputUuid != null && _view.InputSinkIds.TryGetValue(inputUuid, out var sid) ? sid : (int?)null;
+                    var sinkStatus = sinkId.HasValue ? _sinkStatuses.GetValueOrDefault(sinkId.Value) : null;
+                    <tr class="tr-stream">
+                        <td>
+                            <select value="@playbackValue" @onchange="e => OnChangePlayback(ch, e.Value?.ToString() ?? string.Empty)">
+                                <option value="">(none)</option>
+                                @foreach (var opt in _view.InputOptions.Values.SelectMany(v => v))
+                                {
+                                    <option value="@opt.Value">@opt.Label</option>
+                                }
+                            </select>
+                        </td>
+                        <td>@LegBadgeMarkup(sinkStatus)</td>
+                        <td>ALSA Capture @ch</td>
+                        <td>ALSA Playback @ch</td>
+                        <td>
+                            <select value="@captureValue" @onchange="e => OnChangeCapture(ch, e.Value?.ToString() ?? string.Empty)">
+                                <option value="">(none)</option>
+                                @foreach (var opt in _view.TxOptions)
+                                {
+                                    <option value="@opt.Value">@opt.Label</option>
+                                }
+                            </select>
+                        </td>
+                    </tr>
+                }
+            }
+            else
+            {
+                @foreach (var rx in _view.RxChannels)
+                {
+                    <tr class="tr-stream">
+                        <td>@rx.Label</td>
+                        <td>@LegBadgeMarkup(_sinkStatuses.GetValueOrDefault(rx.SinkId))</td>
+                        <td>&mdash;</td>
+                        <td>
+                            <select value="@rx.AlsaChannel" @onchange="e => OnChangeRxPlayback(rx, e)">
+                                @foreach (var ch in _view.Channels)
+                                {
+                                    <option value="@ch">ALSA Playback @ch</option>
+                                }
+                            </select>
+                        </td>
+                        <td>&mdash;</td>
+                    </tr>
+                }
+                @foreach (var tx in _view.TxChannels)
+                {
+                    var currentValue = _view.PlaybackSelection.GetValueOrDefault(tx.AlsaChannel, "");
+                    if (string.IsNullOrEmpty(currentValue))
+                    {
+                        currentValue = $"{_view.CaptureUuid.GetValueOrDefault(tx.AlsaChannel, "")}::0";
+                    }
+                    <tr class="tr-stream">
+                        <td>&mdash;</td>
+                        <td>@TxLegBadgeMarkup(_sourceStatuses.GetValueOrDefault(tx.SourceId))</td>
+                        <td>
+                            <select value="@currentValue" @onchange="e => OnChangeTxInputRow(tx, e.Value?.ToString() ?? string.Empty)">
+                                @foreach (var opt in _view.CaptureOptions)
+                                {
+                                    <option value="@opt.Value">@opt.Label</option>
+                                }
+                            </select>
+                        </td>
+                        <td>&mdash;</td>
+                        <td>@tx.Label</td>
+                    </tr>
+                }
+            }
+        </tbody></table>
+        <span class="pointer-area" @onclick="FetchAll"><img width="30" height="30" src="img/reload.png" alt="" /></span>
+    }
+</div>
+
+@code {
+    private enum ViewMode { Alsa, Stream }
+
+    private const int PollSeconds = 5;
+
+    private ViewMode _view_ = ViewMode.Alsa;
+    private ChannelMapView _view = new();
+    private Dictionary<int, SinkStatus?> _sinkStatuses = new();
+    private Dictionary<int, SourceStatus?> _sourceStatuses = new();
+    private bool _loading = true;
+    private bool _initializedChannelMapClient;
+
+    private PeriodicTimer? _timer;
+    private readonly CancellationTokenSource _cts = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await FetchAll();
+        _ = PollLoop();
+    }
+
+    private async Task PollLoop()
+    {
+        _timer = new PeriodicTimer(TimeSpan.FromSeconds(PollSeconds));
+        try
+        {
+            while (await _timer.WaitForNextTickAsync(_cts.Token))
+            {
+                await FetchAll();
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private void SetView(ViewMode mode) => _view_ = mode;
+
+    private async Task FetchAll()
+    {
+        _loading = true;
+        try
+        {
+            if (!_initializedChannelMapClient)
+            {
+                var config = await Api.GetConfigAsync();
+                ChannelMap.EnsureInitialized(config);
+                _initializedChannelMapClient = true;
+            }
+
+            var inputIds = await SafeAwait(ChannelMap.GetInputIdsAsync(), new List<string>());
+            var outputIds = await SafeAwait(ChannelMap.GetOutputIdsAsync(), new List<string>());
+            var sinks = await SafeAwait(Api.GetSinksAsync(), new List<SinkInfo>());
+            var sources = await SafeAwait(Api.GetSourcesAsync(), new List<SourceInfo>());
+            var activeMap = await SafeAwait(ChannelMap.GetActiveMapAsync(), new Is08ActiveMapResponse());
+
+            var inputInfos = await Task.WhenAll(inputIds.Select(FetchInputInfo));
+            var outputInfos = await Task.WhenAll(outputIds.Select(FetchOutputInfo));
+
+            _view = ChannelMapModel.Build(inputInfos.ToList(), outputInfos.ToList(), sinks, sources, activeMap);
+
+            var sinkStatusTasks = sinks.Select(async s => (s.Id, await SafeAwaitOrNull(Api.GetSinkStatusAsync(s.Id))));
+            var sourceStatusTasks = sources.Select(async s => (s.Id, await SafeAwaitOrNull(Api.GetSourceStatusAsync(s.Id))));
+            _sinkStatuses = (await Task.WhenAll(sinkStatusTasks)).ToDictionary(p => p.Id, p => p.Item2);
+            _sourceStatuses = (await Task.WhenAll(sourceStatusTasks)).ToDictionary(p => p.Id, p => p.Item2);
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task<ChannelMapResourceInfo> FetchInputInfo(string id)
+    {
+        var propsTask = SafeAwait(ChannelMap.GetInputPropertiesAsync(id), new Is08ResourceProperties { Name = id });
+        var channelsTask = SafeAwait(ChannelMap.GetInputChannelsAsync(id), new List<Is08Channel> { new() });
+        var props = await propsTask;
+        var channels = await channelsTask;
+        return new ChannelMapResourceInfo(id, props.Name, channels.Select(c => c.Label).ToList());
+    }
+
+    private async Task<ChannelMapResourceInfo> FetchOutputInfo(string id)
+    {
+        var propsTask = SafeAwait(ChannelMap.GetOutputPropertiesAsync(id), new Is08ResourceProperties { Name = id });
+        var channelsTask = SafeAwait(ChannelMap.GetOutputChannelsAsync(id), new List<Is08Channel> { new() });
+        var props = await propsTask;
+        var channels = await channelsTask;
+        return new ChannelMapResourceInfo(id, props.Name, channels.Select(c => c.Label).ToList());
+    }
+
+    private static async Task<T> SafeAwait<T>(Task<T> task, T fallback)
+    {
+        try
+        {
+            return await task;
+        }
+        catch (DaemonApiException)
+        {
+            return fallback;
+        }
+    }
+
+    private static async Task<T?> SafeAwaitOrNull<T>(Task<T> task) where T : class
+    {
+        try
+        {
+            return await task;
+        }
+        catch (DaemonApiException)
+        {
+            return null;
+        }
+    }
+
+    private async Task OnChangePlayback(int channel, string value)
+    {
+        var outputId = _view.PlaybackUuid.GetValueOrDefault(channel, "");
+        if (string.IsNullOrEmpty(outputId))
+        {
+            return;
+        }
+        if (string.IsNullOrEmpty(value))
+        {
+            await ChannelMap.ActivateAsync(outputId, 0, null, null);
+        }
+        else
+        {
+            var sep = value.LastIndexOf("::", StringComparison.Ordinal);
+            var inputId = value[..sep];
+            var inputChannel = int.Parse(value[(sep + 2)..]);
+            await ChannelMap.ActivateAsync(outputId, 0, inputId, inputChannel);
+        }
+        await FetchAll();
+    }
+
+    private Task OnChangeRxPlayback(RxChannelRow rx, ChangeEventArgs e) =>
+        OnChangePlayback(int.Parse(e.Value?.ToString() ?? "0"), rx.Value);
+
+    private async Task OnChangeCapture(int channel, string value)
+    {
+        // No real "clear" is possible here: a Sender's Tx channel always reads from some ALSA
+        // capture channel, so picking "(none)" can't be honored.
+        if (string.IsNullOrEmpty(value))
+        {
+            return;
+        }
+        var sep = value.LastIndexOf("::", StringComparison.Ordinal);
+        var outputId = value[..sep];
+        var outputChannel = int.Parse(value[(sep + 2)..]);
+        var inputId = _view.CaptureUuid.GetValueOrDefault(channel, "");
+        await ChannelMap.ActivateAsync(outputId, outputChannel, inputId, 0);
+        await FetchAll();
+    }
+
+    // Stream view's "Capture" dropdown for a Tx-channel row: the row (output) is fixed, the input
+    // (ALSA Capture or Sink-repeater) is what's chosen - the mirror image of OnChangeCapture.
+    private async Task OnChangeTxInputRow(TxChannelRow tx, string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return;
+        }
+        var rowSep = tx.Value.LastIndexOf("::", StringComparison.Ordinal);
+        var outputId = tx.Value[..rowSep];
+        var outputChannel = int.Parse(tx.Value[(rowSep + 2)..]);
+
+        var sep = value.LastIndexOf("::", StringComparison.Ordinal);
+        var inputId = value[..sep];
+        var inputChannel = int.Parse(value[(sep + 2)..]);
+        await ChannelMap.ActivateAsync(outputId, outputChannel, inputId, inputChannel);
+        await FetchAll();
+    }
+
+    private static MarkupString LegBadgeMarkup(SinkStatus? status)
+    {
+        if (status == null)
+        {
+            return new MarkupString("");
+        }
+        var primary = status.SinkFlags.ReceivingRtpPacket;
+        var leg2 = status.Leg2;
+        if (!leg2.Present)
+        {
+            return primary
+                ? new MarkupString("<span class=\"topo-badge topo-active\">red &#9679;</span>")
+                : new MarkupString("<span class=\"topo-badge topo-wait\">red &#9675;</span>");
+        }
+        if (primary && leg2.ReceivingRtpPacket)
+        {
+            return new MarkupString("<span class=\"topo-badge topo-active\">red+blue &#9679;</span>");
+        }
+        if (primary)
+        {
+            return new MarkupString("<span class=\"topo-badge topo-muted\">red only</span>");
+        }
+        if (leg2.ReceivingRtpPacket)
+        {
+            return new MarkupString("<span class=\"topo-badge topo-muted\">blue only</span>");
+        }
+        return new MarkupString("<span class=\"topo-badge topo-wait\">no signal</span>");
+    }
+
+    private static MarkupString TxLegBadgeMarkup(SourceStatus? status)
+    {
+        if (status == null)
+        {
+            return new MarkupString("");
+        }
+        var primary = status.SourceFlags.Transmitting;
+        var leg2 = status.Leg2;
+        if (!leg2.Present)
+        {
+            return primary
+                ? new MarkupString("<span class=\"topo-badge topo-active\">red &#9679;</span>")
+                : new MarkupString("<span class=\"topo-badge topo-wait\">red &#9675;</span>");
+        }
+        if (primary && leg2.Transmitting)
+        {
+            return new MarkupString("<span class=\"topo-badge topo-active\">red+blue &#9679;</span>");
+        }
+        if (primary)
+        {
+            return new MarkupString("<span class=\"topo-badge topo-muted\">red only</span>");
+        }
+        if (leg2.Transmitting)
+        {
+            return new MarkupString("<span class=\"topo-badge topo-muted\">blue only</span>");
+        }
+        return new MarkupString("<span class=\"topo-badge topo-wait\">no signal</span>");
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        _timer?.Dispose();
+        _cts.Dispose();
+        await Task.CompletedTask;
+    }
+}

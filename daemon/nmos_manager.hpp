@@ -491,6 +491,12 @@ class NmosManager {
   mutable std::mutex  registry_disc_mutex_;
   std::string         discovered_registry_address_;
   uint16_t            discovered_registry_port_{0};
+  // Set once the current registry (discovered or configured) has successfully accepted a node
+  // registration or heartbeat, cleared on failure. While true, a newly-announced DNS-SD registry
+  // is logged but not switched to - otherwise a stray/decoy registry announcement (e.g. from an
+  // NMOS conformance test tool running elsewhere on the network) silently steals this daemon away
+  // from a perfectly healthy registration and it never falls back.
+  std::atomic<bool>   registry_healthy_{false};
   std::string         sec_interface_ip_str_;
   std::string         sec_interface_mac_str_;
 };

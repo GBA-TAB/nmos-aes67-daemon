@@ -1,0 +1,92 @@
+@* Ports Sinks.jsx's SinkEntry - fetches its own status per row (flags/errors/min-arrival-time/leg
+   badge), matching the original's per-row fetch. *@
+@using AesDaemonWebUI.Models
+@using AesDaemonWebUI.Services
+@inject DaemonApiClient Api
+
+<tr class="tr-stream">
+    <td><label>@Sink.Id</label></td>
+    <td><label>@Sink.Name</label></td>
+    <td><label>@NmosLabelHelper.MakeLabel(Hostname, Sink.Map)</label></td>
+    <td align="center"><label>@Sink.Map.Count</label></td>
+    <td align="center"><label>@_flags</label></td>
+    <td align="center"><label>@_errors</label></td>
+    <td align="center"><label>@_minTime</label></td>
+    <td align="center">
+        @{ var badge = RxLegBadge(); }
+        @if (badge != null)
+        {
+            <span class="topo-badge @badge.Value.Css">@badge.Value.Text</span>
+        }
+    </td>
+    <td><span class="pointer-area" @onclick="() => OnEditClick.InvokeAsync(Sink.Id)"><img width="20" height="20" src="img/edit.png" alt="" /></span></td>
+    <td><span class="pointer-area" @onclick="() => OnTrashClick.InvokeAsync(Sink.Id)"><img width="20" height="20" src="img/trash.png" alt="" /></span></td>
+</tr>
+
+@code {
+    [Parameter, EditorRequired] public SinkInfo Sink { get; set; } = new();
+    [Parameter] public string Hostname { get; set; } = "";
+    [Parameter] public EventCallback<int> OnEditClick { get; set; }
+    [Parameter] public EventCallback<int> OnTrashClick { get; set; }
+
+    private string _minTime = "n/a";
+    private string _flags = "n/a";
+    private string _errors = "n/a";
+    private SinkStatus? _status;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _status = await Api.GetSinkStatusAsync(Sink.Id);
+            var f = _status.SinkFlags;
+
+            var errors = new List<string>();
+            if (f.RtpSeqIdError) errors.Add("SEQID");
+            if (f.RtpSsrcError) errors.Add("SSRC");
+            if (f.RtpPayloadTypeError) errors.Add("payload type");
+            if (f.RtpSacError) errors.Add("SAC");
+
+            var flags = new List<string>();
+            if (f.ReceivingRtpPacket) flags.Add("receiving");
+            if (f.SomeMuted) flags.Add("some muted");
+            if (f.AllMuted) flags.Add("all muted");
+            if (f.Muted) flags.Add("muted");
+
+            _minTime = $"{_status.SinkMinTime} ms";
+            _flags = flags.Count > 0 ? string.Join(",", flags) : "idle";
+            _errors = errors.Count > 0 ? string.Join(",", errors) : "none";
+        }
+        catch (DaemonApiException)
+        {
+            _status = null;
+        }
+    }
+
+    private (string Css, string Text)? RxLegBadge()
+    {
+        if (_status == null)
+        {
+            return null;
+        }
+        var primary = _status.SinkFlags.ReceivingRtpPacket;
+        var leg2 = _status.Leg2;
+        if (!leg2.Present)
+        {
+            return primary ? ("topo-active", "red ●") : ("topo-wait", "red ○");
+        }
+        if (primary && leg2.ReceivingRtpPacket)
+        {
+            return ("topo-active", "red+blue ●");
+        }
+        if (primary)
+        {
+            return ("topo-muted", "red only");
+        }
+        if (leg2.ReceivingRtpPacket)
+        {
+            return ("topo-muted", "blue only");
+        }
+        return ("topo-wait", "no signal");
+    }
+}

@@ -1,0 +1,118 @@
+@page "/Browser"
+@using System.Text.RegularExpressions
+@using AesDaemonWebUI.Models
+@using AesDaemonWebUI.Services
+@inject DaemonApiClient Api
+
+<div id="sources">
+    @if (_loading)
+    {
+        <p><em>Loading...</em></p>
+    }
+    else
+    {
+        <div id="remote-sources-table">
+            <table class="table-stream"><tbody>
+                @if (_sources.Count > 0)
+                {
+                    <tr class="tr-stream">
+                        <th>Source</th>
+                        <th>Address</th>
+                        <th>Name</th>
+                        <th>Domain</th>
+                        <th>RTP Address</th>
+                        <th>Port</th>
+                        <th>Seen</th>
+                        <th>Period</th>
+                    </tr>
+                    @foreach (var source in _sources)
+                    {
+                        var (rtpAddress, port) = ParseSdp(source.Sdp);
+                        <tr class="tr-browser">
+                            <td><label>@source.Source</label></td>
+                            <td><label>@source.Address</label></td>
+                            <td><label>@source.Name</label></td>
+                            <td><label>@(source.Source == "mDNS" ? source.Domain : "N/A")</label></td>
+                            <td><label>@rtpAddress</label></td>
+                            <td align="center"><label>@port</label></td>
+                            <td align="center"><label>@source.LastSeen</label></td>
+                            <td align="center"><label>@(source.Source == "SAP" ? source.AnnouncePeriod.ToString() : "N/A")</label></td>
+                            <td><span class="pointer-area" @onclick="() => OnInfoClick(source)"><img width="20" height="20" src="img/info.png" alt="" /></span></td>
+                        </tr>
+                    }
+                }
+                else
+                {
+                    <tr><th>No remote sources found.</th></tr>
+                }
+            </tbody></table>
+            &nbsp;
+            <span class="pointer-area" @onclick="Reload"><img width="30" height="30" src="img/reload.png" alt="" /></span>
+        </div>
+    }
+</div>
+
+@if (_infoVisible)
+{
+    <SourceInfoModal Visible="true" Title="Announced Source Info" Id="@_infoId" SourceKind="@_infoSourceKind" Name="@_infoName" Domain="@_infoDomain" Sdp="@_infoSdp" OnClose="CloseInfo" />
+}
+
+@code {
+    private static readonly Regex AddressRegex = new(@"c=IN IP4 ([0-9.]+)");
+    private static readonly Regex PortRegex = new(@"m=audio ([0-9]+)");
+
+    private List<RemoteSource> _sources = new();
+    private bool _loading = true;
+
+    private bool _infoVisible;
+    private string _infoId = "";
+    private string _infoSourceKind = "";
+    private string _infoName = "";
+    private string _infoDomain = "";
+    private string _infoSdp = "";
+
+    protected override async Task OnInitializedAsync() => await FetchRemoteSources();
+
+    private async Task FetchRemoteSources()
+    {
+        _loading = true;
+        try
+        {
+            _sources = await Api.GetRemoteSourcesAsync();
+        }
+        catch (DaemonApiException)
+        {
+            // Leave the last-known list in place rather than blanking the page.
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private Task Reload() => FetchRemoteSources();
+
+    private static (string Address, string Port) ParseSdp(string sdp)
+    {
+        var addrMatch = AddressRegex.Match(sdp);
+        var portMatch = PortRegex.Match(sdp);
+        return (addrMatch.Success ? addrMatch.Groups[1].Value : "n/a",
+                portMatch.Success ? portMatch.Groups[1].Value : "n/a");
+    }
+
+    private void OnInfoClick(RemoteSource source)
+    {
+        _infoId = source.Id;
+        _infoSourceKind = source.Source;
+        _infoName = source.Name;
+        _infoDomain = source.Domain;
+        _infoSdp = source.Sdp;
+        _infoVisible = true;
+    }
+
+    private async Task CloseInfo()
+    {
+        _infoVisible = false;
+        await FetchRemoteSources();
+    }
+}

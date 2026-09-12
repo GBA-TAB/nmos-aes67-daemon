@@ -1,0 +1,17 @@
+@*
+    The tab strip itself. Unlike the original React app (Tabs.jsx/Tab.jsx), which manually swaps
+    which child is mounted via local state + a manual window.history.pushState call, this uses
+    Blazor's own router: each tab is a real @page route (Pages/*.razor), NavLink handles the
+    "active" CSS class, and MainLayout's @Body swaps to whichever page component matched -
+    Blazor's router already creates a fresh component instance per navigation, so this reproduces
+    the original's "remount and refetch on every tab switch" behavior without extra code.
+*@
+<div class="tab-list">
+    <NavLink class="tab-list-item" ActiveClass="tab-list-active" href="/" Match="NavLinkMatch.All">Config</NavLink>
+    <NavLink class="tab-list-item" ActiveClass="tab-list-active" href="/PTP">PTP</NavLink>
+    <NavLink class="tab-list-item" ActiveClass="tab-list-active" href="/Sources">Sources</NavLink>
+    <NavLink class="tab-list-item" ActiveClass="tab-list-active" href="/Sinks">Sinks</NavLink>
+    <NavLink class="tab-list-item" ActiveClass="tab-list-active" href="/Browser">Browser</NavLink>
+    <NavLink class="tab-list-item" ActiveClass="tab-list-active" href="/Topology">Topology</NavLink>
+    <NavLink class="tab-list-item" ActiveClass="tab-list-active" href="/ChannelMap">Channel Map</NavLink>
+</div>

@@ -1,0 +1,127 @@
+/* Ported near-verbatim from webui/src/styles.css (the original React app) - plain CSS, no
+   framework, matching this project's "as lightweight as possible" goal. */
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  margin: 0;
+}
+
+.app-shell {
+  padding: 0 1.5rem 1.5rem;
+}
+
+.tab-body {
+  padding-top: 1rem;
+}
+
+.tab-list {
+  border-bottom: 1px solid #ccc;
+  padding-left: 0;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.tab-list-item {
+  display: inline-block;
+  list-style: none;
+  margin-bottom: -1px;
+  padding: 0.5rem 0.75rem;
+  /* The original used non-anchor elements for tabs; NavLink renders a real <a>, so reset link
+     chrome here rather than leaving default blue/underline styling the original never had. */
+  text-decoration: none;
+  color: inherit;
+}
+
+.tab-list-active {
+  background-color: white;
+  border: solid #ccc;
+  border-width: 1px 1px 0 1px;
+}
+
+.input-number {
+  width: 5em;
+}
+
+.table-stream {
+  border-collapse: separate;
+  border-spacing: 15px 1rem;
+}
+
+.tr-stream {
+  padding: 5px;
+  text-align: left;
+}
+
+.pointer-area {
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+/* ── Topology ── */
+.topo-section {
+  margin-bottom: 1.5rem;
+}
+
+.topo-empty {
+  color: #888;
+  font-style: italic;
+  margin: 0.5rem 0;
+}
+
+.topo-arrow {
+  padding: 0 1rem;
+  color: #aaa;
+  font-size: 1.2em;
+}
+
+.topo-badge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.topo-active  { background: #dcfce7; color: #16a34a; }
+.topo-muted   { background: #fef3c7; color: #b45309; }
+.topo-wait    { background: #f3f4f6; color: #6b7280; }
+.topo-unknown { background: #f3f4f6; color: #9ca3af; }
+.topo-local   { background: #dbeafe; color: #1d4ed8; }
+.topo-remote  { background: #f3e8ff; color: #7c3aed; }
+
+/* ── Modal (replaces react-modal's default centering) ── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-content {
+  background: white;
+  border-radius: 4px;
+  padding: 1.5rem;
+  max-width: 90vw;
+  max-height: 90vh;
+  overflow: auto;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+
+/* ── Form feedback (EditForm/DataAnnotationsValidator + post-submit status) ── */
+.validation-message {
+  color: #dc2626;
+  font-size: 12px;
+  display: block;
+}
+
+.status-success {
+  color: #16a34a;
+}
+
+.status-error {
+  color: #dc2626;
+}

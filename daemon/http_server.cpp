@@ -87,13 +87,38 @@ bool HttpServer::init() {
 
   svr_.set_mount_point("/", config_->get_http_base_dir().c_str());
 
-  svr_.Get("(/|/Config|/PTP|/Sources|/Sinks|/Browser|/Topology|/ChannelMap)",
-           [&](const Request& req, Response& res) {
-             std::ifstream file(config_->get_http_base_dir() + "/index.html");
-             std::stringstream buffer;
-             buffer << file.rdbuf();
-             res.set_content(buffer.str(), "text/html");
-           });
+  // cpp-httplib's static file handler sends no Cache-Control/ETag/Last-Modified by default, which
+  // leaves each browser's own heuristic caching free to decide whether a plain reload re-fetches
+  // the Blazor app's _framework/* files - unreliable during active development/redeploys, where a
+  // stale cached wasm/dll bundle can silently keep running old logic after a real page reload.
+  // "no-cache" (revalidate every time, not "no-store") keeps normal HTTP caching semantics while
+  // guaranteeing a reload always sees the latest deployed build.
+  svr_.set_file_request_handler([](const Request&, Response& res) {
+    res.set_header("Cache-Control", "no-cache");
+  });
+
+  // SPA deep-link fallback: any client-side route (e.g. /Sources, /PTP) has no matching static
+  // file or /api handler, so it 404s from set_mount_point above - serve index.html instead so the
+  // SPA's own router can take over, same as a browser refresh on any of those paths already needs
+  // to work. Was previously a hardcoded regex allowlist of the React app's exact routes
+  // ("(/|/Config|/PTP|/Sources|/Sinks|/Browser|/Topology|/ChannelMap)"), which needed updating
+  // every time a frontend route changed or got renamed - a real SPA-independent wildcard instead:
+  // any GET that isn't under /api and wasn't served as a real file gets index.html. /api/* is
+  // explicitly excluded so a genuine API 404 (e.g. GET /api/sink/status/999 for a nonexistent
+  // sink) still returns its own real error body instead of being masked by this.
+  Server::HandlerWithResponse spa_fallback_handler =
+      [&](const Request& req, Response& res) -> Server::HandlerResponse {
+    if (req.method != "GET" || res.status != 404 || req.path.rfind("/api", 0) == 0) {
+      return Server::HandlerResponse::Unhandled;
+    }
+    std::ifstream file(config_->get_http_base_dir() + "/index.html");
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    res.set_content(buffer.str(), "text/html");
+    res.status = 200;
+    return Server::HandlerResponse::Handled;
+  };
+  svr_.set_error_handler(spa_fallback_handler);
 
   /* allows cross-origin */
   svr_.Options("/api/(.*?)", [&](const Request& /*req*/, Response& res) {

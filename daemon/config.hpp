@@ -20,6 +20,8 @@
 #ifndef _CONFIG_HPP_
 #define _CONFIG_HPP_
 
+#include <unistd.h>
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -84,7 +86,23 @@ class Config {
   const std::string& get_nmos_registry_address() const { return nmos_registry_address_; }
   uint16_t get_nmos_registry_port() const { return nmos_registry_port_; }
   uint16_t get_nmos_node_port() const { return nmos_node_port_; }
-  const std::string& get_nmos_label() const { return nmos_label_; }
+  // The node's NMOS label always follows the system hostname, not the daemon.conf-configured
+  // value (nmos_label_ is still stored/settable for backward-compat with the JSON config file and
+  // POST /api/config, but no longer consulted here) - with several unrelated NMOS-node processes
+  // (this daemon, MXL gateways, signal generators) frequently co-located on one box, a
+  // machine-derived name is unambiguous by construction where a manually-typed one can drift out
+  // of sync or collide.
+  const std::string& get_nmos_label() const {
+    static const std::string hostname = [] {
+      char buf[256];
+      if (gethostname(buf, sizeof(buf)) == 0) {
+        buf[sizeof(buf) - 1] = '\0';
+        return std::string(buf);
+      }
+      return std::string("localhost");
+    }();
+    return hostname;
+  }
   bool get_nmos_registry_auto_discover() const { return nmos_registry_auto_discover_; }
   bool get_nmos_mdns_enabled() const { return nmos_mdns_enabled_; }
   bool get_is12_enabled() const { return is12_enabled_; }

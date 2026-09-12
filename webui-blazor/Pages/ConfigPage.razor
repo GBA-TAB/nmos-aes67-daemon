@@ -1,0 +1,337 @@
+@page "/"
+@page "/Config"
+@using System.ComponentModel.DataAnnotations
+@using AesDaemonWebUI.Models
+@inject AesDaemonWebUI.Services.DaemonApiClient Api
+
+<div class="config">
+    @if (_loading)
+    {
+        <p><em>Loading...</em></p>
+    }
+    else
+    {
+        <h3>Version</h3>
+        <table><tbody>
+            <tr>
+                <th align="left"><label>Daemon</label></th>
+                <th align="left"><input value="@_version" disabled /></th>
+            </tr>
+        </tbody></table>
+        <br />
+
+        <EditForm Model="@_form" OnValidSubmit="Submit">
+            <DataAnnotationsValidator />
+
+            <h3>Audio Config</h3>
+            <table><tbody>
+                <tr>
+                    <th align="left"><label>Safety Playout delay (samples)</label></th>
+                    <th align="left">
+                        <InputNumber class="input-number" @bind-Value="_form.PlayoutDelay" />
+                        <ValidationMessage For="() => _form.PlayoutDelay" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>TIC frame size @@1FS (samples)</label></th>
+                    <th align="left">
+                        <InputSelect @bind-Value="_form.TicFrameSizeAt1Fs">
+                            <option value="48">48 - 1ms</option>
+                            <option value="64">64 - 1.3ms</option>
+                            <option value="96">96 - 2ms</option>
+                            <option value="128">128 - 2.7ms</option>
+                            <option value="192">192 - 4ms</option>
+                        </InputSelect>
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Max TIC frame size (samples)</label></th>
+                    <th align="left"><input type="number" class="input-number" value="@_form.MaxTicFrameSize" disabled /></th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Initial Sample rate</label></th>
+                    <th align="left">
+                        <InputSelect @bind-Value="_form.SampleRate">
+                            <option value="44100">44.1 kHz</option>
+                            <option value="48000">48 kHz</option>
+                            <option value="88200">88.2 kHz</option>
+                            <option value="96000">96 kHz</option>
+                            <option value="176400">176.4 kHz</option>
+                            <option value="192000">192 kHz</option>
+                            <option value="352800">352.8 kHz</option>
+                            <option value="384000">384 kHz</option>
+                        </InputSelect>
+                    </th>
+                </tr>
+            </tbody></table>
+            <br />
+
+            <h3>HTTP Streamer Config</h3>
+            <table><tbody>
+                <tr height="35">
+                    <th align="left"><label>Streamer enabled</label></th>
+                    <th align="left"><InputCheckbox @bind-Value="_form.StreamerEnabled" /></th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Streamer channels</label></th>
+                    <th align="left">
+                        <InputNumber class="input-number" @bind-Value="_form.StreamerChannels" />
+                        <ValidationMessage For="() => _form.StreamerChannels" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Streamer files</label></th>
+                    <th align="left">
+                        <InputNumber class="input-number" @bind-Value="_form.StreamerFilesNum" />
+                        <ValidationMessage For="() => _form.StreamerFilesNum" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Streamer file duration (secs)</label></th>
+                    <th align="left">
+                        <InputNumber class="input-number" @bind-Value="_form.StreamerFileDuration" />
+                        <ValidationMessage For="() => _form.StreamerFileDuration" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Streamer player buffer files</label></th>
+                    <th align="left"><input type="number" class="input-number" value="@_form.StreamerPlayerBufferFilesNum" disabled /></th>
+                </tr>
+            </tbody></table>
+            <br />
+
+            <h3>Network Config</h3>
+            <table><tbody>
+                <tr>
+                    <th align="left"><label>Current Node ID</label></th>
+                    <th align="left"><input value="@_nodeId" size="32" disabled /></th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Custom Node ID</label></th>
+                    <th align="left">
+                        <InputText size="32" @bind-Value="_form.CustomNodeId" />
+                        <ValidationMessage For="() => _form.CustomNodeId" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>HTTP port</label></th>
+                    <th align="left"><input type="number" class="input-number" value="@_httpPort" disabled /></th>
+                </tr>
+                <tr>
+                    <th align="left"><label>RTSP port</label></th>
+                    <th align="left">
+                        <InputNumber class="input-number" @bind-Value="_form.RtspPort" />
+                        <ValidationMessage For="() => _form.RtspPort" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>RTP base address</label></th>
+                    <th align="left">
+                        <InputText size="15" @bind-Value="_form.RtpMcastBase" />
+                        <ValidationMessage For="() => _form.RtpMcastBase" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Secondary RTP address</label></th>
+                    <th align="left">
+                        <InputText size="15" @bind-Value="_form.RtpMcastBaseSec" />
+                        <ValidationMessage For="() => _form.RtpMcastBaseSec" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>RTP port</label></th>
+                    <th align="left">
+                        <InputNumber class="input-number" @bind-Value="_form.RtpPort" />
+                        <ValidationMessage For="() => _form.RtpPort" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Secondary RTP port</label></th>
+                    <th align="left">
+                        <InputNumber class="input-number" @bind-Value="_form.RtpPortSec" />
+                        <ValidationMessage For="() => _form.RtpPortSec" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>SAP multicast address</label></th>
+                    <th align="left">
+                        <InputText size="15" @bind-Value="_form.SapMcastAddr" />
+                        <ValidationMessage For="() => _form.SapMcastAddr" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>SAP interval (sec)</label></th>
+                    <th align="left">
+                        <InputNumber class="input-number" @bind-Value="_form.SapInterval" />
+                        <ValidationMessage For="() => _form.SapInterval" />
+                    </th>
+                </tr>
+                <tr height="35">
+                    <th align="left"><label>mDNS enabled</label></th>
+                    <th align="left"><InputCheckbox @bind-Value="_form.MdnsEnabled" /></th>
+                </tr>
+                <tr height="35">
+                    <th align="left"><label>Auto Sinks update</label></th>
+                    <th align="left"><InputCheckbox @bind-Value="_form.AutoSinksUpdate" /></th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Network Interface</label></th>
+                    <th align="left"><input value="@_interfaceName" disabled /></th>
+                </tr>
+                <tr>
+                    <th align="left"><label>MAC address</label></th>
+                    <th align="left"><input value="@_macAddr" disabled /></th>
+                </tr>
+                <tr>
+                    <th align="left"><label>IP address</label></th>
+                    <th align="left"><input value="@_ipAddr" disabled /></th>
+                </tr>
+            </tbody></table>
+            <br />
+
+            <h3>Logging Config</h3>
+            <table><tbody>
+                <tr>
+                    <th align="left"><label>Syslog protocol</label></th>
+                    <th align="left">
+                        <InputSelect @bind-Value="_form.SyslogProto">
+                            <option value="none">none</option>
+                            <option value="">local</option>
+                            <option value="udp">UDP server</option>
+                        </InputSelect>
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Syslog server</label></th>
+                    <th align="left">
+                        <InputText @bind-Value="_form.SyslogServer" disabled="@(_form.SyslogProto != "udp")" />
+                        <ValidationMessage For="() => _form.SyslogServer" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Log severity</label></th>
+                    <th align="left">
+                        <InputSelect @bind-Value="_form.LogSeverity">
+                            <option value="1">debug</option>
+                            <option value="2">info</option>
+                            <option value="3">warning</option>
+                            <option value="4">error</option>
+                            <option value="5">fatal</option>
+                        </InputSelect>
+                    </th>
+                </tr>
+            </tbody></table>
+            <br />
+
+            <h3>NMOS Config</h3>
+            <table><tbody>
+                <tr height="35">
+                    <th align="left"><label>NMOS enabled</label></th>
+                    <th align="left"><InputCheckbox @bind-Value="_form.NmosEnabled" /></th>
+                </tr>
+                <tr height="35">
+                    <th align="left"><label>Auto-discover registry (DNS-SD)</label></th>
+                    <th align="left"><InputCheckbox @bind-Value="_form.NmosRegistryAutodiscovery" disabled="@(!_form.NmosEnabled)" /></th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Registry address</label></th>
+                    <th align="left">
+                        <InputText size="32" @bind-Value="_form.NmosRegistryAddress" disabled="@(!_form.NmosEnabled || _form.NmosRegistryAutodiscovery)" />
+                        <ValidationMessage For="() => _form.NmosRegistryAddress" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Registry port</label></th>
+                    <th align="left">
+                        <InputNumber class="input-number" @bind-Value="_form.NmosRegistryPort" disabled="@(!_form.NmosEnabled)" />
+                        <ValidationMessage For="() => _form.NmosRegistryPort" />
+                    </th>
+                </tr>
+                <tr>
+                    <th align="left"><label>Node API port</label></th>
+                    <th align="left">
+                        <InputNumber class="input-number" @bind-Value="_form.NmosNodePort" disabled="@(!_form.NmosEnabled)" />
+                        <ValidationMessage For="() => _form.NmosNodePort" />
+                    </th>
+                </tr>
+                <tr height="35">
+                    <th align="left"><label>Advertise via mDNS (DNS-SD)</label></th>
+                    <th align="left"><InputCheckbox @bind-Value="_form.NmosMdnsEnabled" disabled="@(!_form.NmosEnabled)" /></th>
+                </tr>
+            </tbody></table>
+            <br />
+
+            <table><tbody>
+                <tr>
+                    <th><button type="submit" disabled="@_submitting">Submit</button></th>
+                </tr>
+            </tbody></table>
+        </EditForm>
+
+        @if (!string.IsNullOrEmpty(_statusMessage))
+        {
+            <p class="@(_statusIsError ? "status-error" : "status-success")">@_statusMessage</p>
+        }
+    }
+</div>
+
+@code {
+    private bool _loading = true;
+    private bool _submitting;
+    private string _version = "";
+    private string _nodeId = "";
+    private int _httpPort;
+    private string _interfaceName = "";
+    private string _macAddr = "";
+    private string _ipAddr = "";
+    private string? _statusMessage;
+    private bool _statusIsError;
+    private ConfigUpdateRequest _form = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            var versionTask = Api.GetVersionAsync();
+            var config = await Api.GetConfigAsync();
+            _version = await versionTask;
+
+            _nodeId = config.NodeId;
+            _httpPort = config.HttpPort;
+            _interfaceName = config.InterfaceName;
+            _macAddr = config.MacAddr;
+            _ipAddr = config.IpAddr;
+            _form = ConfigUpdateRequest.FromConfig(config);
+        }
+        catch (AesDaemonWebUI.Services.DaemonApiException ex)
+        {
+            _statusMessage = $"Failed to load configuration: {ex.Message}";
+            _statusIsError = true;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task Submit()
+    {
+        _submitting = true;
+        _statusMessage = null;
+        try
+        {
+            await Api.SetConfigAsync(_form);
+            _statusMessage = "Applying new configuration ...";
+            _statusIsError = false;
+        }
+        catch (AesDaemonWebUI.Services.DaemonApiException ex)
+        {
+            _statusMessage = $"Failed to apply configuration: {ex.Message}";
+            _statusIsError = true;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+}
