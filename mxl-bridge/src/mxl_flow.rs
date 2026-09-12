@@ -91,6 +91,28 @@ pub fn build_audio_flow_def(
     .to_string()
 }
 
+/// How far `next_index` may diverge from `MxlInstance::get_current_index` (the real,
+/// clock-derived "correct" index for right now) before `write_next`/`read_next` snap-correct to
+/// it instead of continuing to accumulate. 5ms at 48kHz - roughly half a period at this project's
+/// own configured `period_frames`/`sample_rate` (480/48000 = 10ms) - loose enough that ordinary
+/// per-period scheduling jitter never triggers a correction, tight enough to bound real drift to
+/// a small, likely-inaudible jump rather than letting it grow without limit. See `write_next`'s
+/// own doc comment for why this exists at all: found live, real ALSA hardware, growing without
+/// bound (2.5s and climbing within 15 real seconds) - `next_index` is seeded once from the real
+/// clock and then purely accumulates every period, so it silently diverges from the real clock at
+/// whatever rate the local ALSA device's own hardware clock actually runs relative to the CLOCK_TAI
+/// (or PTP, if genuinely locked) that `get_current_index` is really derived from - never
+/// re-verified otherwise. `gst-mxl-rs`'s own mxlsink (a sibling MXL writer, `render_continuous.rs`)
+/// never accumulates an index at all - it derives one fresh from each buffer's own real timestamp
+/// every single time, structurally immune to this - not directly portable here (this has no
+/// GStreamer buffer/PTS to anchor to, just a raw ALSA period), so this is the same "never trust an
+/// un-reverified accumulated value" principle adapted to a real-time polling loop instead.
+const DRIFT_TOLERANCE_SAMPLES_AT_48K: u64 = 240; // 5ms @ 48kHz; scaled by sample_rate at use sites.
+
+fn drift_tolerance_samples(sample_rate: &mxl::Rational) -> u64 {
+    (DRIFT_TOLERANCE_SAMPLES_AT_48K * sample_rate.numerator as u64) / (48_000 * sample_rate.denominator as u64).max(1)
+}
+
 /// Owns the MXL instance and the samples writer for one continuous (audio) flow, plus its own
 /// running write index (Phase 2: each Sink's flow is created/destroyed independently as leases
 /// come and go, §1 — so unlike Phase 1's one global index, every flow now tracks its own).
@@ -147,15 +169,31 @@ impl MxlAudioFlow {
     /// seeded from MXL's own current-time-based index on the very first call (it reads the same
     /// ptp-clock-manager-disciplined system clock internally per mxl/docs/Timing.md's "index 0 =
     /// SMPTE 2059-1 epoch" model, no need to duplicate that computation here). Mirrors the
-    /// write_samples loop in mxl's own flow-writer.rs example, generalized to per-flow state.
+    /// write_samples loop in mxl's own flow-writer.rs example, generalized to per-flow state -
+    /// except every call also re-checks the accumulated index against a fresh real one
+    /// (`get_current_index`) and snaps to it past `drift_tolerance_samples` (see that function's
+    /// own doc comment for why this exists - found live, real ALSA hardware, unbounded growing
+    /// latency): the local ALSA device's own hardware clock isn't guaranteed to run at exactly the
+    /// same rate as whatever real/PTP clock `get_current_index` is really derived from, and pure
+    /// accumulation never re-verifies that assumption.
     pub fn write_next(&mut self, planar: &[Vec<f32>]) -> anyhow::Result<()> {
         let count = planar.first().map(|c| c.len()).unwrap_or(0);
         if count == 0 {
             return Ok(());
         }
+        let real_index = self.instance.get_current_index(&self.sample_rate);
         let index = match self.next_index {
-            Some(i) => i,
-            None => self.instance.get_current_index(&self.sample_rate),
+            Some(i) if i.abs_diff(real_index) <= drift_tolerance_samples(&self.sample_rate) => i,
+            Some(i) => {
+                tracing::warn!(
+                    accumulated_index = i,
+                    real_index,
+                    drift_samples = i.abs_diff(real_index),
+                    "MXL write index drifted from the real clock beyond tolerance, snapping to it"
+                );
+                real_index
+            }
+            None => real_index,
         };
 
         tracing::debug!(index, count, "write_next");
@@ -258,6 +296,18 @@ impl MxlAudioFlowSource {
     /// wherever the previous call left off (seeded from `head_index()` on the first call, or after
     /// `resync_to_head`). Each SourceEntry's reader tracks this independently (Phase 2: readers are
     /// opened/closed per-activation, not one global index like Phase 1).
+    ///
+    /// Same accumulate-and-never-re-verify shape as `MxlAudioFlow::write_next` before its own
+    /// drift fix (see that function's doc comment) - not given the same treatment here, because
+    /// the correct reference is different: a reader is *supposed* to trail `head_index()` by a
+    /// stable playout margin, not track it tightly, so naively snapping to a fresh `head_index()`
+    /// every period the way the writer snaps to `get_current_index()` would fight that margin
+    /// instead of correcting real drift. The right check is "has the *gap* to `head_index()` grown
+    /// or shrunk over time," not "does this index differ from a fresh reference" - genuinely
+    /// different from the writer's case, not yet built, and not verified live the way the write
+    /// side's drift was (that was measured against a real Sink; no Source/Receiver was activated
+    /// in that same session to check this side empirically). Flagging this as the same open
+    /// question, not silently assuming it's fine.
     pub fn read_next(&mut self, count: usize, timeout: std::time::Duration) -> anyhow::Result<Vec<Vec<f32>>> {
         let index = match self.next_index {
             Some(i) => i,

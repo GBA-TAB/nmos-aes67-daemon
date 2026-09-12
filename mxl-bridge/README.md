@@ -153,6 +153,53 @@ First build triggers vcpkg building ~8 dependencies from source (catch2, spdlog,
 
 ## Known issues
 
+- **RESOLVED (2026-09-12, found via real-hardware testing - the first time this session actually
+  ran the real C++ daemon against the real RAVENNA card): the MXL write index accumulated forever
+  with no re-verification against the real clock, drifting without bound.** Requested as a direct
+  follow-up to `decklink-mxl-gateway`'s own real-hardware optimization pass that session - started
+  the real `aes67-daemon` (`daemon/aes67-daemon -c daemon.conf`) against this host's real
+  `MergingRavennaALSA` card for the first time, pointed `mxl-bridge` at it, and activated its one
+  real, already-configured Sink ("DKL OPT2 Audio", 16 real channels from the DeckLink OPT2 card's
+  own onboard NMOS agent). `mxl-info` showed real, genuine audio capture (head index correctly
+  advancing) but `Latency` growing without bound - 729ms, then climbing steadily to 3534ms within
+  15 real seconds, no sign of stabilizing.
+  - **Root cause**: `MxlAudioFlow::write_next` (`mxl_flow.rs`) seeds its write index once from
+    `MxlInstance::get_current_index` on the first call, then only ever increments it by `count`
+    every period - never re-verified against the real clock again. The local ALSA hardware clock
+    isn't guaranteed to run at exactly the rate `get_current_index`'s own reference clock does, and
+    nothing here ever checked that assumption - the same "sampled once, never re-verified" shape as
+    the clock-offset staleness bug already found and fixed in `gst-mxl-rs` earlier that session
+    (`c3974d40`), independently rediscovered here because it was never ported to this app's own
+    hand-rolled index tracking.
+  - **Fix**: every `write_next` call now also computes a fresh `get_current_index` and snaps the
+    accumulated index to it once they diverge past `drift_tolerance_samples` (5ms at 48kHz, scaled
+    by configured sample rate) - see `mxl_flow.rs`'s doc comments on that function and on
+    `write_next` itself for the full reasoning, including why this isn't the same fix shape as
+    `gst-mxl-rs`'s own (that one derives an index fresh from each GStreamer buffer's real PTS every
+    single time with no accumulation at all - not directly portable here, since this has no
+    GStreamer buffer/PTS to anchor to, just a raw ALSA period).
+  - **Verified live**, same real hardware, same real Sink, same 15-second (then a further 30-second)
+    observation window: latency now stays bounded, oscillating within roughly ±8ms with no growth
+    trend, instead of climbing past 3.5s. The correction fires on a real but modest fraction of
+    periods (~9.75% - 1099 of 11273 real `write_next` calls over ~2m23s), not every call.
+  - **Not fixed, flagged as a related open question**: `MxlAudioFlowSource::read_next` (the Rx/
+    playback direction) has the identical accumulate-and-never-re-verify code shape, but wasn't
+    given the same treatment - the correct reference for a reader is different (trail
+    `head_index()` by a stable playout margin, not track it tightly), and no Source/Receiver was
+    activated this session to measure whether it actually drifts in practice the way the write
+    side provably does. See `read_next`'s own doc comment.
+  - **Not investigated, flagged as a likely deeper cause**: the real per-period drift rate implied
+    by how often corrections fire (roughly 5ms every ~100ms, order of several percent) is large for
+    a real hardware clock mismatch - typical free-running crystal drift is far smaller. This session
+    separately found the real daemon logging persistent `driver_manager:: cmd GetPTPStatus failed
+    with error unexpected driver command response code` every ~2s against the currently-loaded
+    `MergingRavennaALSA` kernel module (`bondagit-2.1`, loaded 2026-09-09) - plausibly means PTP
+    genuinely isn't locking on this card right now, which would explain a real, not merely
+    measurement-artifact, clock-rate mismatch. This fix bounds the damage regardless of cause, but
+    doesn't address whatever's actually keeping the card's clock from being disciplined - worth a
+    dedicated look at the daemon/driver communication before relying on this for real production
+    timing accuracy.
+
 - **RESOLVED (2026-09-12, found via an audit prompted by the same session's `decklink-mxl-gateway`/
   `mxl-signal-gen` watchdog-hardening work): no fault visibility on a stalled/failing MXL read or
   write, in this app or `../mxl-test-app/`.** Confirmed both apps are structurally immune to the
