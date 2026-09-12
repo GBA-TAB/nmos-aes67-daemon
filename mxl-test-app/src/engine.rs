@@ -42,6 +42,13 @@ pub struct MixerState {
     /// engine re-derives fresh from the real `tracks`/`buses`/`masters` maps whenever it fires, not
     /// a correctness-load-bearing synchronization point itself.
     pub topology_generation: AtomicU64,
+    /// "Some input/output grid entry's `fault` transitioned, please re-register" - sent
+    /// (non-blocking) from this engine's own plain OS thread whenever `run`'s read/write step
+    /// flips a `fault` field, so `nmos::registration::run_fault_push` can push the change to the
+    /// registry promptly instead of waiting for the next periodic/404-triggered full resync.
+    /// `take_fault_rx` hands out the paired receiver exactly once.
+    pub fault_notify_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    pub fault_notify_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<()>>>,
     pub period_frames: usize,
     pub sample_rate: u32,
 }
@@ -57,6 +64,32 @@ impl MixerState {
 
     pub fn masters_snapshot(&self) -> Vec<Arc<MasterTrack>> {
         self.masters.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Takes `fault_notify_rx` - exactly once (`nmos::mod::run`, at startup). Panics on a second
+    /// call: there is only ever one consumer of this channel.
+    pub fn take_fault_rx(&self) -> tokio::sync::mpsc::UnboundedReceiver<()> {
+        self.fault_notify_rx.lock().unwrap().take().expect("take_fault_rx called more than once")
+    }
+
+    /// Sets `*slot` and, only on an actual None-to-Some transition, notifies `fault_notify_rx` -
+    /// shared by both `run`'s input-read and output-write steps, each locking their own entry's
+    /// `fault` field directly and passing it here rather than this taking an `Arc<InputGridEntry>`/
+    /// `Arc<OutputGridEntry>` (the two types share no common trait to genericize over cheaply).
+    fn mark_fault(&self, slot: &mut Option<String>, reason: String) {
+        if slot.is_none() {
+            let _ = self.fault_notify_tx.send(());
+        }
+        *slot = Some(reason);
+    }
+
+    /// Inverse of `mark_fault` - clears `*slot` and notifies on a Some-to-None transition. A no-op
+    /// (no notification) if it was already clear, so the common case (every period succeeds) costs
+    /// nothing beyond the `is_some()` check.
+    fn clear_fault(&self, slot: &mut Option<String>) {
+        if slot.take().is_some() {
+            let _ = self.fault_notify_tx.send(());
+        }
     }
 }
 
@@ -282,6 +315,7 @@ pub fn run(state: Arc<MixerState>) {
                         planar.iter().map(|ch| peak_to_db(ch.iter().fold(0.0f32, |m, &s| m.max(s.abs())))).collect();
                     *entry.meter_db.lock().unwrap() = meters;
                     input_bufs.insert(entry.id.clone(), planar);
+                    state.clear_fault(&mut entry.fault.lock().unwrap());
                 }
                 Err(e) => {
                     tracing::warn!(entry_id = %entry.id, error = %e, "input grid read failed, resyncing to flow head");
@@ -289,6 +323,7 @@ pub fn run(state: Arc<MixerState>) {
                     if let Err(e) = r.resync_to_head() {
                         tracing::error!(entry_id = %entry.id, error = %e, "failed to resync input grid entry to flow head");
                     }
+                    state.mark_fault(&mut entry.fault.lock().unwrap(), e.to_string());
                 }
             }
         }
@@ -503,8 +538,12 @@ pub fn run(state: Arc<MixerState>) {
             state.patch.resolve_output(&entry.id, &input_bufs, &track_out_this_period, &bus_out_this_period, &master_out_this_period, dst);
             let meters: Vec<f32> = dst.iter().map(|ch| peak_to_db(ch.iter().fold(0.0f32, |m, &s| m.max(s.abs())))).collect();
             *entry.meter_db.lock().unwrap() = meters;
-            if let Err(e) = entry.writer.lock().unwrap().write_next(dst) {
-                tracing::error!(output_id = %entry.id, error = %e, "failed to write samples into output grid entry's MXL flow");
+            match entry.writer.lock().unwrap().write_next(dst) {
+                Ok(()) => state.clear_fault(&mut entry.fault.lock().unwrap()),
+                Err(e) => {
+                    tracing::error!(output_id = %entry.id, error = %e, "failed to write samples into output grid entry's MXL flow");
+                    state.mark_fault(&mut entry.fault.lock().unwrap(), e.to_string());
+                }
             }
         }
 

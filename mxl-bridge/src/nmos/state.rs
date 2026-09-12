@@ -69,6 +69,12 @@ pub struct SinkEntry {
     pub receiver_id: Option<String>,
     pub leases: Vec<String>,
     pub flow: Option<mxl_flow::MxlAudioFlow>,
+    /// Set by `alsa_capture.rs` on a write failure, cleared on the next successful write - `active`
+    /// as exposed to NMOS (`SinkEntrySnapshot::from`) folds this in, so a stalled/dead flow reads
+    /// honestly as inactive instead of silently still claiming to be sending. Deliberately does not
+    /// touch `active` above directly, which stays exactly "what IS-05 was told" - a fault clearing
+    /// must not resurrect a Sender the controller deactivated while it was faulted.
+    pub fault: Option<String>,
 }
 
 impl SinkEntry {
@@ -86,6 +92,7 @@ impl SinkEntry {
             receiver_id: None,
             leases: Vec::new(),
             flow: None,
+            fault: None,
         }
     }
 
@@ -119,6 +126,10 @@ pub struct SourceEntry {
     pub active: bool,
     pub sender_id: Option<String>,
     pub reader: Option<mxl_flow::MxlAudioFlowSource>,
+    /// Set by `alsa_playback.rs` on a read failure, cleared on the next successful read - same
+    /// "folds into exposed `active`, never touches the raw PATCH-driven bit" rule as
+    /// `SinkEntry::fault`.
+    pub fault: Option<String>,
 }
 
 impl SourceEntry {
@@ -133,6 +144,7 @@ impl SourceEntry {
             active: false,
             sender_id: None,
             reader: None,
+            fault: None,
         }
     }
 
@@ -161,12 +173,22 @@ pub struct NmosState {
     pub sources: Mutex<HashMap<u8, SourceEntry>>,
 
     pub is08: super::is08::Is08State,
+
+    /// "Something's `fault` changed, please re-register" - sent (non-blocking, safe from
+    /// alsa_capture.rs/alsa_playback.rs's plain OS threads) on every fault transition so a real
+    /// controller sees the drop close to when it happens, not just on the next full periodic/404-
+    /// triggered resync. `nmos::run` takes the paired receiver exactly once via `take_fault_rx`.
+    fault_notify_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    fault_notify_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<()>>>,
 }
 
 impl NmosState {
     pub fn new(cfg: Config, mxl_so_path: std::path::PathBuf) -> Self {
         let alsa_channels = cfg.alsa_channels_fallback;
+        let (fault_notify_tx, fault_notify_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            fault_notify_tx,
+            fault_notify_rx: std::sync::Mutex::new(Some(fault_notify_rx)),
             node_id: mxl_flow::node_id(),
             device_id: mxl_flow::device_id(),
             node_version: now_version(),
@@ -176,6 +198,48 @@ impl NmosState {
             sinks: Mutex::new(HashMap::new()),
             sources: Mutex::new(HashMap::new()),
             is08: super::is08::Is08State::default(),
+        }
+    }
+
+    /// Takes the receiver paired with `fault_notify_tx` - exactly once (`nmos::run`, at startup).
+    /// Panics on a second call: there is only ever one consumer of this channel.
+    pub fn take_fault_rx(&self) -> tokio::sync::mpsc::UnboundedReceiver<()> {
+        self.fault_notify_rx.lock().unwrap().take().expect("take_fault_rx called more than once")
+    }
+
+    /// Sets `entry.fault` (a plain field behind `sinks`'s own lock, not a separate one) and, only
+    /// on an actual None-to-Some transition, notifies `fault_notify_rx` so the registry push
+    /// happens promptly instead of waiting for the next full resync. Called from
+    /// `alsa_capture.rs`'s plain OS thread, already holding `sinks.blocking_lock()` at the call
+    /// site - takes the entry directly rather than re-locking.
+    pub fn mark_sink_fault(&self, entry: &mut SinkEntry, reason: String) {
+        if entry.fault.is_none() {
+            let _ = self.fault_notify_tx.send(());
+        }
+        entry.fault = Some(reason);
+    }
+
+    /// Inverse of `mark_sink_fault` - clears `entry.fault` and notifies on a Some-to-None
+    /// transition. A no-op (no notification) if it was already clear, so the normal, common case
+    /// (every period succeeds) costs nothing beyond the `is_some()` check.
+    pub fn clear_sink_fault(&self, entry: &mut SinkEntry) {
+        if entry.fault.take().is_some() {
+            let _ = self.fault_notify_tx.send(());
+        }
+    }
+
+    /// `SourceEntry` counterparts of `mark_sink_fault`/`clear_sink_fault`, called from
+    /// `alsa_playback.rs`'s own thread while holding `sources.blocking_lock()`.
+    pub fn mark_source_fault(&self, entry: &mut SourceEntry, reason: String) {
+        if entry.fault.is_none() {
+            let _ = self.fault_notify_tx.send(());
+        }
+        entry.fault = Some(reason);
+    }
+
+    pub fn clear_source_fault(&self, entry: &mut SourceEntry) {
+        if entry.fault.take().is_some() {
+            let _ = self.fault_notify_tx.send(());
         }
     }
 
@@ -350,7 +414,10 @@ impl From<&SinkEntry> for SinkEntrySnapshot {
             label: e.label.clone(),
             channels: e.channels,
             version: e.version,
-            active: e.active,
+            // Honest, not just "IS-05 was told to" - `e.active` alone stays exactly that (see
+            // `SinkEntry::fault`'s doc comment), but what NMOS sees must reflect whether this
+            // Sender is genuinely writing, which a live fault says it isn't.
+            active: e.active && e.fault.is_none(),
             receiver_id: e.receiver_id.clone(),
         }
     }
@@ -375,7 +442,8 @@ impl From<&SourceEntry> for SourceEntrySnapshot {
             label: e.label.clone(),
             channels: e.channels,
             version: e.version,
-            active: e.active,
+            // See SinkEntrySnapshot::from's identical note.
+            active: e.active && e.fault.is_none(),
             sender_id: e.sender_id.clone(),
         }
     }

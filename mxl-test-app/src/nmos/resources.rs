@@ -168,7 +168,9 @@ pub fn sender_json(
         "device_id": device_id.to_string(),
         "manifest_href": format!("{base}/x-nmos/connection/v1.1/single/senders/{sender_id}/transportfile"),
         "interface_bindings": [cfg.interface_name],
-        "subscription": { "receiver_id": receiver_id, "active": true }
+        // Not hardcoded `true` any more: a write failure (engine.rs's output-write step) sets
+        // entry.fault, so this honestly reflects whether it's genuinely writing, not just running.
+        "subscription": { "receiver_id": receiver_id, "active": entry.fault.lock().unwrap().is_none() }
     })
 }
 

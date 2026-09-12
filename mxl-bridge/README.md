@@ -150,3 +150,66 @@ normal Rust toolchain:
 
 First build triggers vcpkg building ~8 dependencies from source (catch2, spdlog, fmt, pcapplusplus, etc.)
 — expect 15-40+ minutes. Subsequent builds are fast; vcpkg and CMake both cache their outputs.
+
+## Known issues
+
+- **RESOLVED (2026-09-12, found via an audit prompted by the same session's `decklink-mxl-gateway`/
+  `mxl-signal-gen` watchdog-hardening work): no fault visibility on a stalled/failing MXL read or
+  write, in this app or `../mxl-test-app/`.** Confirmed both apps are structurally immune to the
+  two other bug classes found elsewhere that session (a zero-sleep busy-spin loop pegging a core -
+  both are paced by real blocking I/O, ALSA hardware writes here, an explicitly-guarded tick
+  scheduler in `mxl-test-app`; and `register_all` silently omitting a channel - both iterate live,
+  dynamic collections, not a fixed set of `Option<T>` config fields). But a read/write failure in
+  either app just logs `tracing::warn!`/`error!` and continues (`alsa_playback.rs`'s
+  `resync_to_head` on read failure, `alsa_capture.rs`'s write-failure log, `mxl-test-app`'s
+  equivalent in `engine.rs`) - nothing is surfaced to a real NMOS controller. A permanently-dead
+  flow (upstream writer gone, MXL domain issue) looks identical, from the registry's point of view,
+  to a genuinely healthy one - exactly the class of blind spot the `watchdog` work elsewhere this
+  session exists to close, just not yet applied here.
+  - **Plan**: add `fault: Option<String>` to `SinkEntry`/`SourceEntry` (`mxl-bridge`, in the
+    existing per-map lock - no new lock needed) and `Mutex<Option<String>>` to `InputGridEntry`/
+    `OutputGridEntry` (`mxl-test-app`, matching those types' existing per-entry-Mutex convention).
+    Set it at the read/write call site on failure, clear it on the next success - safe to do
+    unconditionally here (unlike `decklink-mxl-gateway`'s DeckLink SDK case) since neither app ever
+    tears down or rebuilds a reader/writer on a transient failure, only resyncs its tracked index.
+    Fold `fault.is_none()` into whatever already computes the exposed `active`/`subscription.active`
+    (`SinkEntrySnapshot`/`SourceEntrySnapshot`'s `From` impls in `mxl-bridge`; the inline
+    `reader.is_some()` check in `mxl-test-app`'s `registration.rs`) rather than overwriting the
+    PATCH-driven intent bit directly - so a fault clearing never wrongly resurrects an entry the
+    user deactivated while it was faulted. Push the change to the registry promptly on a fault
+    *transition* (not every period) via a small debounced notify channel calling each app's
+    existing, already-idempotent `register_all`/`register_sink`+`register_source` - both apps
+    already have everything needed for a full-registration push, just not a trigger tied to fault
+    state today (a related, smaller pre-existing gap found along the way: neither app currently
+    re-pushes to the registry on an IS-05 activation change either, only on daemon-topology changes
+    or a full periodic/404-triggered resync - the same notify mechanism incidentally covers that
+    too).
+  - **Implemented as planned, in both apps.** `mxl-bridge`: `SinkEntry`/`SourceEntry.fault`, set/
+    cleared in `alsa_capture.rs`/`alsa_playback.rs`, `NmosState::mark_sink_fault`/`clear_sink_fault`
+    (+ `Source` counterparts) sending on `NmosState`'s new `fault_notify_tx` only on an actual
+    transition; `SinkEntrySnapshot`/`SourceEntrySnapshot::from` now compute `active` as `e.active &&
+    e.fault.is_none()` instead of just `e.active`. `mxl-test-app`: `InputGridEntry`/
+    `OutputGridEntry.fault: Mutex<Option<String>>`, set/cleared in `engine.rs`'s input-read and
+    output-write steps via `MixerState::mark_fault`/`clear_fault` (same notify-on-transition
+    pattern, on `MixerState`'s own `fault_notify_tx` this time - the audio engine and NMOS state are
+    separate types here, unlike `mxl-bridge`); `resources.rs`'s `sender_json` no longer hardcodes
+    `subscription.active: true`, and `registration.rs`'s receiver `active` computation now ANDs in
+    `fault.is_none()` too. Both apps' new `registration::run_fault_push` consumes the notify channel,
+    draining any further pending notifications before each pass (a burst of near-simultaneous
+    faults - e.g. a shared MXL domain hiccup - collapses into one re-registration, not one per
+    fault) and re-running the same already-idempotent `register_all` the startup/404-recovery path
+    already uses.
+  - **Verified**: `cargo test` in both crates - 17/17 (`mxl-bridge`), 75/75 (`mxl-test-app`), all
+    passing, including every pre-existing test that constructs an `InputGridEntry`/`OutputGridEntry`/
+    `SinkEntry`/`SourceEntry`/`MixerState` directly. Live-smoke-tested `mxl-test-app` against this
+    session's own real MXL domain and registry: real output-grid flow genuinely writing (`mxl-info`
+    confirms a live, advancing head index), `subscription.active: true` over the real Node API - the
+    happy path is provably unbroken, matching the prior hardcoded-`true` behavior exactly when
+    nothing is faulted. **Not verified**: the fault path itself under a real ALSA/MXL failure -
+    unlike `decklink-mxl-gateway`'s naturally-reproducible DeckLink stall, there was no safe way to
+    manufacture a genuine ALSA read/write error or MXL domain fault in this environment without
+    risking the shared domain other live processes this session depend on. The mechanism is a
+    direct structural copy of the identical, already-live-verified pattern from
+    `decklink-mxl-gateway`/`mxl-signal-gen` earlier this session (mark-on-error/clear-on-success +
+    notify-only-on-transition), not new design - reasonable confidence, but a real hardware/fault
+    test is worth doing before leaning on this in production.

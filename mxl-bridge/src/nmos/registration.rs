@@ -160,3 +160,25 @@ pub async fn resolve_sender_flow_id(state: &NmosState, sender_id: &str) -> anyho
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("sender {sender_id} response had no flow_id field"))
 }
+
+/// Consumes `NmosState::take_fault_rx`'s channel, re-running the same full `register_all` the
+/// startup/404-recovery path already uses whenever a Sink's or Source's `fault` transitions (see
+/// `mark_sink_fault`/`clear_sink_fault`/their Source counterparts) - so a controller sees a
+/// stalled/recovered flow close to when it actually happens, not just on the next periodic/404
+/// resync. Drains any further pending notifications before each pass: several faults can transition
+/// around the same time (e.g. a shared MXL domain hiccup), and one full re-registration already
+/// covers all of them - no need for one pass per notification. Exits quietly once the channel
+/// closes (`state` dropped) or if no registry is configured (nothing to push to).
+pub async fn run_fault_push(state: Arc<NmosState>, ip: String, mut rx: tokio::sync::mpsc::UnboundedReceiver<()>) {
+    let Some(base) = registry_base(&state) else {
+        return;
+    };
+    let client = reqwest::Client::new();
+
+    while rx.recv().await.is_some() {
+        while rx.try_recv().is_ok() {}
+        if let Err(e) = register_all(&client, &base, &state, &ip).await {
+            tracing::warn!(error = %e, "fault-triggered re-registration failed");
+        }
+    }
+}

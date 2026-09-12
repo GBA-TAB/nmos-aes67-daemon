@@ -115,8 +115,12 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
             for (ch_idx, &alsa_ch) in entry.map.iter().enumerate() {
                 read_channel(alsa_ch as usize, &mut planar_scratch[ch_idx]);
             }
-            if let Err(e) = flow.write_next(&planar_scratch[..n]) {
-                tracing::error!(daemon_id = entry.daemon_id, error = %e, "failed to write samples into MXL flow");
+            match flow.write_next(&planar_scratch[..n]) {
+                Ok(()) => state.clear_sink_fault(entry),
+                Err(e) => {
+                    tracing::error!(daemon_id = entry.daemon_id, error = %e, "failed to write samples into MXL flow");
+                    state.mark_sink_fault(entry, e.to_string());
+                }
             }
         }
         drop(sinks);

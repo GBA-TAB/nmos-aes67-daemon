@@ -356,6 +356,8 @@ mod tests {
             patch: crate::patch::PatchState::default(),
             default_channels: channels.iter().copied().max().unwrap_or(2),
             topology_generation: AtomicU64::new(0),
+            fault_notify_tx: tokio::sync::mpsc::unbounded_channel().0,
+            fault_notify_rx: Mutex::new(None),
             period_frames: 480,
             sample_rate: 48000,
         }

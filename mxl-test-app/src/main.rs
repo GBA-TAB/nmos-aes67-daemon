@@ -221,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
             meter_db: std::sync::Mutex::new(vec![f32::NEG_INFINITY; channels]),
             receiver_id,
             subscribed_sender_id: std::sync::Mutex::new(None),
+            fault: std::sync::Mutex::new(None),
         });
     }
 
@@ -252,6 +253,7 @@ async fn main() -> anyhow::Result<()> {
             meter_db: std::sync::Mutex::new(vec![f32::NEG_INFINITY; channels]),
             flow_id,
             receiver_id: std::sync::Mutex::new(None),
+            fault: std::sync::Mutex::new(None),
         });
         tracing::info!(output_id = %entry.id, label = %entry.label, %flow_id, channels, "output grid entry MXL flow ready");
     }
@@ -264,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
         topology::warn_incompatible_sends(t, &buses);
     }
 
+    let (fault_notify_tx, fault_notify_rx) = tokio::sync::mpsc::unbounded_channel();
     let mixer = Arc::new(MixerState {
         tracks: Mutex::new(tracks.into_iter().map(|t| (t.id, t)).collect::<HashMap<_, _>>()),
         buses: Mutex::new(buses.into_iter().map(|b| (b.id, b)).collect::<HashMap<_, _>>()),
@@ -273,6 +276,8 @@ async fn main() -> anyhow::Result<()> {
         patch: patch_state,
         default_channels,
         topology_generation: AtomicU64::new(0),
+        fault_notify_tx,
+        fault_notify_rx: Mutex::new(Some(fault_notify_rx)),
         period_frames: cfg.period_frames as usize,
         sample_rate: cfg.sample_rate,
     });

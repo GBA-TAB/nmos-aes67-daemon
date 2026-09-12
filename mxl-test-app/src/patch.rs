@@ -132,6 +132,12 @@ pub struct InputGridEntry {
     /// The `sender_id` a controller last PATCHed this entry's own Receiver's `subscription` to —
     /// purely informational, set by `nmos/server.rs`'s `receiver_patch`.
     pub subscribed_sender_id: Mutex<Option<String>>,
+    /// Set by `engine.rs`'s input-read step on a read failure, cleared on the next successful
+    /// read. `registration.rs`'s exposed `active` folds this in (`reader.is_some() &&
+    /// fault.is_none()`) rather than this entry having its own separate activation bit to keep in
+    /// sync - a stalled/dead flow this way reads honestly as inactive instead of silently still
+    /// claiming to be receiving.
+    pub fault: Mutex<Option<String>>,
 }
 
 #[derive(Default)]
@@ -185,6 +191,10 @@ pub struct OutputGridEntry {
     /// The `receiver_id` a controller last PATCHed this entry's mirrored Sender's `subscription`
     /// to — purely informational.
     pub receiver_id: Mutex<Option<String>>,
+    /// Set by `engine.rs`'s output-write step on a write failure, cleared on the next successful
+    /// write - same rationale as `InputGridEntry::fault`. `resources.rs`'s `sender_json` folds
+    /// this into the exposed `subscription.active` instead of hardcoding it `true`.
+    pub fault: Mutex<Option<String>>,
 }
 
 #[derive(Default)]
@@ -673,6 +683,7 @@ mod tests {
                 meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
                 receiver_id: uuid::Uuid::new_v4(),
                 subscribed_sender_id: Mutex::new(None),
+                fault: Mutex::new(None),
             });
         }
         grid

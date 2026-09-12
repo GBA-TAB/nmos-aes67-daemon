@@ -100,7 +100,9 @@ async fn register_all(client: &reqwest::Client, base: &str, state: &NmosState, i
     }
 
     for e in state.mixer.input_grid.snapshot() {
-        let active = e.reader.lock().unwrap().is_some();
+        // Not just "has a reader" any more: a read failure (engine.rs's input-read step) sets
+        // e.fault, so this honestly reflects whether it's genuinely receiving.
+        let active = e.reader.lock().unwrap().is_some() && e.fault.lock().unwrap().is_none();
         let sender_id = e.subscribed_sender_id.lock().unwrap().clone();
         register_resource(
             client,
@@ -135,4 +137,25 @@ pub async fn resolve_sender_flow_id(state: &NmosState, sender_id: &str) -> anyho
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("sender {sender_id} response had no flow_id field"))
+}
+
+/// Consumes `MixerState::take_fault_rx`'s channel, re-running the same full `register_all` the
+/// startup/404-recovery path already uses whenever an input- or output-grid entry's `fault`
+/// transitions (see `engine.rs`'s `MixerState::mark_fault`/`clear_fault`) - so a controller sees a
+/// stalled/recovered flow close to when it actually happens, not just on the next periodic/404
+/// resync. Drains any further pending notifications before each pass: several faults can transition
+/// around the same time (e.g. a shared MXL domain hiccup), and one full re-registration already
+/// covers all of them. Exits quietly once the channel closes or if no registry is configured.
+pub async fn run_fault_push(state: Arc<NmosState>, ip: String, mut rx: tokio::sync::mpsc::UnboundedReceiver<()>) {
+    let Some(base) = registry_base(&state) else {
+        return;
+    };
+    let client = reqwest::Client::new();
+
+    while rx.recv().await.is_some() {
+        while rx.try_recv().is_ok() {}
+        if let Err(e) = register_all(&client, &base, &state, &ip).await {
+            tracing::warn!(error = %e, "fault-triggered re-registration failed");
+        }
+    }
 }

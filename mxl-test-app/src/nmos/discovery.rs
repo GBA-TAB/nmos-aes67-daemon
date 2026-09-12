@@ -137,6 +137,7 @@ fn apply_diff(state: &NmosState, known: &mut HashMap<String, Candidate>, candida
                     reader: std::sync::Mutex::new(Some(reader)),
                     meter_db: std::sync::Mutex::new(vec![f32::NEG_INFINITY; candidate.channels]),
                     subscribed_sender_id: std::sync::Mutex::new(None),
+                    fault: std::sync::Mutex::new(None),
                 });
                 tracing::info!(sender_id = id, label = %candidate.label, channels = candidate.channels, "input grid discovery: entry ready");
             }

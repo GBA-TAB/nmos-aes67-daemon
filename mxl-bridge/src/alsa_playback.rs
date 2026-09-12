@@ -87,9 +87,11 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
                     if let Err(e) = reader.resync_to_head() {
                         tracing::error!(daemon_id = entry.daemon_id, error = %e, "failed to resync to flow head");
                     }
+                    state.mark_source_fault(entry, e.to_string());
                     continue;
                 }
             };
+            state.clear_source_fault(entry);
             let frames = planar.first().map(|c| c.len()).unwrap_or(0).min(period);
 
             for (ch_idx, &alsa_ch) in entry.map.iter().enumerate() {

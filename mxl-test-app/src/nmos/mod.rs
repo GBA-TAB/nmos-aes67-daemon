@@ -93,7 +93,9 @@ impl NmosState {
 /// just the registration background task.
 pub fn spawn_registration(state: Arc<NmosState>) {
     let ip = state.cfg.ip_addr.clone();
-    tokio::spawn(registration::run(state, ip));
+    let fault_rx = state.mixer.take_fault_rx();
+    tokio::spawn(registration::run(state.clone(), ip.clone()));
+    tokio::spawn(registration::run_fault_push(state, ip, fault_rx));
 }
 
 /// Starts the pickoff-point patch bay's input grid discovery poller (Milestone 3, `discovery.rs`)

@@ -21,6 +21,7 @@ pub async fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
     let port = state.cfg.nmos_node_port;
 
     tokio::spawn(registration::run(state.clone(), ip.clone()));
+    tokio::spawn(registration::run_fault_push(state.clone(), ip.clone(), state.take_fault_rx()));
 
     let app = server::router(state);
     let listener = tokio::net::TcpListener::bind((ip.as_str(), port))
