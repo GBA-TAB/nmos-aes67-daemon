@@ -34,6 +34,21 @@ class DriverHandler {
   static constexpr off_t data_offset =
       sizeof(struct MT_ALSA_msg) /*+ sizeof(int)*/;
   static constexpr int reply_timeout_secs = 1;  // 1sec in driver
+  // How many extra receive() attempts send_command makes after a mismatched
+  // (stale) reply, before giving up on the command that triggered reading it.
+  // See send_command's own doc comment (driver_handler.cpp) for why this
+  // exists. Found live: id 32 (GetPTPStatus) replies arrive on this channel
+  // roughly once a second, far more often than session_manager's own PTP
+  // poll loop asks for one (throttled to once every 10s after its first
+  // iteration - session_manager.cpp's `ptp_interval`) - looks like the
+  // kernel driver pushes unsolicited periodic PTP status onto the same
+  // channel send_command listens on for replies, not (only) a slow reply to
+  // an actual request. 3 wasn't always enough to skip past a burst of these
+  // before a different command's own real reply arrived; 8 gives more
+  // headroom against a once-a-second flood without meaningfully changing
+  // worst-case latency (each retry only costs real time if it *also* times
+  // out, which a genuinely-arriving-but-mismatched message does not).
+  static constexpr int max_receive_retries = 8;
   static constexpr size_t buffer_size =
       NLMSG_SPACE(max_payload) + sizeof(struct MT_ALSA_msg);
 

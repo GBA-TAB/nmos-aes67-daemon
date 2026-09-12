@@ -770,3 +770,47 @@ where:
 
 > **rate**
 > JSON number specifying the sample rate of the stream.
+
+## Known issues (session notes, not upstream) ##
+
+- **RESOLVED (2026-09-12): kernel<->daemon netlink command/response channel had no per-request
+  sequence number, so a late or unsolicited reply on that channel permanently desynced every
+  command sent after it.** Found live, real RAVENNA hardware: user-reported "can't add a stream
+  via the UI" reproduced immediately and reliably (`PUT /api/sink/<id>` returning 500,
+  `unexpected driver command response code`), alongside continuous
+  `driver_manager:: cmd GetPTPStatus failed`/`session_manager:: failed to retrieve PTP clock info`
+  errors roughly once a second.
+  - **Root cause**: `driver_handler.cpp`'s `send_command` sends one netlink message and blindly
+    trusts that whatever message `receive()` returns next is that command's own reply, matched
+    only by the shared `MT_ALSA_msg_id` command-type enum (no sequence number in the protocol at
+    all - `MT_ALSA_message_defs.h`). Log analysis (`MT_ALSA_msg_id`'s own declaration order gives
+    the numeric IDs: 29=`GetRTPStreamStatus`, 31=`GetPTPConfig`, 32=`GetPTPStatus`) showed
+    id-32-tagged messages arriving on this channel roughly once a second - far more often than
+    `session_manager.cpp`'s own PTP poll loop asks for one (throttled to once per 10s after its
+    first iteration) - consistent with the kernel driver pushing unsolicited periodic PTP status
+    onto the same channel `send_command` listens on for replies, not merely replying slowly to an
+    actual request. Whichever command was sent right before one of these arrived would read it,
+    see the type mismatch, and fail outright - previously a hard failure with no retry.
+  - **Ruled out first**: a stale/rebuilt kernel module mismatch - rebuilt `MergingRavennaALSA.ko`
+    from this exact source tree and diffed it byte-for-byte (`md5sum`) against what was already
+    loaded; identical. Not a build/version skew.
+  - **Fix**: `driver_handler.cpp`'s `send_command` now retries `receive()` (up to
+    `max_receive_retries`, `driver_handler.hpp`) on a type mismatch, discarding the stray message
+    and trying again for the real reply instead of failing the command outright - userspace-only,
+    no kernel module change.
+  - **Verified live**, same real hardware: before the fix, 12 errors in the first few seconds of
+    startup alone and continuous ~1/sec errors afterward, and `PUT /api/sink/4` reliably returned
+    500. After: zero errors across two separate 20s+/30s+ observation windows, `PUT /api/sink/4`
+    and `/5` both returned 200, and `GET /api/ptp/status` went from unreadable
+    (`failed to retrieve PTP clock info`) to reporting a real, genuinely locked status
+    (`"status": "locked"`, a real GMID, `jitter: 4`). Also fixed a downstream symptom found the
+    same session in `mxl-bridge` (see that app's own README): its MXL write index appeared to
+    drift without bound against real hardware, traced to never re-verifying against the real
+    clock - after this fix, that app's own drift-correction code fired zero times across a fresh
+    observation window that previously triggered it roughly every 100ms, meaning the apparent
+    clock-rate mismatch was very likely this same communication desync, not a genuine hardware
+    clock problem.
+  - **Not investigated further**: *why* the kernel driver behaves this way (a genuine unsolicited
+    push vs. some other trigger) - the userspace fix resolves the daemon-visible symptom
+    regardless of the kernel-side mechanism, but the kernel module itself (`3rdparty/ravenna-alsa-lkm/`)
+    was not modified or debugged further.

@@ -199,6 +199,16 @@ First build triggers vcpkg building ~8 dependencies from source (catch2, spdlog,
     doesn't address whatever's actually keeping the card's clock from being disciplined - worth a
     dedicated look at the daemon/driver communication before relying on this for real production
     timing accuracy.
+  - **Update (2026-09-12, same day): found and fixed.** See `../daemon/README.md`'s own "Known
+    issues" - the daemon's kernel netlink command/response channel had no per-request sequence
+    number, so an unsolicited periodic PTP status push arriving on the same channel as command
+    replies permanently desynced whatever real command was sent around the same time. After that
+    fix, this app's own drift-correction code (above) fired *zero* times across a fresh
+    observation window that, before the daemon fix, triggered it roughly every 100ms - strong
+    evidence the apparent clock-rate mismatch was this same communication desync, not a genuine
+    hardware clock problem. The drift-correction code here stays regardless (defense-in-depth for
+    whenever PTP genuinely isn't locked, e.g. a real signal-loss scenario), but the *cause* of the
+    drift actually observed live that day is now understood and fixed at the daemon level.
 
 - **RESOLVED (2026-09-12, found via an audit prompted by the same session's `decklink-mxl-gateway`/
   `mxl-signal-gen` watchdog-hardening work): no fault visibility on a stalled/failing MXL read or

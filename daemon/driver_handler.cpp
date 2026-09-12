@@ -162,19 +162,39 @@ void DriverHandler::send_command(enum MT_ALSA_msg_id id,
 
   BOOST_LOG_TRIVIAL(debug) << "driver_handler:: command code " << id
                            << " data len " << data_size << " sent";
-  boost::system::error_code ec;
-  auto bytes =
-      client_u2k_.receive(boost::asio::buffer(command_buffer_, max_payload),
-                          boost::posix_time::seconds(reply_timeout_secs), ec);
-  if (ec) {
-    BOOST_LOG_TRIVIAL(error) << "driver_handler:: u2k_receive " << ec.message();
-    on_command_error(id, DaemonErrc::receive_u2k_failed);
-    return;
-  }
 
-  for (struct nlmsghdr* nlh = (nlmsghdr*)command_buffer_;
-       NLMSG_OK(nlh, (size_t)bytes); nlh = NLMSG_NEXT(nlh, bytes)) {
-    if (nlh->nlmsg_type == NLMSG_DONE) {
+  // The kernel<->daemon protocol has no per-request sequence number, only the
+  // command's own type - matched strictly against whatever message this
+  // receive() call happens to read next, which is only correct if replies
+  // are never late relative to reply_timeout_secs. Found live (real RAVENNA
+  // card, real driver): GetPTPStatus's own kernel-side reply is sometimes
+  // slower than that. Once genuinely late, its stale reply sits in the
+  // socket and gets consumed by whatever *different* command is sent next,
+  // permanently desyncing every following exchange on this channel - "sent
+  // X received Y" for an unrelated Y, forever after, since nothing before
+  // this ever discarded a mismatched message and tried again. Retrying
+  // receive() a bounded number of times, discarding a mismatch instead of
+  // immediately failing the command that triggered reading it, resyncs the
+  // channel as soon as the real reply actually arrives - usually the very
+  // next read, since it was likely already in flight right behind the stale
+  // one.
+  for (int attempt = 0; attempt <= max_receive_retries; ++attempt) {
+    boost::system::error_code ec;
+    auto bytes =
+        client_u2k_.receive(boost::asio::buffer(command_buffer_, max_payload),
+                            boost::posix_time::seconds(reply_timeout_secs), ec);
+    if (ec) {
+      BOOST_LOG_TRIVIAL(error) << "driver_handler:: u2k_receive " << ec.message();
+      on_command_error(id, DaemonErrc::receive_u2k_failed);
+      return;
+    }
+
+    bool matched = false;
+    for (struct nlmsghdr* nlh = (nlmsghdr*)command_buffer_;
+         NLMSG_OK(nlh, (size_t)bytes); nlh = NLMSG_NEXT(nlh, bytes)) {
+      if (nlh->nlmsg_type != NLMSG_DONE) {
+        continue;
+      }
       struct MT_ALSA_msg* palsa_msg =
           reinterpret_cast<struct MT_ALSA_msg*> NLMSG_DATA(nlh);
 
@@ -184,19 +204,30 @@ void DriverHandler::send_command(enum MT_ALSA_msg_id id,
 
       if (id != palsa_msg->id) {
         BOOST_LOG_TRIVIAL(warning)
-            << "driver_handler:: unexpected cmd response:" << "sent " << id
-            << " received " << palsa_msg->id;
-        on_command_error(palsa_msg->id, DaemonErrc::invalid_driver_response);
-      } else {
-        if (palsa_msg->errCode == 0) {
-          // dump((uint8_t*)palsa_msg + data_offset, palsa_msg->dataSize);
-          on_command_done(
-              palsa_msg->id, palsa_msg->dataSize,
-              reinterpret_cast<const uint8_t*>(palsa_msg) + data_offset);
-        } else {
-          on_command_error(palsa_msg->id, get_driver_error(palsa_msg->errCode));
-        }
+            << "driver_handler:: stale cmd response (discarding, retrying):"
+            << " expected " << id << " received " << palsa_msg->id
+            << " attempt " << attempt;
+        continue;
       }
+
+      matched = true;
+      if (palsa_msg->errCode == 0) {
+        // dump((uint8_t*)palsa_msg + data_offset, palsa_msg->dataSize);
+        on_command_done(
+            palsa_msg->id, palsa_msg->dataSize,
+            reinterpret_cast<const uint8_t*>(palsa_msg) + data_offset);
+      } else {
+        on_command_error(palsa_msg->id, get_driver_error(palsa_msg->errCode));
+      }
+      break;
+    }
+    if (matched) {
+      return;
     }
   }
+
+  BOOST_LOG_TRIVIAL(error)
+      << "driver_handler:: giving up on command " << id << " after "
+      << (max_receive_retries + 1) << " mismatched replies";
+  on_command_error(id, DaemonErrc::invalid_driver_response);
 }
