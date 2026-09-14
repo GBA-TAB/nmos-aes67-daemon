@@ -1,9 +1,11 @@
+mod adm;
 mod biquad;
 mod config;
 mod dsp;
 mod engine;
 mod flow;
 mod ids;
+mod layout;
 mod mixer;
 mod nmos;
 mod patch;
@@ -62,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut tracks = Vec::with_capacity(cfg.tracks.len());
     for t in &cfg.tracks {
-        let track = topology::build_track(t, default_channels, cfg.sample_rate, false);
+        let track = topology::build_track(t, default_channels, cfg.sample_rate, false).map_err(|e| anyhow::anyhow!(e))?;
         tracing::info!(track_id = track.id, label = %track.label, channels = track.channels, "track ready (unpatched -- see input_grid/input-patch)");
         tracks.push(track);
     }
@@ -71,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
     // no MXL flow of their own.
     let mut buses = Vec::with_capacity(cfg.buses.len());
     for b in &cfg.buses {
-        let bus = topology::build_bus(b, default_channels, false);
+        let bus = topology::build_bus(b, default_channels, false).map_err(|e| anyhow::anyhow!(e))?;
         tracing::info!(bus_id = bus.id, label = %bus.label, channels = bus.channels, "bus ready (pure summer)");
         buses.push(bus);
     }
@@ -90,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
             id: b.id,
             label: auto.label.clone().unwrap_or_else(|| b.label.clone()),
             channels: b.channels,
+            layout: b.layout,
             fader_db: auto.fader_db,
             template: auto.template,
             chain: auto.chain.clone(),
@@ -100,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     // construction.
     let mut masters = Vec::with_capacity(master_configs.len());
     for m in &master_configs {
-        let master = topology::build_master(m, default_channels, cfg.sample_rate, false);
+        let master = topology::build_master(m, default_channels, cfg.sample_rate, false).map_err(|e| anyhow::anyhow!(e))?;
         tracing::info!(master_id = master.id, label = %master.label, channels = master.channels, "master track ready");
         masters.push(master);
     }
@@ -122,7 +125,10 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(t) if tracks.iter().any(|existing| existing.id == t.id) => {
                                     tracing::warn!(track_id = t.id, "state file: dynamically-created track collides with a config-authored id, skipped");
                                 }
-                                Ok(t) => tracks.push(topology::build_track(&t, default_channels, cfg.sample_rate, true)),
+                                Ok(t) => match topology::build_track(&t, default_channels, cfg.sample_rate, true) {
+                                    Ok(track) => tracks.push(track),
+                                    Err(e) => tracing::warn!(track_id = t.id, error = %e, "state file: dynamically-created track has an inconsistent channels/layout, skipped"),
+                                },
                                 Err(e) => tracing::warn!(id = %id_str, error = %e, "state file: malformed dynamically-created track topology, skipped"),
                             }
                         }
@@ -133,7 +139,10 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(b) if buses.iter().any(|existing| existing.id == b.id) => {
                                     tracing::warn!(bus_id = b.id, "state file: dynamically-created bus collides with a config-authored id, skipped");
                                 }
-                                Ok(b) => buses.push(topology::build_bus(&b, default_channels, true)),
+                                Ok(b) => match topology::build_bus(&b, default_channels, true) {
+                                    Ok(bus) => buses.push(bus),
+                                    Err(e) => tracing::warn!(bus_id = b.id, error = %e, "state file: dynamically-created bus has an inconsistent channels/layout, skipped"),
+                                },
                                 Err(e) => tracing::warn!(id = %id_str, error = %e, "state file: malformed dynamically-created bus topology, skipped"),
                             }
                         }
@@ -144,7 +153,10 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(m) if masters.iter().any(|existing| existing.id == m.id) => {
                                     tracing::warn!(master_id = m.id, "state file: dynamically-created master collides with a config-authored id, skipped");
                                 }
-                                Ok(m) => masters.push(topology::build_master(&m, default_channels, cfg.sample_rate, true)),
+                                Ok(m) => match topology::build_master(&m, default_channels, cfg.sample_rate, true) {
+                                    Ok(master) => masters.push(master),
+                                    Err(e) => tracing::warn!(master_id = m.id, error = %e, "state file: dynamically-created master has an inconsistent channels/layout, skipped"),
+                                },
                                 Err(e) => tracing::warn!(id = %id_str, error = %e, "state file: malformed dynamically-created master topology, skipped"),
                             }
                         }
@@ -192,7 +204,9 @@ async fn main() -> anyhow::Result<()> {
     // same way, waiting for IS-05 activation (`nmos/server.rs::receiver_patch`).
     let input_grid = patch::InputGrid::default();
     for entry in &cfg.input_grid {
-        let channels = entry.channels.unwrap_or(cfg.channels) as usize;
+        let channels = layout::resolve_channels(&format!("input grid entry {}", entry.id), entry.channels, entry.layout)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .unwrap_or(cfg.channels) as usize;
         let receiver_id = ids::instance_input_receiver_id(&cfg.instance_name, &entry.id);
         let reader = match &entry.source {
             Some(source) => {
@@ -217,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
             id: entry.id.clone(),
             label: entry.label.clone(),
             channels,
+            layout: entry.layout,
             reader: std::sync::Mutex::new(reader),
             meter_db: std::sync::Mutex::new(vec![f32::NEG_INFINITY; channels]),
             receiver_id,
@@ -232,7 +247,9 @@ async fn main() -> anyhow::Result<()> {
     // now (PICKOFFS.md's own intro) -- neither a bus's nor a master's own signal is itself NMOS-visible.
     let output_grid = patch::OutputGrid::default();
     for entry in &cfg.output_grid {
-        let channels = entry.channels.unwrap_or(cfg.channels) as usize;
+        let channels = layout::resolve_channels(&format!("output grid entry {}", entry.id), entry.channels, entry.layout)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .unwrap_or(cfg.channels) as usize;
         let flow_id = entry.resolve_flow_id(&cfg.instance_name);
         let writer = FlowWriter::create(
             &cfg.mxl_domain,
@@ -249,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
             id: entry.id.clone(),
             label: entry.label.clone(),
             channels,
+            layout: entry.layout,
             writer: std::sync::Mutex::new(writer),
             meter_db: std::sync::Mutex::new(vec![f32::NEG_INFINITY; channels]),
             flow_id,
@@ -360,9 +378,33 @@ async fn main() -> anyhow::Result<()> {
     // complexity for a test app; see the redundancy design note in kube-example.yaml for what this
     // is actually for -- the probe that decides "this container needs replacing", which is what a
     // SIGTERM-triggered final state save (above) then has a chance to react to.
+    // Serial ADM (ITU-R BS.2125) export/import (Phase E, adm.rs) -- a plain HTTP route rather than
+    // going through the amixer WS protocol, since this is a whole-document snapshot/replace, not a
+    // per-field live control (that's what `channel/{id}/adm-object` over WS is for).
+    let adm_mixer_get = mixer.clone();
+    let adm_mixer_post = mixer.clone();
     let app = nmos::server::router(nmos_state)
         .merge(ws::router(ws_state))
-        .route("/healthz", axum::routing::get(|| async { "ok" }));
+        .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/adm.xml",
+            axum::routing::get(move || {
+                let mixer = adm_mixer_get.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, "application/xml")], adm::to_sadm_xml(&mixer)) }
+            })
+            .post(move |body: String| {
+                let mixer = adm_mixer_post.clone();
+                async move {
+                    match adm::from_sadm_xml(&body) {
+                        Ok(updates) => {
+                            let applied = adm::apply_sadm_updates(&mixer, &updates);
+                            (axum::http::StatusCode::OK, format!("applied {applied} of {} object update(s)\n", updates.len()))
+                        }
+                        Err(e) => (axum::http::StatusCode::BAD_REQUEST, format!("invalid S-ADM XML: {e}\n")),
+                    }
+                }
+            }),
+        );
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", cfg.ws_port))
         .await
         .map_err(|e| anyhow::anyhow!("binding HTTP server to 0.0.0.0:{}: {e}", cfg.ws_port))?;

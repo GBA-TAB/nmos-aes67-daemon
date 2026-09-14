@@ -116,6 +116,10 @@ pub struct InputGridEntry {
     pub id: String,
     pub label: String,
     pub channels: usize,
+    /// This entry's own standard layout, if any -- see `layout::ChannelLayout`. Not yet consumed
+    /// anywhere (a Receiver's NMOS JSON has no `channels[]` label array to fill in, unlike a
+    /// Source/Flow) -- stored here for parity with `OutputGridEntry::layout` and any future use.
+    pub layout: Option<crate::layout::ChannelLayout>,
     /// `std::sync::Mutex`, not `tokio::sync::Mutex`: the audio engine (a plain OS thread) needs a
     /// blocking lock every period, and async callers (nmos/server.rs) only ever hold it briefly to
     /// open/replace it at insert time, never across an `.await` — same reasoning as `mixer.rs`'s
@@ -181,6 +185,10 @@ pub struct OutputGridEntry {
     pub id: String,
     pub label: String,
     pub channels: usize,
+    /// This entry's own standard layout, if any -- see `layout::ChannelLayout`. When set,
+    /// `nmos/resources.rs::channels_json` emits each channel's real speaker label instead of the
+    /// generic "Channel N" for this entry's mirrored Source/Flow.
+    pub layout: Option<crate::layout::ChannelLayout>,
     pub writer: Mutex<FlowWriter>,
     /// This `output:<id>` pickoff point's own peak — same shape/convention as
     /// `InputGridEntry.meter_db`, written by the engine once per period (`engine.rs` step 6, right
@@ -659,6 +667,8 @@ mod tests {
                         id: i as u32,
                         label: format!("T{i}"),
                         channels: None,
+                        layout: None,
+                        adm_object: None,
                         sends: vec![],
                         gain_db: 0.0,
                         fader_db: 0.0,
@@ -679,6 +689,7 @@ mod tests {
                 id: id.to_string(),
                 label: id.to_string(),
                 channels,
+                layout: None,
                 reader: Mutex::new(None),
                 meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
                 receiver_id: uuid::Uuid::new_v4(),

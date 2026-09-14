@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::mixer::{
-    compute_compensation, db_to_linear, is_muted, is_on, is_soloed, mix_into_scaled, peak_to_db, Bus, LatencyCompensation, MasterTrack,
+    compute_compensation, db_to_linear, is_muted, is_on, is_soloed, mix_into_scaled, mix_into_scaled_with_layout, peak_to_db, Bus, LatencyCompensation, MasterTrack,
     PickoffPoint, Track,
 };
 use crate::patch::{InputGrid, OutputGrid, PatchState};
@@ -450,9 +450,10 @@ pub fn run(state: Arc<MixerState>) {
                     };
                     let level = db_to_linear(*send.level_db.lock().unwrap());
                     // Startup validation (main.rs) / CREATE validation (topology.rs) already warned
-                    // about any incompatible track/bus channel-count pairing -- mix_into_scaled
-                    // itself just quietly no-ops for one, doesn't need to log here too.
-                    mix_into_scaled(src, dst, period, level);
+                    // about any track/bus channel-count pairing neither a real downmix matrix nor
+                    // the count-only rule can handle -- mix_into_scaled_with_layout itself just
+                    // quietly no-ops for one, doesn't need to log here too.
+                    mix_into_scaled_with_layout(src, dst, period, level, track.layout, bus.layout);
                 }
             }
             // --- Step 4: resolve this bus's input-patch (summing, alongside the sends above) into
@@ -568,15 +569,15 @@ mod tests {
     use crate::config::{BusConfig, MasterTrackConfig, TrackConfig};
 
     fn track(id: u32, channels: usize) -> Arc<Track> {
-        Arc::new(Track::new(&TrackConfig { id, label: format!("T{id}"), channels: None, sends: vec![], gain_db: 0.0, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels, 48000))
+        Arc::new(Track::new(&TrackConfig { id, label: format!("T{id}"), channels: None, layout: None, adm_object: None, sends: vec![], gain_db: 0.0, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels, 48000))
     }
 
     fn bus(id: u32, channels: usize) -> Arc<Bus> {
-        Arc::new(Bus::new(&BusConfig { id, label: format!("B{id}"), channels: None, auto_master: None }, channels))
+        Arc::new(Bus::new(&BusConfig { id, label: format!("B{id}"), channels: None, layout: None, auto_master: None }, channels))
     }
 
     fn master(id: u32, channels: usize) -> Arc<MasterTrack> {
-        Arc::new(MasterTrack::new(&MasterTrackConfig { id, label: format!("M{id}"), channels: None, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels, 48000))
+        Arc::new(MasterTrack::new(&MasterTrackConfig { id, label: format!("M{id}"), channels: None, layout: None, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels, 48000))
     }
 
     #[test]

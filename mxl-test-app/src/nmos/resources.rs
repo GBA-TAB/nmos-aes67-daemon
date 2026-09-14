@@ -94,7 +94,17 @@ pub fn device_json(
     })
 }
 
-fn channels_json(count: u32) -> serde_json::Value {
+/// Emits real speaker labels (`ChannelRole::short_name`, e.g. `"L"`/`"C"`/`"LFE"`) when `layout`
+/// is a named layout with real roles; falls back to today's generic `"Channel N"` labels when it's
+/// `None`/`Discrete` or its role count doesn't match `count` (defensive — `resolve_channels`
+/// already guarantees agreement at construction time, but this function has no way to hard-fail).
+fn channels_json(count: u32, layout: Option<crate::layout::ChannelLayout>) -> serde_json::Value {
+    if let Some(layout) = layout {
+        let roles = layout.roles();
+        if roles.len() as u32 == count {
+            return roles.iter().map(|r| serde_json::json!({ "label": r.short_name() })).collect();
+        }
+    }
     (0..count).map(|i| serde_json::json!({ "label": format!("Channel {}", i + 1) })).collect()
 }
 
@@ -111,7 +121,7 @@ pub fn source_json(cfg: &Config, device_id: uuid::Uuid, entry: &OutputGridEntry,
         "grain_rate": { "numerator": cfg.sample_rate, "denominator": 1 },
         "caps": {},
         "format": "urn:x-nmos:format:audio",
-        "channels": channels_json(entry.channels as u32)
+        "channels": channels_json(entry.channels as u32, entry.layout)
     })
 }
 
@@ -137,7 +147,7 @@ pub fn flow_json(
         "media_type": "audio/float32",
         "sample_rate": { "numerator": cfg.sample_rate, "denominator": 1 },
         "bit_depth": 32,
-        "channels": channels_json(entry.channels as u32)
+        "channels": channels_json(entry.channels as u32, entry.layout)
     })
 }
 
@@ -206,4 +216,39 @@ fn hostname() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "mxl-test-app".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::ChannelLayout;
+
+    #[test]
+    fn channels_json_with_no_layout_falls_back_to_generic_channel_labels() {
+        let json = channels_json(3, None);
+        assert_eq!(json, serde_json::json!([{"label": "Channel 1"}, {"label": "Channel 2"}, {"label": "Channel 3"}]));
+    }
+
+    #[test]
+    fn channels_json_with_a_named_layout_emits_real_speaker_labels() {
+        let json = channels_json(6, Some(ChannelLayout::Surround5_1));
+        assert_eq!(
+            json,
+            serde_json::json!([{"label": "L"}, {"label": "R"}, {"label": "C"}, {"label": "LFE"}, {"label": "Ls"}, {"label": "Rs"}])
+        );
+    }
+
+    #[test]
+    fn channels_json_falls_back_when_layout_role_count_disagrees_with_count() {
+        // Defensive path only -- resolve_channels already guarantees this can't happen for a real
+        // resource, but channels_json has no way to hard-fail, so it degrades gracefully instead.
+        let json = channels_json(4, Some(ChannelLayout::Surround5_1));
+        assert_eq!(json, serde_json::json!([{"label": "Channel 1"}, {"label": "Channel 2"}, {"label": "Channel 3"}, {"label": "Channel 4"}]));
+    }
+
+    #[test]
+    fn channels_json_with_discrete_layout_falls_back_to_generic_channel_labels() {
+        let json = channels_json(2, Some(ChannelLayout::Discrete(2)));
+        assert_eq!(json, serde_json::json!([{"label": "Channel 1"}, {"label": "Channel 2"}]));
+    }
 }

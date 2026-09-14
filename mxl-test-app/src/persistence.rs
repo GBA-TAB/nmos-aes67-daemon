@@ -30,6 +30,15 @@ use std::sync::atomic::Ordering;
 use crate::engine::MixerState;
 use crate::mixer::MasterTrack;
 
+/// `null` for an ordinary bed track (no `adm_object` slot at all -- `mixer::Track::adm_object` is
+/// `None`), the live `adm::AdmObjectMetadata` value otherwise. Shared by both `capture`'s per-track
+/// live-value section and its dynamically-created-topology section (a dynamically-created
+/// ADM-object track's own topology reconstruction, `main.rs`, re-creates the slot itself from the
+/// same field -- see `config::TrackConfig::adm_object`'s own doc comment).
+fn adm_object_json(t: &crate::mixer::Track) -> serde_json::Value {
+    t.adm_object.as_ref().map(|slot| serde_json::to_value(&*slot.lock().unwrap()).unwrap()).unwrap_or(serde_json::Value::Null)
+}
+
 /// Snapshots every track's, bus's, and master's current live state into one JSON document. A bus
 /// is a pure summer now (see mixer::Bus's own docs) — only its own `input_patch` (bus-in) is
 /// captured; fader/mute/DSP all moved to masters.
@@ -49,6 +58,7 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
                 "sends": crate::ws::sends_json(t),
                 "chain": crate::ws::chain_json(&t.chain),
                 "input_patch": mixer.patch.track_in_json(t.id, t.channels),
+                "adm_object": adm_object_json(t),
             });
             (t.id.to_string(), value)
         })
@@ -91,6 +101,7 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
                 "sends": crate::ws::sends_json(t),
                 "gain_db": *t.gain_db.lock().unwrap(),
                 "fader_db": *t.fader_db.lock().unwrap(),
+                "adm_object": adm_object_json(t),
             });
             (t.id.to_string(), value)
         })
@@ -161,6 +172,12 @@ pub fn apply_snapshot(mixer: &MixerState, snapshot: &serde_json::Value) {
                 }
             }
             apply_chain_snapshot(&track.chain, t.get("chain"));
+            if let (Some(slot), Some(v)) = (&track.adm_object, t.get("adm_object").filter(|v| !v.is_null())) {
+                match serde_json::from_value::<crate::adm::AdmObjectMetadata>(v.clone()) {
+                    Ok(meta) => *slot.lock().unwrap() = meta,
+                    Err(e) => tracing::warn!(track_id = track.id, error = %e, "state file: malformed adm_object, skipped"),
+                }
+            }
             if let Some(v) = t.get("input_patch") {
                 match crate::patch::PatchState::parse_track_in(v) {
                     Ok(patch) => {
@@ -315,6 +332,8 @@ mod tests {
                         id,
                         label: format!("T{i}"),
                         channels: None,
+                        layout: None,
+                        adm_object: None,
                         sends: vec![],
                         gain_db: 0.0,
                         fader_db: 0.0,
@@ -337,6 +356,7 @@ mod tests {
                         id,
                         label: format!("M{i}"),
                         channels: None,
+                        layout: None,
                         fader_db: 0.0,
                         template: ChannelTemplate::FullChannel,
                         chain: vec![],
@@ -382,6 +402,69 @@ mod tests {
         assert_eq!(*fresh_track0.fader_db.lock().unwrap(), -12.0);
         assert!(fresh_track0.mute.load(Ordering::Relaxed));
         assert!(fresh_track0.solo.load(Ordering::Relaxed));
+    }
+
+    fn track_with_adm_object(id: u32, channels: usize, name: &str) -> Arc<Track> {
+        Arc::new(Track::new(
+            &TrackConfig {
+                id,
+                label: format!("T{id}"),
+                channels: None,
+                layout: None,
+                adm_object: Some(crate::adm::AdmObjectMetadata {
+                    name: name.to_string(),
+                    gain_db: 0.0,
+                    position: crate::adm::AdmPosition::default(),
+                    width: 0.0,
+                    height: 0.0,
+                    depth: 0.0,
+                }),
+                sends: vec![],
+                gain_db: 0.0,
+                fader_db: 0.0,
+                template: ChannelTemplate::FullChannel,
+                chain: vec![],
+            },
+            channels,
+            48000,
+        ))
+    }
+
+    #[test]
+    fn capture_apply_round_trips_adm_object_metadata() {
+        let mixer = test_mixer(&[2]);
+        mixer.tracks.lock().unwrap().insert(0, track_with_adm_object(0, 2, "Dialogue"));
+        let track0 = mixer.tracks.lock().unwrap().get(&0).unwrap().clone();
+        *track0.adm_object.as_ref().unwrap().lock().unwrap() = crate::adm::AdmObjectMetadata {
+            name: "Dialogue".to_string(),
+            gain_db: -6.0,
+            position: crate::adm::AdmPosition { azimuth: 45.0, elevation: 15.0, distance: 1.0 },
+            width: 0.1,
+            height: 0.0,
+            depth: 0.0,
+        };
+
+        let snapshot = capture(&mixer);
+        assert_eq!(snapshot["tracks"]["0"]["adm_object"]["name"], "Dialogue");
+
+        let fresh = test_mixer(&[2]);
+        fresh.tracks.lock().unwrap().insert(0, track_with_adm_object(0, 2, "Dialogue"));
+        apply_snapshot(&fresh, &snapshot);
+        let fresh_track0 = fresh.tracks.lock().unwrap().get(&0).unwrap().clone();
+        let resumed = fresh_track0.adm_object.as_ref().unwrap().lock().unwrap().clone();
+        assert_eq!(resumed.gain_db, -6.0);
+        assert_eq!(resumed.position.azimuth, 45.0);
+        assert_eq!(resumed.position.elevation, 15.0);
+        assert_eq!(resumed.width, 0.1);
+    }
+
+    #[test]
+    fn capture_reports_null_adm_object_for_an_ordinary_bed_track() {
+        // test_mixer's own tracks are all ordinary bed tracks (adm_object: None) -- confirms
+        // capture doesn't invent a value for a track that never had a slot to begin with.
+        let mixer = test_mixer(&[2]);
+        let snapshot = capture(&mixer);
+        assert!(snapshot["tracks"]["0"]["adm_object"].is_null());
     }
 
     /// `test_mixer`'s tracks/masters are built with `template: FullChannel` and an empty `chain`,
@@ -457,7 +540,7 @@ mod tests {
 
         let created = crate::topology::create_track(
             &mixer,
-            &TrackConfig { id: 99, label: "Dyn".into(), channels: Some(2), sends: vec![], gain_db: 1.0, fader_db: 0.0, template: ChannelTemplate::Simple, chain: vec![] },
+            &TrackConfig { id: 99, label: "Dyn".into(), channels: Some(2), layout: None, adm_object: None, sends: vec![], gain_db: 1.0, fader_db: 0.0, template: ChannelTemplate::Simple, chain: vec![] },
         )
         .unwrap();
         assert!(created.dynamically_created);

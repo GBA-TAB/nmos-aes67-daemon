@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use crate::config::{BusConfig, MasterTrackConfig, TrackConfig};
 use crate::dsp::ProcessingStage;
+use crate::layout::ChannelLayout;
 
 /// Where in a track's own chain a `Send` taps its signal from. Real consoles (see
 /// `~/DEV/yam bus.png`, a Yamaha "CH to MIX" send diagram) offer taps before/after several
@@ -48,6 +49,11 @@ pub struct Track {
     /// track's and bus's own count, resolved once at startup from `TrackConfig::channels` (see
     /// `main.rs`).
     pub channels: usize,
+    /// This track's own standard layout, if any -- see `layout::ChannelLayout`. `None` for a
+    /// bare `Discrete`/no-role count, same as `channels` alone meant before this field existed.
+    /// Consulted by `mix_into_scaled_with_layout` (`engine.rs`) to pick a real downmix matrix
+    /// instead of the count-only fallback rule when sending into a bus of a different width.
+    pub layout: Option<ChannelLayout>,
     pub gain_db: Mutex<f32>,
     pub fader_db: Mutex<f32>,
     pub mute: AtomicBool,
@@ -87,6 +93,12 @@ pub struct Track {
     /// tracks need their full topology (not just live values) saved so they can be reconstructed on
     /// the next restart -- see PICKOFFS.md §6.
     pub dynamically_created: bool,
+    /// `Some` only for a track explicitly authored as a real ADM audio object -- see
+    /// `adm::AdmObjectMetadata`'s own doc comment. Live-controllable via `channel/{id}/adm-object`
+    /// (`ws.rs`) and persisted the same way every other live track value is (`persistence.rs`).
+    /// `None` for an ordinary bed/channel track -- the default, and the only possibility before
+    /// this field existed.
+    pub adm_object: Option<Mutex<crate::adm::AdmObjectMetadata>>,
 }
 
 impl Track {
@@ -99,6 +111,7 @@ impl Track {
             id: cfg.id,
             label: cfg.label.clone(),
             channels,
+            layout: cfg.layout,
             gain_db: Mutex::new(cfg.gain_db),
             fader_db: Mutex::new(cfg.fader_db),
             mute: AtomicBool::new(false),
@@ -110,6 +123,7 @@ impl Track {
             chain: crate::config::build_chain(&cfg.chain, cfg.template, channels, sample_rate),
             compensation_delay_samples: AtomicUsize::new(0),
             dynamically_created,
+            adm_object: cfg.adm_object.clone().map(Mutex::new),
         }
     }
 }
@@ -129,6 +143,9 @@ pub struct Bus {
     pub label: String,
     /// This bus's own channel count — see `Track::channels`'s docs, same idea.
     pub channels: usize,
+    /// This bus's own standard layout, if any -- see `Track::layout`'s own doc, same idea and
+    /// same consumer (`mix_into_scaled_with_layout`).
+    pub layout: Option<ChannelLayout>,
     /// This bus's own post-sum peak, one value per channel, in dBFS — `bus-out:<id>`'s own pickoff
     /// meter. This is the bus's only/final value (no fader stage exists to distinguish a separate
     /// "post-fader" reading from) — it's what `output_prev` snapshots too.
@@ -158,6 +175,7 @@ impl Bus {
             id: cfg.id,
             label: cfg.label.clone(),
             channels,
+            layout: cfg.layout,
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             input_meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
             output_prev: Mutex::new(vec![Vec::new(); channels]),
@@ -181,6 +199,10 @@ pub struct MasterTrack {
     pub label: String,
     /// This master's own channel count — see `Track::channels`'s docs, same idea.
     pub channels: usize,
+    /// This master's own standard layout, if any -- see `Track::layout`'s own doc. Not yet
+    /// consumed by any downmix path (a master has no `Send`s of its own to mismatch against),
+    /// stored for Phase C's real NMOS speaker labels and Phase D/E's ADM metadata.
+    pub layout: Option<ChannelLayout>,
     pub fader_db: Mutex<f32>,
     pub mute: AtomicBool,
     /// Post-fader peak, one value per channel, in dBFS — this *is* `master-out:<id>`'s value.
@@ -218,6 +240,7 @@ impl MasterTrack {
             id: cfg.id,
             label: cfg.label.clone(),
             channels,
+            layout: cfg.layout,
             fader_db: Mutex::new(cfg.fader_db),
             mute: AtomicBool::new(false),
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
@@ -233,6 +256,15 @@ impl MasterTrack {
 /// dB -> linear amplitude multiplier.
 pub fn db_to_linear(db: f32) -> f32 {
     10f32.powf(db / 20.0)
+}
+
+/// linear amplitude multiplier -> dB -- the inverse of `db_to_linear`, used at `adm.rs`'s Serial
+/// ADM XML boundary (ADM's own `<gain>` element is linear, this app's own fields are dB
+/// everywhere else). Clamps away from exactly `0.0` (`-inf` dB) since a real S-ADM document
+/// legitimately can carry a `0.0` gain (fully muted object) and `log10(0.0)` would otherwise
+/// produce `-inf`, which `AdmObjectMetadata.gain_db: f32`'s own callers don't expect to handle.
+pub fn linear_to_db(linear: f32) -> f32 {
+    20.0 * linear.max(1e-9).log10()
 }
 
 /// Engine-owned, invisible sample-alignment delay -- keeps a track's/master's final output in step
@@ -343,11 +375,122 @@ pub fn mix_into_scaled(src: &[Vec<f32>], dst: &mut [Vec<f32>], frames: usize, sc
     }
 }
 
+/// The classic ITU-R BS.775 downmix constant (~-3 dB, "half power") — the real coefficient in the
+/// standard 5.1->stereo downmix equation `Lo = L + 0.707*C + 0.707*Ls`, `Ro = R + 0.707*C +
+/// 0.707*Rs` (LFE excluded, the common broadcast-downmix convention). Verified directly, not
+/// guessed — this exact equation is the industry-standard reference every other coefficient below
+/// extrapolates from.
+const DOWNMIX_COEFF: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+/// A layout-aware downmix matrix: `matrix[dst_channel][src_channel]` is the linear gain applied to
+/// that source channel on the way into that destination channel. Row/column order matches each
+/// layout's own `ChannelLayout::roles()` order exactly (hardcoded here rather than built from role
+/// lookups, since both layouts and their order are fixed, known quantities at every one of the 5
+/// call sites below).
+///
+/// Only the specific standard paths below are implemented — every other layout pair (including
+/// any pairing where either side is `Discrete`/has no roles) returns `None`, and the caller
+/// (`mix_into_scaled_with_layout`) falls back to `mix_into_scaled`'s existing byte-identical
+/// 3-case rule. Nothing changes for a deployment that doesn't use named layouts.
+///
+/// Verified directly against ITU-R BS.775's own downmix equation: **5.1 -> stereo** only
+/// (`DOWNMIX_COEFF`'s own doc). The other four paths (7.1->stereo, 7.1->5.1, 5.1.4->5.1,
+/// 5.1.4->stereo) are a **principled but not independently spec-verified** extrapolation of that
+/// same rule — every source role with no destination match folds into its nearest front/surround
+/// counterpart at the same -3 dB coefficient (a height channel folding through an intermediate bed
+/// channel compounds to two -3 dB steps, i.e. ~-6 dB/0.5 linear, e.g. 5.1.4->stereo's `Ltf`/`Ltb`
+/// contributions). Reasonable and internally consistent, but revisit against a specific published
+/// standard (ITU-R BS.775 Annex 4, or Dolby's own Atmos-bed downmix guidance for the height paths)
+/// before relying on it for mastering-critical use.
+fn downmix_matrix(src: ChannelLayout, dst: ChannelLayout) -> Option<Vec<Vec<f32>>> {
+    use ChannelLayout::*;
+    let k = DOWNMIX_COEFF;
+    let kk = k * k;
+    match (src, dst) {
+        // src: L, R, C, Lfe, Ls, Rs -- dst: L, R
+        (Surround5_1, Stereo) => Some(vec![
+            vec![1.0, 0.0, k, 0.0, k, 0.0],
+            vec![0.0, 1.0, k, 0.0, 0.0, k],
+        ]),
+        // src: L, R, C, Lfe, Lss, Rss, Lrs, Rrs -- dst: L, R
+        (Surround7_1, Stereo) => Some(vec![
+            vec![1.0, 0.0, k, 0.0, k, 0.0, k, 0.0],
+            vec![0.0, 1.0, k, 0.0, 0.0, k, 0.0, k],
+        ]),
+        // src: L, R, C, Lfe, Lss, Rss, Lrs, Rrs -- dst: L, R, C, Lfe, Ls, Rs
+        (Surround7_1, Surround5_1) => Some(vec![
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+        ]),
+        // src: L, R, C, Lfe, Ls, Rs, Ltf, Rtf, Ltb, Rtb -- dst: L, R, C, Lfe, Ls, Rs
+        (Surround5_1_4, Surround5_1) => Some(vec![
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, k, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, k, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, k, 0.0],
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, k],
+        ]),
+        // src: L, R, C, Lfe, Ls, Rs, Ltf, Rtf, Ltb, Rtb -- dst: L, R
+        (Surround5_1_4, Stereo) => Some(vec![
+            vec![1.0, 0.0, k, 0.0, k, 0.0, kk, 0.0, kk, 0.0],
+            vec![0.0, 1.0, k, 0.0, 0.0, k, 0.0, kk, 0.0, kk],
+        ]),
+        _ => None,
+    }
+}
+
+/// Layout-aware variant of `mix_into_scaled`: when both `src_layout` and `dst_layout` are known
+/// and `downmix_matrix` defines a real matrix for that specific pair, applies it instead of
+/// `mix_into_scaled`'s own count-only rule. Falls back to `mix_into_scaled` unchanged — same
+/// silent-no-op-for-an-unhandled-mismatch behavior — whenever either layout is unknown/`Discrete`
+/// or `downmix_matrix` has no entry for this pair, so a deployment that never sets `layout` is
+/// completely unaffected by this function's existence.
+pub fn mix_into_scaled_with_layout(
+    src: &[Vec<f32>],
+    dst: &mut [Vec<f32>],
+    frames: usize,
+    scale: f32,
+    src_layout: Option<ChannelLayout>,
+    dst_layout: Option<ChannelLayout>,
+) {
+    if let (Some(sl), Some(dl)) = (src_layout, dst_layout) {
+        if let Some(matrix) = downmix_matrix(sl, dl) {
+            if matrix.len() == dst.len() && matrix.iter().all(|row| row.len() == src.len()) {
+                for (dst_ch, row) in dst.iter_mut().zip(matrix.iter()) {
+                    for (src_ch, &gain) in src.iter().zip(row.iter()) {
+                        if gain == 0.0 {
+                            continue;
+                        }
+                        let g = gain * scale;
+                        for i in 0..frames {
+                            dst_ch[i] += src_ch[i] * g;
+                        }
+                    }
+                }
+                return;
+            }
+        }
+    }
+    mix_into_scaled(src, dst, frames, scale);
+}
+
 /// True if `mix_into` can actually do something meaningful for these two channel counts (used at
 /// startup to validate every track-to-bus assignment once, rather than silently no-op'ing forever
 /// at audio rate for a mismatched pair — see `mix_into`'s own docs for which combinations work).
 pub fn channels_compatible(track_channels: usize, bus_channels: usize) -> bool {
     track_channels == bus_channels || track_channels == 1 || bus_channels == 1
+}
+
+/// True if `mix_into_scaled_with_layout` has a real downmix matrix for this specific
+/// (track, bus) layout pair — used alongside `channels_compatible` so `warn_incompatible_sends`
+/// doesn't flag a send `downmix_matrix` (`mixer.rs`) actually knows how to handle.
+pub fn layouts_compatible(src: Option<ChannelLayout>, dst: Option<ChannelLayout>) -> bool {
+    matches!((src, dst), (Some(s), Some(d)) if downmix_matrix(s, d).is_some())
 }
 
 /// Peak sample magnitude in a block -> dBFS (`NEG_INFINITY` for exact silence, matching the
@@ -413,6 +556,50 @@ mod tests {
     }
 
     #[test]
+    fn surround_5_1_into_stereo_applies_the_bs775_downmix_matrix() {
+        // L=1, R=2, C=3, LFE=4 (excluded), Ls=5, Rs=6 -- one frame.
+        let src = vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0], vec![6.0]];
+        let mut dst = vec![vec![0.0], vec![0.0]];
+        mix_into_scaled_with_layout(&src, &mut dst, 1, 1.0, Some(ChannelLayout::Surround5_1), Some(ChannelLayout::Stereo));
+        let k = DOWNMIX_COEFF;
+        assert_eq!(dst[0][0], 1.0 + k * 3.0 + k * 5.0);
+        assert_eq!(dst[1][0], 2.0 + k * 3.0 + k * 6.0);
+    }
+
+    #[test]
+    fn surround_7_1_into_5_1_sums_side_and_rear_surrounds_into_the_narrower_surround_pair() {
+        // L,R,C,LFE,Lss,Rss,Lrs,Rrs = 1..8.
+        let src: Vec<Vec<f32>> = (1..=8).map(|n| vec![n as f32]).collect();
+        let mut dst = vec![vec![0.0]; 6];
+        mix_into_scaled_with_layout(&src, &mut dst, 1, 1.0, Some(ChannelLayout::Surround7_1), Some(ChannelLayout::Surround5_1));
+        assert_eq!(dst, vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0 + 7.0], vec![6.0 + 8.0]]);
+    }
+
+    #[test]
+    fn unknown_layout_pair_falls_back_to_the_count_only_rule_unchanged() {
+        // Quad (4ch, a layout with no defined downmix matrix at all) into stereo -- both layouts
+        // known, but `downmix_matrix` has no entry for this pair, so behavior must be byte-
+        // identical to calling `mix_into_scaled` directly (today's existing "any other mismatch is
+        // a no-op" rule).
+        let src = vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0]];
+        let mut with_layout = vec![vec![0.0], vec![0.0]];
+        let mut without_layout = with_layout.clone();
+        mix_into_scaled_with_layout(&src, &mut with_layout, 1, 1.0, Some(ChannelLayout::Quad), Some(ChannelLayout::Stereo));
+        mix_into_scaled(&src, &mut without_layout, 1, 1.0);
+        assert_eq!(with_layout, without_layout);
+    }
+
+    #[test]
+    fn no_layout_info_falls_back_to_the_count_only_rule_unchanged() {
+        // Mono into stereo with no layout on either side -- confirms mix_into_scaled_with_layout
+        // reproduces mix_into_scaled's existing dual-mono behavior exactly when layout is unknown.
+        let src = vec![vec![2.0, 4.0]];
+        let mut with_layout = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+        mix_into_scaled_with_layout(&src, &mut with_layout, 2, 1.0, None, None);
+        assert_eq!(with_layout, vec![vec![2.0, 4.0], vec![2.0, 4.0]]);
+    }
+
+    #[test]
     fn compute_compensation_examples() {
         assert_eq!(compute_compensation(&[0, 5, 3]), vec![5, 0, 2]);
         assert_eq!(compute_compensation(&[0, 0, 0]), vec![0, 0, 0]);
@@ -474,6 +661,8 @@ mod tests {
             id: 0,
             label: "T".to_string(),
             channels: None,
+            layout: None,
+            adm_object: None,
             sends: vec![],
             gain_db: 0.0,
             fader_db: 0.0,

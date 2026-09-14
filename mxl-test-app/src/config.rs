@@ -120,6 +120,13 @@ pub struct InputGridEntryConfig {
     /// as `TrackConfig`/`BusConfig`.
     #[serde(default)]
     pub channels: Option<u32>,
+    /// This entry's own standard channel layout, if any — see `layout::ChannelLayout`. `None`
+    /// (default) behaves exactly as before: a bare `channels` count with no role semantics, and
+    /// `nmos/resources.rs::channels_json` falls back to its existing generic "Channel N" labels.
+    /// When set, its `channel_count()` must agree with an explicit `channels` (validated at
+    /// startup, see `main.rs`'s layout-validation pass) and supplies `channels` when unset.
+    #[serde(default)]
+    pub layout: Option<crate::layout::ChannelLayout>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -131,6 +138,16 @@ pub struct TrackConfig {
     /// for how a mismatch against an assigned bus is handled.
     #[serde(default)]
     pub channels: Option<u32>,
+    /// See `InputGridEntryConfig::layout`'s own doc comment - same convention, same validation.
+    #[serde(default)]
+    pub layout: Option<crate::layout::ChannelLayout>,
+    /// `None` (default) for an ordinary bed/channel track. `Some` only for a track explicitly
+    /// authored as a real ADM audio object — see `adm::AdmObjectMetadata`'s own doc comment for
+    /// the full field semantics. Independent of `layout`: an ADM-object track is conceptually a
+    /// single moving point source, not a bed with channel roles, though nothing stops both being
+    /// set on the same track if a future use case needs it.
+    #[serde(default)]
+    pub adm_object: Option<crate::adm::AdmObjectMetadata>,
     /// This track's own sends (`SendConfig`) — replaces the old flat `bus_assign: Vec<u32>`; a
     /// plain `{"bus_id": 0}` entry (all other fields defaulted) behaves exactly like the old
     /// bus-assign did (see `mixer::Send`'s docs on why a fixed-0dB send *is* a bus assignment, not
@@ -305,6 +322,9 @@ pub struct BusConfig {
     /// `TrackConfig::channels`'s docs.
     #[serde(default)]
     pub channels: Option<u32>,
+    /// See `InputGridEntryConfig::layout`'s own doc comment - same convention, same validation.
+    #[serde(default)]
+    pub layout: Option<crate::layout::ChannelLayout>,
     /// Small-mixer convenience: when set, `main.rs` synthesizes a paired `MasterTrackConfig` with
     /// this bus's own `id` and auto-patches `master-in:<id> <- bus-out:<id>` (channel-for-channel)
     /// at startup, reproducing today's fused bus/master behavior with zero extra authoring. `None`
@@ -343,6 +363,9 @@ pub struct MasterTrackConfig {
     pub label: String,
     #[serde(default)]
     pub channels: Option<u32>,
+    /// See `InputGridEntryConfig::layout`'s own doc comment - same convention, same validation.
+    #[serde(default)]
+    pub layout: Option<crate::layout::ChannelLayout>,
     #[serde(default)]
     pub fader_db: f32,
     #[serde(default)]
@@ -385,6 +408,9 @@ pub struct OutputGridEntryConfig {
     /// here; nothing in this app enforces a specific block size.
     #[serde(default)]
     pub channels: Option<u32>,
+    /// See `InputGridEntryConfig::layout`'s own doc comment - same convention, same validation.
+    #[serde(default)]
+    pub layout: Option<crate::layout::ChannelLayout>,
 }
 
 impl OutputGridEntryConfig {

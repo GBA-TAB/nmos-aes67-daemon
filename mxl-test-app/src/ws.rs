@@ -331,6 +331,17 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, extra: Option<
             Some(stage) => stage.apply(value),
             None => tracing::warn!(track_id = track.id, ?extra, "PUT stage rejected: no chain slot at this index"),
         },
+        // This track's ADM object metadata (`adm::AdmObjectMetadata`) -- only meaningful for a
+        // track actually constructed with `adm_object: Some(...)` (`config.rs`/`topology.rs`);
+        // PUTting this on an ordinary bed track is a silent no-op, same "the slot must already
+        // exist" convention `"stage"` above follows for an out-of-range chain index.
+        "adm-object" => match &track.adm_object {
+            Some(slot) => match serde_json::from_value::<crate::adm::AdmObjectMetadata>(value.clone()) {
+                Ok(meta) => *slot.lock().unwrap() = meta,
+                Err(e) => tracing::warn!(track_id = track.id, error = %e, "PUT adm-object: malformed value"),
+            },
+            None => tracing::warn!(track_id = track.id, "PUT adm-object rejected: track has no adm_object slot"),
+        },
         _ => {}
     }
     let echo_param = match extra { Some(idx) => format!("{param}/{idx}"), None => param.to_string() };
@@ -416,6 +427,7 @@ fn current_track_value(state: &WsState, track: &Track, param: &str, extra: Optio
             .map(|s| s.to_json())
             .unwrap_or(serde_json::Value::Null),
         "chain" => chain_json(&track.chain),
+        "adm-object" => track.adm_object.as_ref().map(|slot| serde_json::to_value(&*slot.lock().unwrap()).unwrap()).unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::Null,
     }
 }

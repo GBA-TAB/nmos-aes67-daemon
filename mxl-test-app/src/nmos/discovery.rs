@@ -134,6 +134,9 @@ fn apply_diff(state: &NmosState, known: &mut HashMap<String, Candidate>, candida
                     id: entry_id,
                     label: candidate.label.clone(),
                     channels: candidate.channels,
+                    // Auto-discovered from the network, not config-authored -- no layout info is
+                    // available to attach here.
+                    layout: None,
                     reader: std::sync::Mutex::new(Some(reader)),
                     meter_db: std::sync::Mutex::new(vec![f32::NEG_INFINITY; candidate.channels]),
                     subscribed_sender_id: std::sync::Mutex::new(None),
