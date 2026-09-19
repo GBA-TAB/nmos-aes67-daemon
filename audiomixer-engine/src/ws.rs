@@ -284,21 +284,21 @@ fn handle_create(state: &WsState, path: &str, value: Option<&serde_json::Value>)
     match kind {
         "channel" => match serde_json::from_value::<crate::config::TrackConfig>(value.clone()) {
             Ok(cfg) => match crate::topology::create_track(&state.mixer, &cfg) {
-                Ok(_) => publish_lists(state),
+                Ok(_) => publish_lists_and_init(state),
                 Err(e) => tracing::warn!(error = %e, "CREATE channel rejected"),
             },
             Err(e) => tracing::warn!(error = %e, "CREATE channel: malformed value"),
         },
         "sum" => match serde_json::from_value::<crate::config::BusConfig>(value.clone()) {
             Ok(cfg) => match crate::topology::create_bus(&state.mixer, &cfg) {
-                Ok(_) => publish_lists(state),
+                Ok(_) => publish_lists_and_init(state),
                 Err(e) => tracing::warn!(error = %e, "CREATE sum rejected"),
             },
             Err(e) => tracing::warn!(error = %e, "CREATE sum: malformed value"),
         },
         "master" => match serde_json::from_value::<crate::config::MasterTrackConfig>(value.clone()) {
             Ok(cfg) => match crate::topology::create_master(&state.mixer, &cfg) {
-                Ok(_) => publish_lists(state),
+                Ok(_) => publish_lists_and_init(state),
                 Err(e) => tracing::warn!(error = %e, "CREATE master rejected"),
             },
             Err(e) => tracing::warn!(error = %e, "CREATE master: malformed value"),
@@ -317,7 +317,7 @@ fn handle_delete(state: &WsState, path: &str) {
         _ => false,
     };
     if removed {
-        publish_lists(state);
+        publish_lists_and_init(state);
     }
 }
 
@@ -364,14 +364,33 @@ fn masters_list_json(state: &WsState) -> serde_json::Value {
     serde_json::json!(list)
 }
 
+/// The three list re-publishes alone -- cheap, and genuinely wanted on every tick
+/// (`run_meter_broadcaster`'s own call site below) as the steady-state/newly-connected-client
+/// discovery path, same reasoning `tracks_list_json`'s own doc comment already gives. Does *not*
+/// include the full `init` snapshot -- see `publish_lists_and_init` for that, and why conflating
+/// the two here was a real bug, not a simplification.
 fn publish_lists(state: &WsState) {
     publish(state, &format!("amixer/{}/channel-list", state.mixer_id), tracks_list_json(state));
     publish(state, &format!("amixer/{}/sum-list", state.mixer_id), buses_list_json(state));
     publish(state, &format!("amixer/{}/master-list", state.mixer_id), masters_list_json(state));
-    // Every call site here is a runtime CREATE/DELETE (topology.rs) -- exactly what
-    // schema.rs's own doc comment calls a real "topology change", so re-broadcasting the full
-    // init snapshot to every connected client belongs alongside these three list re-publishes,
-    // not as a separate thing callers have to remember to also trigger.
+}
+
+/// `publish_lists` plus the full `amixer/{mixerId}/init` re-broadcast -- for a genuine topology
+/// change (CREATE/DELETE) only, per schema.rs's own doc comment on when `init` should re-fire.
+/// Was previously folded into `publish_lists` itself under the assumption every one of its callers
+/// was a topology change -- wrong the moment `run_meter_broadcaster`'s own steady-state tick
+/// started calling the *list* half of this for an unrelated reason (client discovery), which
+/// dragged the *init* half along for the ride: the full schema+topology snapshot was going out on
+/// every single meter tick (25/sec at this instance's own `meter_hz`), not just on a real topology
+/// change -- and since `init`'s own topology snapshot deliberately excludes live meter values
+/// (schema.rs's own doc comment), every one of those repaints briefly showed every meter as
+/// silence before the next tick's own per-field values arrived, reading as "meters flashing/
+/// resetting to nil" client-side. A proxy client that does a full re-render on `init` (the
+/// documented, correct behavior) has no way to tell "reflects a real topology change" apart from
+/// "just noise" if this fires constantly -- so the fix is here, not in how often a client is
+/// allowed to repaint.
+fn publish_lists_and_init(state: &WsState) {
+    publish_lists(state);
     publish(state, &format!("amixer/{}/init", state.mixer_id), crate::schema::init_json(state));
 }
 
