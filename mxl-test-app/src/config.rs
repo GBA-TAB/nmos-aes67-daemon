@@ -86,6 +86,17 @@ pub struct Config {
     pub masters: Vec<MasterTrackConfig>,
 }
 
+/// Treats an explicit JSON `null` the same as the field being absent -- i.e. `T::default()` for
+/// either -- unlike plain `#[serde(default)]` alone, which only ever covers absence. See
+/// `TrackConfig.adm_objects`'s own doc comment for the real bug this exists to close.
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 fn default_nmos_registry_port() -> u16 {
     80
 }
@@ -108,7 +119,12 @@ pub struct InputGridEntryConfig {
     /// distinct from any track/bus id's own numbering, this app never confuses the two since
     /// they're different string-keyed maps.
     pub id: String,
-    pub label: String,
+    /// `None` — auto-generated at load time (`main.rs`) as `"Grid In {start:02}-{end:02}"`, the
+    /// 1-based cumulative channel range this entry occupies across the whole `input_grid` array in
+    /// declared order (the real-world patchbay/router convention: a contiguous channel range per
+    /// stream, not a hand-typed name per entry). An explicit `label` always wins.
+    #[serde(default)]
+    pub label: Option<String>,
     /// Where this entry reads from — reuses `TrackSource` unchanged (it already models "resolve to
     /// a raw MXL flow_id", exactly what an input-grid entry needs; nothing here is track-specific
     /// despite the name). `None` — starts with no reader, waiting for IS-05 receiver activation
@@ -141,13 +157,38 @@ pub struct TrackConfig {
     /// See `InputGridEntryConfig::layout`'s own doc comment - same convention, same validation.
     #[serde(default)]
     pub layout: Option<crate::layout::ChannelLayout>,
-    /// `None` (default) for an ordinary bed/channel track. `Some` only for a track explicitly
-    /// authored as a real ADM audio object — see `adm::AdmObjectMetadata`'s own doc comment for
-    /// the full field semantics. Independent of `layout`: an ADM-object track is conceptually a
-    /// single moving point source, not a bed with channel roles, though nothing stops both being
-    /// set on the same track if a future use case needs it.
+    /// Empty (default) for an ordinary bed/channel track. Non-empty only for a track explicitly
+    /// authored as N real ADM audio objects, one per own channel -- see `adm::AdmObjectMetadata`'s
+    /// own doc comment for one object's full field semantics. Must be either empty or exactly
+    /// `channels` long (validated at build time, `topology::build_track` -- a track is entirely an
+    /// ordinary bed or entirely N independent objects, never a partial mix). Independent of
+    /// `layout`: an ADM-object channel is conceptually a single moving point source, not a bed
+    /// role, though nothing stops both being set on the same track if a future use case needs it
+    /// (e.g. a layout purely for the dashboard's own channel-count display).
+    ///
+    /// `deserialize_with = deserialize_null_default`, not just `#[serde(default)]` alone: plain
+    /// `#[serde(default)]` only supplies the default for a field that's *absent* from the JSON --
+    /// an explicit `"adm_objects": null` (which is exactly what a JSON serializer emits for a C#
+    /// `null` property with no NullValueHandling.Ignore override, and audiomixer's own
+    /// TrackCreatePayload.AdmObjects did precisely this for every ordinary, non-ADM track) still
+    /// fails a plain `Vec<T>`'s own deserializer, which doesn't accept `null` -- silently rejecting
+    /// the *entire* CREATE with "malformed value" for every non-ADM track, exactly the bug this
+    /// closes. Accepting `null` the same as absence here is the more robust fix (protects any
+    /// client that reasonably sends an explicit null for "no objects", not just one dashboard's own
+    /// payload shape) -- kept alongside, not instead of, fixing the dashboard's own payload not to
+    /// send null in the first place.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub adm_objects: Vec<crate::adm::AdmObjectMetadata>,
+    /// Small-mixer convenience, config-time only (mirrors `BusConfig.auto_master`'s own "startup-
+    /// only, ignored on a runtime-created resource" convention — see `topology::create_track`):
+    /// when set, `main.rs` auto-wires this track's own `input_patch` as sequential channels from
+    /// the named input-grid entry, channel-for-channel starting at `start_channel` — the common
+    /// "this track just *is* grid entry X's channels N..N+trackchannels" case (e.g. a generator or
+    /// capture-card feed with a fixed, known channel range) without hand-writing every channel's
+    /// own `input-patch` entry. `None` (default) — an ordinary track patched later via `input-patch`
+    /// itself, same as before this existed.
     #[serde(default)]
-    pub adm_object: Option<crate::adm::AdmObjectMetadata>,
+    pub auto_input: Option<AutoInputConfig>,
     /// This track's own sends (`SendConfig`) — replaces the old flat `bus_assign: Vec<u32>`; a
     /// plain `{"bus_id": 0}` entry (all other fields defaulted) behaves exactly like the old
     /// bus-assign did (see `mixer::Send`'s docs on why a fixed-0dB send *is* a bus assignment, not
@@ -158,6 +199,11 @@ pub struct TrackConfig {
     pub gain_db: f32,
     #[serde(default)]
     pub fader_db: f32,
+    /// See `mixer::Track.lfe_trim_db`'s own doc comment -- extra trim on top of `gain_db`, applied
+    /// only to this track's own `Lfe`-role channel(s) per its `layout` (a no-op if `layout` has no
+    /// `Lfe` role). `0.0` default matches `gain_db`'s own "no trim" default.
+    #[serde(default)]
+    pub lfe_trim_db: f32,
     /// Back-compat sugar only — expanded by `build_chain` into a canned `chain` when `chain` itself
     /// is empty. See `ChannelTemplate::expand`'s own docs for why this stays supported rather than
     /// being removed now that `chain` is the authoritative shape.
@@ -253,6 +299,28 @@ pub struct SendConfig {
     pub level_db: f32,
     #[serde(default)]
     pub pickoff: PickoffPointConfig,
+    /// See `mixer::Send::rotation_deg`'s own docs -- only meaningful for a `PanObject::Rigid(n)`
+    /// pair; `0.0` (the source's own authored angles) for every config that doesn't set it.
+    #[serde(default)]
+    pub rotation_deg: f64,
+    /// See `mixer::Send::elevation_deg`'s own docs -- same `Rigid(n)`-only scope.
+    #[serde(default)]
+    pub elevation_deg: f64,
+    /// See `mixer::Send::route`'s own docs -- `None` (default) keeps this send on its existing
+    /// automatic pan/object behavior; `Some(matrix)` (exactly `channels` rows x the target bus's
+    /// own `channels` columns) switches it to explicit unity-gain crosspoint routing instead.
+    #[serde(default)]
+    pub route: Option<Vec<Vec<bool>>>,
+    /// `"auto"` (default) | `"adm"` | `"route"` -- see `mixer::SendPanMode`'s own doc comment.
+    /// Malformed/unrecognized values fall back to `"auto"` at build time (`to_send`), same "one
+    /// bad entry doesn't take the whole app down" precedent this codebase already follows
+    /// elsewhere, rather than failing the whole config load over one send's own typo.
+    #[serde(default = "default_pan_mode")]
+    pub pan_mode: String,
+}
+
+fn default_pan_mode() -> String {
+    "auto".to_string()
 }
 
 fn default_send_on() -> bool {
@@ -266,6 +334,38 @@ impl SendConfig {
             pickoff: self.pickoff.into(),
             on: std::sync::atomic::AtomicBool::new(self.on),
             level_db: std::sync::Mutex::new(self.level_db),
+            rotation_deg: std::sync::Mutex::new(self.rotation_deg),
+            elevation_deg: std::sync::Mutex::new(self.elevation_deg),
+            route: std::sync::Mutex::new(self.route.clone()),
+            pan_mode: std::sync::Mutex::new(crate::mixer::SendPanMode::from_wire_name(&self.pan_mode).unwrap_or_default()),
+        }
+    }
+}
+
+/// A `BusConfig`'s or `MasterTrackConfig`'s own send into a *master* -- see `mixer::MasterSend`'s
+/// own docs for why this is a separate shape from `SendConfig` (no `pickoff`: neither a bus nor a
+/// master's own scratch retains a second, pre-fader-equivalent signal to pick from).
+#[derive(Deserialize, Clone, Debug)]
+pub struct MasterSendConfig {
+    pub master_id: u32,
+    #[serde(default = "default_send_on")]
+    pub on: bool,
+    #[serde(default)]
+    pub level_db: f32,
+    #[serde(default)]
+    pub rotation_deg: f64,
+    #[serde(default)]
+    pub elevation_deg: f64,
+}
+
+impl MasterSendConfig {
+    pub fn to_master_send(&self) -> crate::mixer::MasterSend {
+        crate::mixer::MasterSend {
+            master_id: self.master_id,
+            on: std::sync::atomic::AtomicBool::new(self.on),
+            level_db: std::sync::Mutex::new(self.level_db),
+            rotation_deg: std::sync::Mutex::new(self.rotation_deg),
+            elevation_deg: std::sync::Mutex::new(self.elevation_deg),
         }
     }
 }
@@ -334,6 +434,33 @@ pub struct BusConfig {
     /// same `id` also exists in `Config.masters` — ambiguous which one should win.
     #[serde(default)]
     pub auto_master: Option<AutoMasterConfig>,
+    /// This bus's own automatic-panning sends into one or more masters -- see `mixer::MasterSend`'s
+    /// own docs. Additive alongside `auto_master`/`master-in`, not a replacement.
+    #[serde(default)]
+    pub master_sends: Vec<MasterSendConfig>,
+}
+
+/// `TrackConfig.auto_input`'s own shape — which input-grid entry, and which of its channels to
+/// start from. Two addressing modes, resolved by `main.rs`'s auto-input loop (`grid_channel` wins
+/// if both are set):
+/// - `entry_id` + `start_channel`: that specific entry's own local channel numbering (0-based,
+///   defaults to 0 -- the entry's own first channel). The original, still-supported shape.
+/// - `grid_channel`: a position in the whole input grid's own unified, 1-based running numbering
+///   (e.g. `9` for "Grid In 09" -- see `patch::InputGrid::reserve_channel_range`/
+///   `resolve_grid_channel`), resolved down to whichever entry actually owns it. Lets several
+///   tracks created together each just say where they start in the grid's own numbering (e.g.
+///   `1`, `9`, `17`, ... for three sequential 8-channel feeds) without knowing which entry_id owns
+///   which range or hand-splitting a track across one. At least one of `entry_id`/`grid_channel`
+///   must be set (validated at startup, main.rs; a track with neither logs a warning and is left
+///   unpatched, same "one bad entry doesn't take the whole app down" precedent as elsewhere here).
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct AutoInputConfig {
+    #[serde(default)]
+    pub entry_id: Option<String>,
+    #[serde(default)]
+    pub start_channel: u32,
+    #[serde(default)]
+    pub grid_channel: Option<u32>,
 }
 
 /// The auto-generated master's own overridable fields — everything a hand-authored
@@ -373,6 +500,10 @@ pub struct MasterTrackConfig {
     /// See `TrackConfig.chain`'s own doc — same meaning, same authoritative-over-`template` rule.
     #[serde(default)]
     pub chain: Vec<StageSlotConfig>,
+    /// This master's own automatic-panning sends into one or more *other* masters (cascaded
+    /// submixes) -- see `mixer::MasterSend`'s own docs.
+    #[serde(default)]
+    pub master_sends: Vec<MasterSendConfig>,
 }
 
 /// Where an output-grid entry's own MXL flow is created (`OutputGridEntryConfig::target`) — no
@@ -400,7 +531,10 @@ pub struct OutputGridEntryConfig {
     /// Stable id within the output grid's own namespace (point id `"output:<id>"`, `patch.rs`) --
     /// distinct from track/bus ids, same convention as `InputGridEntryConfig::id`.
     pub id: String,
-    pub label: String,
+    /// `None` — auto-generated at load time (`main.rs`) as `"Grid Out {start:02}-{end:02}"`, same
+    /// convention as `InputGridEntryConfig::label`'s own doc comment.
+    #[serde(default)]
+    pub label: Option<String>,
     #[serde(default)]
     pub target: Option<BusTarget>,
     /// This entry's own channel count -- defaults to `Config::channels` when unset. The "receiver
@@ -560,5 +694,56 @@ mod chain_tests {
         let chain = build_chain(&cfg.chain, cfg.template, 2, 48000);
         let kinds: Vec<StageKind> = chain.iter().map(|s| s.kind()).collect();
         assert_eq!(kinds, vec![StageKind::Eq, StageKind::Dynamics, StageKind::Filter]);
+    }
+
+    #[test]
+    fn track_config_accepts_an_explicit_null_adm_objects_the_same_as_omitting_it() {
+        // The real bug (2026-09-18): audiomixer's own TrackCreatePayload.AdmObjects sends a
+        // literal JSON null (not omission) for every ordinary, non-ADM track -- Newtonsoft's
+        // default NullValueHandling.Include serializes a C# null property as "adm_objects": null,
+        // not by leaving the key out. Plain #[serde(default)] alone only covers the key being
+        // *absent*, so this silently failed serde_json::from_value::<TrackConfig> with a type
+        // error for every single non-ADM CREATE, rejected upstream (ws.rs::handle_create) with a
+        // warn-level log nobody saw (RUST_LOG unset) -- "lets me add tracks but doesn't add them."
+        let json = serde_json::json!({"id": 1, "label": "T", "sends": [], "adm_objects": null}).to_string();
+        let cfg: TrackConfig = serde_json::from_str(&json).unwrap();
+        assert!(cfg.adm_objects.is_empty());
+    }
+
+    #[test]
+    fn track_config_still_accepts_a_real_adm_objects_array() {
+        let json = serde_json::json!({
+            "id": 1, "label": "T", "sends": [],
+            "adm_objects": [{"name": "Obj1", "gain_db": 0.0, "position": {"azimuth": 0.0, "elevation": 0.0, "distance": 1.0}, "width": 0.0, "height": 0.0, "depth": 0.0}],
+        })
+        .to_string();
+        let cfg: TrackConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg.adm_objects.len(), 1);
+        assert_eq!(cfg.adm_objects[0].name, "Obj1");
+    }
+
+    #[test]
+    fn send_config_pan_mode_defaults_to_auto_and_maps_through_to_send() {
+        let json = serde_json::json!({"bus_id": 1}).to_string();
+        let cfg: SendConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg.pan_mode, "auto");
+        let send = cfg.to_send();
+        assert_eq!(*send.pan_mode.lock().unwrap(), crate::mixer::SendPanMode::Auto);
+    }
+
+    #[test]
+    fn send_config_pan_mode_adm_maps_through_to_send() {
+        let json = serde_json::json!({"bus_id": 1, "pan_mode": "adm"}).to_string();
+        let cfg: SendConfig = serde_json::from_str(&json).unwrap();
+        let send = cfg.to_send();
+        assert_eq!(*send.pan_mode.lock().unwrap(), crate::mixer::SendPanMode::Adm);
+    }
+
+    #[test]
+    fn send_config_unrecognized_pan_mode_falls_back_to_auto_rather_than_failing_the_whole_load() {
+        let json = serde_json::json!({"bus_id": 1, "pan_mode": "spatial"}).to_string();
+        let cfg: SendConfig = serde_json::from_str(&json).unwrap();
+        let send = cfg.to_send();
+        assert_eq!(*send.pan_mode.lock().unwrap(), crate::mixer::SendPanMode::Auto);
     }
 }

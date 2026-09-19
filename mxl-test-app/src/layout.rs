@@ -106,7 +106,7 @@ impl ChannelRole {
 /// Channel *order* within each named layout follows the common WAV/file-based convention (the
 /// most common convention in file-based/AES67 practice) - documented explicitly here since ITU/
 /// Dolby/SMPTE orderings genuinely differ and this is a real choice, not an oversight.
-#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelLayout {
     Mono,
@@ -185,6 +185,41 @@ pub fn resolve_channels(context: &str, channels: Option<u32>, layout: Option<Cha
         )),
         _ => Ok(Some(layout_count)),
     }
+}
+
+/// Real SMPTE ST 2110-30 (which directly references AES67) channel-count conformance levels a real
+/// stream is normally one of — verified directly via the ITU/AMWA-adjacent published spec text
+/// (Level A: 1-8ch mandatory baseline; Level C: 1-64ch at a 125us packet time; Level B sits between
+/// the two) rather than guessed. Used to size a grid entry's ("Stream Rx"/"Stream Tx") own
+/// placeholder channel count: a real 2110 sender/receiver in the wild is essentially always one of
+/// these, not an arbitrary N -- see `SESSION-2026-09-15-DYNAMIC-RX-SIZING-DESIGN.md` for the full
+/// design rationale this exists to support.
+pub const STANDARD_STREAM_SIZES: [u32; 5] = [1, 2, 8, 16, 64];
+
+/// True if `n` is one of `STANDARD_STREAM_SIZES` -- an **input**-grid entry's own `channels` is
+/// validated against this at startup (`main.rs`), same "validate at startup, don't guess at
+/// runtime" precedent `resolve_channels` itself already established. This models *receive-capacity
+/// provisioning*: an operator picks a round placeholder size, and any real sender up to that size
+/// can subscribe (`FlowReader::open`'s own "accepts up to N" change) -- a deliberately different
+/// concept from `is_valid_st2110_30_channel_count` below, see that function's own doc comment for
+/// why the two aren't the same check.
+pub fn is_standard_stream_size(n: u32) -> bool {
+    STANDARD_STREAM_SIZES.contains(&n)
+}
+
+/// True if `n` falls within a real ST 2110-30 conformance level's own channel-count range (Level
+/// A/B: 1-8; Level C: 1-64 -- see `STANDARD_STREAM_SIZES`'s own doc comment for the verified
+/// source). Used for an **output**-grid entry's own `channels` instead of
+/// `is_standard_stream_size`: unlike an input-grid entry (a receive-capacity *placeholder*,
+/// independent of whatever real sender ends up subscribed), an output-grid entry's `channels` *is*
+/// the real transmitted signal itself (its real MXL flow's own real `channelCount`) -- a genuine
+/// 6-channel 5.1 signal, or a 4-channel quad one, is a completely valid real ST 2110-30 payload
+/// (well within Level A's 1-8 range) even though 4 and 6 aren't themselves round "placeholder
+/// bucket" numbers. Requiring an exact bucket match here would incorrectly reject real, valid
+/// layouts (confirmed while implementing this: it broke every non-8-channel layout in
+/// `mxl-test-app-adm-demo.conf`'s own output grid — quad/5.1/5.1.4 — over this exact distinction).
+pub fn is_valid_st2110_30_channel_count(n: u32) -> bool {
+    (1..=64).contains(&n)
 }
 
 #[cfg(test)]
@@ -270,5 +305,37 @@ mod tests {
     #[test]
     fn resolve_channels_named_layout_disagreeing_with_explicit_channels_is_a_hard_error() {
         assert!(resolve_channels("track 3", Some(2), Some(ChannelLayout::Surround5_1)).is_err());
+    }
+
+    #[test]
+    fn standard_stream_sizes_accepts_exactly_the_real_2110_30_conformance_counts() {
+        for n in [1, 2, 8, 16, 64] {
+            assert!(is_standard_stream_size(n), "{n} should be a standard size");
+        }
+    }
+
+    #[test]
+    fn standard_stream_sizes_rejects_everything_else() {
+        for n in [0, 3, 4, 5, 6, 7, 9, 15, 17, 32, 63, 65, 100] {
+            assert!(!is_standard_stream_size(n), "{n} should not be a standard size");
+        }
+    }
+
+    #[test]
+    fn st2110_30_channel_count_range_accepts_real_non_bucket_layout_counts() {
+        // Quad (4), 5.1 (6), and 5.1.4 (10) are all real, valid ST 2110-30 payloads even though
+        // none is one of is_standard_stream_size's discrete placeholder buckets -- the whole point
+        // of this being a separate, range-based check for output-grid entries (see its own doc
+        // comment for the real config this distinction was caught against).
+        for n in [1, 2, 4, 6, 8, 10, 16, 32, 64] {
+            assert!(is_valid_st2110_30_channel_count(n), "{n} should be a valid ST 2110-30 channel count");
+        }
+    }
+
+    #[test]
+    fn st2110_30_channel_count_range_rejects_zero_and_above_64() {
+        assert!(!is_valid_st2110_30_channel_count(0));
+        assert!(!is_valid_st2110_30_channel_count(65));
+        assert!(!is_valid_st2110_30_channel_count(1000));
     }
 }

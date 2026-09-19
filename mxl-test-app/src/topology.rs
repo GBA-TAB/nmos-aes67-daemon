@@ -26,6 +26,19 @@ use crate::mixer::{channels_compatible, layouts_compatible, Bus, MasterTrack, Tr
 
 pub fn build_track(cfg: &TrackConfig, default_channels: usize, sample_rate: u32, dynamically_created: bool) -> Result<Arc<Track>, String> {
     let channels = resolve_channels(&format!("track {}", cfg.id), cfg.channels, cfg.layout)?.map(|c| c as usize).unwrap_or(default_channels);
+    // Every track always carries one ADM position slot per channel (mixer::Track.adm_objects's
+    // own doc comment) -- config-provided seed values are optional (omitted/empty means "auto-
+    // generate defaults", not "no ADM" -- that distinction no longer exists), but when provided
+    // they must cover every channel, never a partial set. Rejected here, at the one shared
+    // construction path, rather than left to silently desync from the real channel count wherever
+    // it's read later.
+    if !cfg.adm_objects.is_empty() && cfg.adm_objects.len() != channels {
+        return Err(format!(
+            "track {}: adm_objects has {} entries but the track resolves to {channels} channels -- must be either omitted/empty (auto-generated defaults) or exactly one entry per channel",
+            cfg.id,
+            cfg.adm_objects.len()
+        ));
+    }
     Ok(Arc::new(Track::new_with_origin(cfg, channels, sample_rate, dynamically_created)))
 }
 
@@ -48,11 +61,37 @@ pub fn build_master(cfg: &MasterTrackConfig, default_channels: usize, sample_rat
 /// to a nonexistent bus is simply inert, the same "trust the client, don't guard every possible
 /// misuse" posture this codebase already takes elsewhere. Also does not warn about a count
 /// mismatch `mix_into_scaled_with_layout` can actually handle via a real downmix matrix (e.g. a
-/// 5.1 track into a stereo bus, both layout-tagged) — see `mixer::layouts_compatible`.
+/// 5.1 track into a stereo bus, both layout-tagged) — see `mixer::layouts_compatible` — nor about
+/// a send in `SendPanMode::Adm` targeting a VBAP-supported bed bus (`Stereo`/`Quad`/`Surround5_1`/
+/// `Surround7_1`/`Surround5_1_4`) regardless of the track's own raw channel count, since
+/// `engine.rs` routes that send through real position-derived VBAP panning instead of the
+/// count/layout rules above (`mixer::vbap_supports_layout`), nor about a send in
+/// `SendPanMode::Route` at all — an explicit crosspoint matrix is valid for any track/bus channel
+/// count pairing by construction, that's the whole point of it existing.
 pub fn warn_incompatible_sends(track: &Track, buses: &[Arc<Bus>]) {
     for send in track.sends.lock().unwrap().iter() {
         if let Some(bus) = buses.iter().find(|b| b.id == send.bus_id) {
-            if !channels_compatible(track.channels, bus.channels) && !layouts_compatible(track.layout, bus.layout) {
+            let pan_mode = *send.pan_mode.lock().unwrap();
+            if pan_mode == crate::mixer::SendPanMode::Route {
+                continue;
+            }
+            let object_pan_covers_it =
+                pan_mode == crate::mixer::SendPanMode::Adm && bus.layout.is_some_and(crate::mixer::vbap_supports_layout);
+            // A Rigid(n) classification (SESSION-2026-09-16-PAN-OBJECT-MATRIX-DESIGN.md) is
+            // always safely covered by mix_into_scaled_with_rigid_array_pan: `classify` only ever
+            // returns Rigid for a destination in {Quad, 5.1, 7.1, 5.1.4}, and all four now have
+            // real vbap_bed_gains ring data (Quad's own ring was added alongside this). Downmix,
+            // by contrast, is *not* automatically safe -- some Downmix-classified pairs (e.g.
+            // Quad<->Stereo) are only proposed-by-analogy in the design doc, not yet real code, so
+            // this still defers to layouts_compatible's own `downmix_matrix(...).is_some()` check
+            // rather than assuming every Downmix cell already has a real matrix.
+            let rigid_pan_covers_it =
+                matches!(crate::mixer::PanObject::classify(track.layout, bus.layout), crate::mixer::PanObject::Rigid(_));
+            if !channels_compatible(track.channels, bus.channels)
+                && !layouts_compatible(track.layout, bus.layout)
+                && !object_pan_covers_it
+                && !rigid_pan_covers_it
+            {
                 tracing::warn!(
                     track_id = track.id,
                     track_channels = track.channels,
@@ -77,6 +116,9 @@ pub fn create_track(mixer: &MixerState, cfg: &TrackConfig) -> Result<Arc<Track>,
             return Err(format!("track {} already exists", cfg.id));
         }
         tracks.insert(cfg.id, track.clone());
+    }
+    if cfg.auto_input.is_some() {
+        tracing::warn!(track_id = track.id, "auto_input is a startup-only convenience and is ignored on a runtime-created track -- PUT its input-patch explicitly instead");
     }
     warn_incompatible_sends(&track, &mixer.buses_snapshot());
     mixer.topology_generation.fetch_add(1, Ordering::Relaxed);

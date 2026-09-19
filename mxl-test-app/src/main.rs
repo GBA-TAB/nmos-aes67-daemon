@@ -10,6 +10,7 @@ mod mixer;
 mod nmos;
 mod patch;
 mod persistence;
+mod schema;
 mod topology;
 mod ws;
 
@@ -96,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
             fader_db: auto.fader_db,
             template: auto.template,
             chain: auto.chain.clone(),
+            master_sends: Vec::new(),
         });
     }
 
@@ -206,38 +208,105 @@ async fn main() -> anyhow::Result<()> {
     for entry in &cfg.input_grid {
         let channels = layout::resolve_channels(&format!("input grid entry {}", entry.id), entry.channels, entry.layout)
             .map_err(|e| anyhow::anyhow!(e))?
-            .unwrap_or(cfg.channels) as usize;
+            .unwrap_or(cfg.channels);
+        if !layout::is_standard_stream_size(channels) {
+            anyhow::bail!(
+                "input grid entry {}: channels {channels} is not a standard ST 2110-30 stream size ({:?}) -- this entry's own channel count is its placeholder/receive-capacity size, not an arbitrary number",
+                entry.id,
+                layout::STANDARD_STREAM_SIZES
+            );
+        }
+        // Reserves this entry's own slice of the grid's ONE shared running channel numbering --
+        // see InputGrid::reserve_channel_range's own doc comment. nmos/discovery.rs's runtime
+        // registry path reserves through this exact same counter, so a config-authored entry and
+        // a later-discovered one both fall on one coherent, 1-based numbering starting at
+        // "Grid In 01", never two separate schemes depending on origin.
+        let grid_channel_start = input_grid.reserve_channel_range(channels);
+        let label = entry.label.clone().unwrap_or_else(|| {
+            format!("Grid In {:02}-{:02}", grid_channel_start + 1, grid_channel_start + channels)
+        });
+        // Per-channel "app side" identity -- always this grid-wide numbering, independent of
+        // whether `label` itself was auto-generated or explicit (see InputGridEntry::channel_labels's
+        // own doc comment for why these are deliberately two separate names).
+        let channel_labels: Vec<String> =
+            (0..channels).map(|i| format!("Grid In {:02}", grid_channel_start + i + 1)).collect();
+        let channels = channels as usize;
         let receiver_id = ids::instance_input_receiver_id(&cfg.instance_name, &entry.id);
-        let reader = match &entry.source {
+        let (reader, flow_id_str) = match &entry.source {
             Some(source) => {
                 let flow_id = source.resolve();
-                match FlowReader::open(&cfg.mxl_domain, &mxl_so, &flow_id.to_string(), channels) {
+                let reader = match FlowReader::open(&cfg.mxl_domain, &mxl_so, &flow_id.to_string(), channels) {
                     Ok(r) => {
-                        tracing::info!(entry_id = %entry.id, label = %entry.label, %flow_id, channels, "input grid entry ready");
+                        tracing::info!(entry_id = %entry.id, %label, %flow_id, channels, "input grid entry ready");
                         Some(r)
                     }
                     Err(e) => {
                         tracing::warn!(entry_id = %entry.id, %flow_id, error = %e, "failed to open configured input grid entry at startup");
                         None
                     }
-                }
+                };
+                (reader, Some(flow_id.to_string()))
             }
             None => {
-                tracing::info!(entry_id = %entry.id, label = %entry.label, channels, "input grid entry ready (empty, awaiting IS-05 activation)");
-                None
+                tracing::info!(entry_id = %entry.id, %label, channels, "input grid entry ready (empty, awaiting IS-05 activation)");
+                (None, None)
             }
         };
         input_grid.insert(patch::InputGridEntry {
             id: entry.id.clone(),
-            label: entry.label.clone(),
+            label: std::sync::Mutex::new(label),
             channels,
+            channel_labels,
+            grid_channel_start,
             layout: entry.layout,
             reader: std::sync::Mutex::new(reader),
+            flow_id: std::sync::Mutex::new(flow_id_str),
             meter_db: std::sync::Mutex::new(vec![f32::NEG_INFINITY; channels]),
             receiver_id,
             subscribed_sender_id: std::sync::Mutex::new(None),
             fault: std::sync::Mutex::new(None),
+            fault_retry_after: std::sync::Mutex::new(None),
         });
+    }
+
+    // Auto-input patching (config.rs's TrackConfig.auto_input docs): each track with auto_input set
+    // gets its own input_patch auto-wired as sequential channels from that grid entry, channel-for-
+    // channel starting at start_channel -- same standalone-PatchState timing as auto-master
+    // patching above (before MixerState/persistence exist), so persistence::load_and_apply (below)
+    // can correctly overwrite this synthesized default with a resumed live patch, not the other way
+    // around. Runs after the input_grid loop above (not interleaved with it) since validate_source
+    // needs every entry's real channel count already known, not just the one entry a given track
+    // happens to reference.
+    for t in &cfg.tracks {
+        let Some(auto) = &t.auto_input else { continue };
+        let Some(track) = tracks.iter().find(|tr| tr.id == t.id) else { continue };
+        // Two addressing modes (config.rs's AutoInputConfig doc comment): `grid_channel` names a
+        // position in the grid's own unified 1-based numbering (e.g. 9 for "Grid In 09") and is
+        // resolved down to whichever entry actually owns it; `entry_id`+`start_channel` addresses
+        // that entry's own local numbering directly, same as before this existed. `grid_channel`
+        // wins if both are set -- lets a batch of tracks each just say where they start in the
+        // grid's own numbering without hand-splitting across entries.
+        let resolved = if let Some(grid_channel) = auto.grid_channel {
+            match input_grid.resolve_grid_channel(grid_channel) {
+                Some(hit) => Some(hit),
+                None => {
+                    tracing::warn!(track_id = track.id, grid_channel, "auto_input: grid_channel does not fall within any input grid entry's reserved range, skipped");
+                    None
+                }
+            }
+        } else if let Some(entry_id) = &auto.entry_id {
+            Some((entry_id.clone(), auto.start_channel as usize))
+        } else {
+            tracing::warn!(track_id = track.id, "auto_input: neither grid_channel nor entry_id set, skipped");
+            None
+        };
+        let Some((entry_id, start_channel)) = resolved else { continue };
+        let patch: Vec<Option<patch::SourceRef>> = (0..track.channels)
+            .map(|ch| Some(patch::SourceRef::Input { entry_id: entry_id.clone(), channel: start_channel + ch }))
+            .collect();
+        if let Err(e) = patch_state.set_track_in(&tracks, &bus_channel_list, &master_channel_list, &input_grid, track.id, patch) {
+            tracing::warn!(track_id = track.id, %entry_id, start_channel, error = %e, "failed to auto-patch track input from grid entry");
+        }
     }
 
     // The pickoff-point patch bay's output grid (patch.rs): each entry gets its own real MXL flow
@@ -246,10 +315,23 @@ async fn main() -> anyhow::Result<()> {
     // actually want this yet" to gate on. The *only* thing that gets a real NMOS Source+Flow+Sender
     // now (PICKOFFS.md's own intro) -- neither a bus's nor a master's own signal is itself NMOS-visible.
     let output_grid = patch::OutputGrid::default();
+    // See input_grid_channel_offset's own doc comment above -- same convention, own running total.
+    let mut output_grid_channel_offset: u32 = 0;
     for entry in &cfg.output_grid {
         let channels = layout::resolve_channels(&format!("output grid entry {}", entry.id), entry.channels, entry.layout)
             .map_err(|e| anyhow::anyhow!(e))?
-            .unwrap_or(cfg.channels) as usize;
+            .unwrap_or(cfg.channels);
+        if !layout::is_valid_st2110_30_channel_count(channels) {
+            anyhow::bail!(
+                "output grid entry {}: channels {channels} is outside the valid ST 2110-30 channel-count range (1-64)",
+                entry.id
+            );
+        }
+        let label = entry.label.clone().unwrap_or_else(|| {
+            format!("Grid Out {:02}-{:02}", output_grid_channel_offset + 1, output_grid_channel_offset + channels)
+        });
+        output_grid_channel_offset += channels;
+        let channels = channels as usize;
         let flow_id = entry.resolve_flow_id(&cfg.instance_name);
         let writer = FlowWriter::create(
             &cfg.mxl_domain,
@@ -258,13 +340,13 @@ async fn main() -> anyhow::Result<()> {
             flow_id,
             ids::instance_output_source_id(&cfg.instance_name, &entry.id),
             ids::device_id(&cfg.instance_name),
-            &entry.label,
+            &label,
             channels as u32,
         )
-        .map_err(|e| anyhow::anyhow!("creating output grid entry {} ('{}') flow {flow_id}: {e}", entry.id, entry.label))?;
+        .map_err(|e| anyhow::anyhow!("creating output grid entry {} ('{}') flow {flow_id}: {e}", entry.id, label))?;
         output_grid.insert(patch::OutputGridEntry {
             id: entry.id.clone(),
-            label: entry.label.clone(),
+            label: std::sync::Mutex::new(label.clone()),
             channels,
             layout: entry.layout,
             writer: std::sync::Mutex::new(writer),
@@ -273,7 +355,7 @@ async fn main() -> anyhow::Result<()> {
             receiver_id: std::sync::Mutex::new(None),
             fault: std::sync::Mutex::new(None),
         });
-        tracing::info!(output_id = %entry.id, label = %entry.label, %flow_id, channels, "output grid entry MXL flow ready");
+        tracing::info!(output_id = %entry.id, %label, %flow_id, channels, "output grid entry MXL flow ready");
     }
 
     // Warn once per incompatible track->bus channel-count pairing (see mixer::mix_into's docs for
@@ -298,6 +380,12 @@ async fn main() -> anyhow::Result<()> {
         fault_notify_rx: Mutex::new(Some(fault_notify_rx)),
         period_frames: cfg.period_frames as usize,
         sample_rate: cfg.sample_rate,
+        mxl_domain: cfg.mxl_domain.clone(),
+        mxl_so_path: mxl_so.clone(),
+        // Seeded with today's compiled defaults -- config-time overrides (a top-level
+        // "downmix_matrices" key) aren't wired yet, only the runtime WS PUT path is; see
+        // SESSION-2026-09-16-PAN-OBJECT-MATRIX-DESIGN.md's addendum for the full plan.
+        downmix_table: mixer::DownmixTable::new(),
     });
 
     // Resume a previous run's live state (gain/fader/sends/patches/DSP params -- see
@@ -380,7 +468,7 @@ async fn main() -> anyhow::Result<()> {
     // SIGTERM-triggered final state save (above) then has a chance to react to.
     // Serial ADM (ITU-R BS.2125) export/import (Phase E, adm.rs) -- a plain HTTP route rather than
     // going through the amixer WS protocol, since this is a whole-document snapshot/replace, not a
-    // per-field live control (that's what `channel/{id}/adm-object` over WS is for).
+    // per-field live control (that's what `channel/{id}/adm-objects` over WS is for).
     let adm_mixer_get = mixer.clone();
     let adm_mixer_post = mixer.clone();
     let app = nmos::server::router(nmos_state)

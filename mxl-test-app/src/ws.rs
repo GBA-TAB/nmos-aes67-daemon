@@ -58,6 +58,20 @@ async fn upgrade(ws: WebSocketUpgrade, State(state): State<WsState>) -> impl Int
 
 async fn handle_socket(socket: WebSocket, state: WsState) {
     let (mut sink, mut stream) = futures_split(socket);
+
+    // The full topology/param-schema snapshot (schema.rs) -- sent once, directly to this one new
+    // connection, before it even subscribes to the shared broadcast stream below. A "command
+    // proxy" hosting UI composed from several different apps' own commands (SESSION-2026-09-18)
+    // needs this to discover this mixer's whole current shape immediately on connect, not
+    // piecemeal from whatever happens to arrive over the next several periodic-tick/PUT-echo
+    // messages -- several params (gain/fader/mute/solo/lfe-trim) never ride the periodic tick at
+    // all, only their own PUT echo, so a client that connects without ever seeing one of those
+    // PUTs would otherwise have no way to learn their current values at all. A send failure here
+    // (already-closed socket) just skips straight to the ordinary loop below, same as any other
+    // send failure in this function.
+    let init_msg = serde_json::json!({ "path": format!("amixer/{}/init", state.mixer_id), "value": crate::schema::init_json(&state) });
+    let _ = sink.send(Message::Text(init_msg.to_string())).await;
+
     let mut rx = state.updates.subscribe();
 
     let forward = tokio::spawn(async move {
@@ -133,28 +147,97 @@ fn handle_put(state: &WsState, path: &str, value: Option<&serde_json::Value>) {
         // namespace (`patch.rs`), not a numeric track/bus/master id.
         "output" => {
             let Some(entry) = state.mixer.output_grid.get(id) else { return };
-            if param != "patch" {
-                return;
-            }
-            match crate::patch::PatchState::parse_track_in(value) {
-                Ok(patch) => {
-                    if let Err(e) = state.mixer.patch.set_output(
-                        &state.mixer.tracks_snapshot(),
-                        &bus_channels(state),
-                        &master_channels(state),
-                        &state.mixer.input_grid,
-                        &entry.id,
-                        entry.channels,
-                        patch,
-                    ) {
-                        tracing::warn!(output_id = %entry.id, error = %e, "PUT output patch rejected");
+            match param {
+                "patch" => {
+                    match crate::patch::PatchState::parse_track_in(value) {
+                        Ok(patch) => {
+                            if let Err(e) = state.mixer.patch.set_output(
+                                &state.mixer.tracks_snapshot(),
+                                &bus_channels(state),
+                                &master_channels(state),
+                                &state.mixer.input_grid,
+                                &entry.id,
+                                entry.channels,
+                                patch,
+                            ) {
+                                tracing::warn!(output_id = %entry.id, error = %e, "PUT output patch rejected");
+                            }
+                        }
+                        Err(e) => tracing::warn!(output_id = %entry.id, error = %e, "PUT output patch: malformed value"),
+                    }
+                    publish(state, path, state.mixer.patch.output_json(&entry.id, entry.channels));
+                }
+                // Live rename -- see OutputGridEntry.label's own doc comment. Empty/whitespace-only
+                // rejected (same "don't accept a blank block name" guard as the input-side arm
+                // below) rather than silently leaving a grid entry with no visible name at all.
+                "label" => {
+                    if let Some(new_label) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        *entry.label.lock().unwrap() = new_label.to_string();
+                        publish(state, &format!("amixer/{}/output-grid", state.mixer_id), state.mixer.output_grid.list_json());
+                    } else {
+                        tracing::warn!(output_id = %entry.id, "PUT output label rejected: empty/missing value");
                     }
                 }
-                Err(e) => tracing::warn!(output_id = %entry.id, error = %e, "PUT output patch: malformed value"),
+                _ => {}
             }
-            publish(state, path, state.mixer.patch.output_json(&entry.id, entry.channels));
+        }
+        // The pickoff-point patch bay's input grid -- `id` is the entry's own string id
+        // (`patch.rs`). Only `label` is PUTtable here (unlike `output`, which also has `patch`):
+        // an input-grid entry's own *subscription* is IS-05 activation
+        // (`nmos/server.rs::receiver_patch`), a different protocol entirely, not a WS PUT.
+        "input" => {
+            let Some(entry) = state.mixer.input_grid.get(id) else { return };
+            if param != "label" {
+                return;
+            }
+            if let Some(new_label) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                *entry.label.lock().unwrap() = new_label.to_string();
+                publish(state, &format!("amixer/{}/input-grid", state.mixer_id), state.mixer.input_grid.list_json());
+            } else {
+                tracing::warn!(input_id = %entry.id, "PUT input label rejected: empty/missing value");
+            }
+        }
+        // Runtime-editable downmix coefficient tables (SESSION-2026-09-16-PAN-OBJECT-MATRIX-
+        // DESIGN.md's own addendum). `id`/`param` here are layout names (e.g.
+        // "surround5_1"/"stereo"), not a numeric track/bus/master id -- `value` is the matrix
+        // itself, `matrix[dst_channel][src_channel]`, the same shape DownmixTable/downmix_matrix
+        // already use.
+        "downmix" => {
+            let (Ok(src), Ok(dst)) = (parse_layout_name(id), parse_layout_name(param)) else { return };
+            match serde_json::from_value::<Vec<Vec<f32>>>(value.clone()) {
+                Ok(matrix) => {
+                    state.mixer.downmix_table.set(src, dst, matrix);
+                    publish(state, path, downmix_json(&state.mixer.downmix_table, src, dst));
+                }
+                Err(e) => tracing::warn!(src = id, dst = param, error = %e, "PUT downmix: malformed matrix"),
+            }
         }
         _ => (),
+    }
+}
+
+/// Parses a bare wire string (e.g. "surround5_1") into the `ChannelLayout` it names -- the same
+/// `#[serde(rename_all = "snake_case")]` representation `TrackConfig::layout` etc. already use.
+/// `Discrete` has no such bare-string form (it carries a channel count) and simply fails to parse
+/// here, which is fine: `PanObject::classify` never resolves `Discrete` to `Downmix` anyway, so
+/// this path never legitimately needs it.
+fn parse_layout_name(s: &str) -> Result<crate::layout::ChannelLayout, serde_json::Error> {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+}
+
+/// The wire name for a `ChannelLayout` -- the inverse of `parse_layout_name`, used to build a
+/// `downmix` path for the periodic broadcast below.
+fn layout_wire_name(layout: crate::layout::ChannelLayout) -> String {
+    match serde_json::to_value(layout) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => String::new(),
+    }
+}
+
+fn downmix_json(table: &crate::mixer::DownmixTable, src: crate::layout::ChannelLayout, dst: crate::layout::ChannelLayout) -> serde_json::Value {
+    match table.get(src, dst) {
+        Some(m) => serde_json::json!(m),
+        None => serde_json::Value::Null,
     }
 }
 
@@ -245,22 +328,38 @@ fn handle_delete(state: &WsState, path: &str) {
 /// master ids exist at all — no such mechanism existed before this (only `input-grid`/`output-grid`
 /// got a list broadcast).
 fn tracks_list_json(state: &WsState) -> serde_json::Value {
-    let mut list: Vec<_> =
-        state.mixer.tracks_snapshot().iter().map(|t| serde_json::json!({"id": t.id, "label": t.label, "channels": t.channels})).collect();
+    // "layout" added alongside the pre-existing "channels" (SESSION-2026-09-16, dashboard follow-up
+    // to the pan-object-matrix work) -- a client previously had no way to know a track's own real
+    // layout (only its channel count), which the new Send-pan UI needs to draw that track's real
+    // per-channel angles. `null` for a track with no named layout, same as everywhere else.
+    let mut list: Vec<_> = state
+        .mixer
+        .tracks_snapshot()
+        .iter()
+        .map(|t| serde_json::json!({"id": t.id, "label": t.label, "channels": t.channels, "layout": t.layout}))
+        .collect();
     list.sort_by_key(|v| v["id"].as_u64());
     serde_json::json!(list)
 }
 
 fn buses_list_json(state: &WsState) -> serde_json::Value {
-    let mut list: Vec<_> =
-        state.mixer.buses_snapshot().iter().map(|b| serde_json::json!({"id": b.id, "label": b.label, "channels": b.channels})).collect();
+    let mut list: Vec<_> = state
+        .mixer
+        .buses_snapshot()
+        .iter()
+        .map(|b| serde_json::json!({"id": b.id, "label": b.label, "channels": b.channels, "layout": b.layout}))
+        .collect();
     list.sort_by_key(|v| v["id"].as_u64());
     serde_json::json!(list)
 }
 
 fn masters_list_json(state: &WsState) -> serde_json::Value {
-    let mut list: Vec<_> =
-        state.mixer.masters_snapshot().iter().map(|m| serde_json::json!({"id": m.id, "label": m.label, "channels": m.channels})).collect();
+    let mut list: Vec<_> = state
+        .mixer
+        .masters_snapshot()
+        .iter()
+        .map(|m| serde_json::json!({"id": m.id, "label": m.label, "channels": m.channels, "layout": m.layout}))
+        .collect();
     list.sort_by_key(|v| v["id"].as_u64());
     serde_json::json!(list)
 }
@@ -269,6 +368,11 @@ fn publish_lists(state: &WsState) {
     publish(state, &format!("amixer/{}/channel-list", state.mixer_id), tracks_list_json(state));
     publish(state, &format!("amixer/{}/sum-list", state.mixer_id), buses_list_json(state));
     publish(state, &format!("amixer/{}/master-list", state.mixer_id), masters_list_json(state));
+    // Every call site here is a runtime CREATE/DELETE (topology.rs) -- exactly what
+    // schema.rs's own doc comment calls a real "topology change", so re-broadcasting the full
+    // init snapshot to every connected client belongs alongside these three list re-publishes,
+    // not as a separate thing callers have to remember to also trigger.
+    publish(state, &format!("amixer/{}/init", state.mixer_id), crate::schema::init_json(state));
 }
 
 fn apply_track_param(state: &WsState, track: &Track, param: &str, extra: Option<&str>, value: &serde_json::Value) {
@@ -281,6 +385,11 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, extra: Option<
         "fader" => {
             if let Some(v) = value.as_f64() {
                 *track.fader_db.lock().unwrap() = v as f32;
+            }
+        }
+        "lfe-trim" => {
+            if let Some(v) = value.as_f64() {
+                *track.lfe_trim_db.lock().unwrap() = v as f32;
             }
         }
         "mute" => {
@@ -302,7 +411,35 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, extra: Option<
         // presented on the track's own channel strip, not the separate patch/grid page; see
         // `patch.rs`'s own module doc.
         "sends" => match parse_sends(value) {
-            Ok(sends) => *track.sends.lock().unwrap() = sends,
+            Ok(sends) => {
+                // Any explicit route matrix (mixer::Send::route) must be exactly track.channels
+                // rows x that send's own target bus's channels columns -- same "the shape must
+                // already match, in full" convention adm_objects's own PUT validation follows.
+                // Rejects the *whole* PUT on a mismatch (not just that one send) for the same
+                // reason: a client sending a malformed route almost certainly has every other
+                // send in this same array built from the same stale assumption, so applying the
+                // rest anyway would leave a half-updated, inconsistent set of sends.
+                let buses = state.mixer.buses_snapshot();
+                let mut bad = None;
+                for s in &sends {
+                    let Some(route) = &*s.route.lock().unwrap() else { continue };
+                    let Some(bus) = buses.iter().find(|b| b.id == s.bus_id) else {
+                        bad = Some(format!("route on send to bus {} -- no such bus", s.bus_id));
+                        break;
+                    };
+                    if route.len() != track.channels || route.iter().any(|row| row.len() != bus.channels) {
+                        bad = Some(format!(
+                            "route on send to bus {} has the wrong shape, expected {}x{}",
+                            s.bus_id, track.channels, bus.channels
+                        ));
+                        break;
+                    }
+                }
+                match bad {
+                    None => *track.sends.lock().unwrap() = sends,
+                    Some(reason) => tracing::warn!(track_id = track.id, %reason, "PUT sends rejected: route matrix shape mismatch"),
+                }
+            }
             Err(e) => tracing::warn!(track_id = track.id, error = %e, "PUT sends: malformed value"),
         },
         // The pickoff-point patch bay's per-track input-patch (patch.rs, plan §1/§5) -- one entry
@@ -331,16 +468,27 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, extra: Option<
             Some(stage) => stage.apply(value),
             None => tracing::warn!(track_id = track.id, ?extra, "PUT stage rejected: no chain slot at this index"),
         },
-        // This track's ADM object metadata (`adm::AdmObjectMetadata`) -- only meaningful for a
-        // track actually constructed with `adm_object: Some(...)` (`config.rs`/`topology.rs`);
-        // PUTting this on an ordinary bed track is a silent no-op, same "the slot must already
-        // exist" convention `"stage"` above follows for an out-of-range chain index.
-        "adm-object" => match &track.adm_object {
-            Some(slot) => match serde_json::from_value::<crate::adm::AdmObjectMetadata>(value.clone()) {
-                Ok(meta) => *slot.lock().unwrap() = meta,
-                Err(e) => tracing::warn!(track_id = track.id, error = %e, "PUT adm-object: malformed value"),
-            },
-            None => tracing::warn!(track_id = track.id, "PUT adm-object rejected: track has no adm_object slot"),
+        // This track's ADM object metadata, one entry per channel (`adm::AdmObjectMetadata`) --
+        // every track has exactly `channels` slots now (SESSION-2026-09-18, mixer::Track.
+        // adm_objects's own doc comment: latent position data, always present, whether or not any
+        // send is actually in SendPanMode::Adm for it). PUTting this with any array length other
+        // than the track's own real channel count is a rejected no-op, same "the slot must already
+        // exist, in exactly this shape" convention `"stage"` above follows for an out-of-range
+        // chain index -- one PUT replaces every object's value at once, same "structured value,
+        // one PUT replaces it all" convention `sends`/`input-patch` already use.
+        "adm-objects" => match serde_json::from_value::<Vec<crate::adm::AdmObjectMetadata>>(value.clone()) {
+            Ok(metas) if metas.len() == track.adm_objects.len() => {
+                for (slot, meta) in track.adm_objects.iter().zip(metas) {
+                    *slot.lock().unwrap() = meta;
+                }
+            }
+            Ok(metas) => tracing::warn!(
+                track_id = track.id,
+                got = metas.len(),
+                expected = track.adm_objects.len(),
+                "PUT adm-objects rejected: wrong array length -- the object count always matches the track's own channel count"
+            ),
+            Err(e) => tracing::warn!(track_id = track.id, error = %e, "PUT adm-objects: malformed value"),
         },
         _ => {}
     }
@@ -351,24 +499,31 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, extra: Option<
 /// A bus is a pure summer now (see `mixer::Bus`'s own docs) -- `input-patch` (`bus-in`) is the only
 /// thing left to PUT here; fader/mute/DSP all moved to `apply_master_param`.
 fn apply_bus_param(state: &WsState, bus: &Bus, param: &str, value: &serde_json::Value) {
-    if param != "input-patch" {
-        return;
-    }
-    match crate::patch::PatchState::parse_bus_in(value) {
-        Ok(patch) => {
-            if let Err(e) = state.mixer.patch.set_bus_in(
-                &state.mixer.tracks_snapshot(),
-                &bus_channels(state),
-                &master_channels(state),
-                &state.mixer.input_grid,
-                bus.id,
-                bus.channels,
-                patch,
-            ) {
-                tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch rejected");
+    match param {
+        "input-patch" => match crate::patch::PatchState::parse_bus_in(value) {
+            Ok(patch) => {
+                if let Err(e) = state.mixer.patch.set_bus_in(
+                    &state.mixer.tracks_snapshot(),
+                    &bus_channels(state),
+                    &master_channels(state),
+                    &state.mixer.input_grid,
+                    bus.id,
+                    bus.channels,
+                    patch,
+                ) {
+                    tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch rejected");
+                }
             }
-        }
-        Err(e) => tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch: malformed value"),
+            Err(e) => tracing::warn!(bus_id = bus.id, error = %e, "PUT input-patch: malformed value"),
+        },
+        // This bus's own automatic-panning sends into one or more masters -- see
+        // mixer::MasterSend's own docs. Full-array replace, same "one PUT replaces it all"
+        // convention `sends`/`input-patch` already use.
+        "master-sends" => match parse_master_sends(value) {
+            Ok(sends) => *bus.master_sends.lock().unwrap() = sends,
+            Err(e) => tracing::warn!(bus_id = bus.id, error = %e, "PUT master-sends: malformed value"),
+        },
+        _ => {}
     }
 }
 
@@ -409,6 +564,12 @@ fn apply_master_param(state: &WsState, master: &MasterTrack, param: &str, extra:
             Some(stage) => stage.apply(value),
             None => tracing::warn!(master_id = master.id, ?extra, "PUT stage rejected: no chain slot at this index"),
         },
+        // This master's own automatic-panning sends into one or more *other* masters -- see
+        // mixer::MasterSend's own docs.
+        "master-sends" => match parse_master_sends(value) {
+            Ok(sends) => *master.master_sends.lock().unwrap() = sends,
+            Err(e) => tracing::warn!(master_id = master.id, error = %e, "PUT master-sends: malformed value"),
+        },
         _ => {}
     }
 }
@@ -417,9 +578,10 @@ fn current_track_value(state: &WsState, track: &Track, param: &str, extra: Optio
     match param {
         "gain" => serde_json::json!(*track.gain_db.lock().unwrap()),
         "fader" => serde_json::json!(*track.fader_db.lock().unwrap()),
+        "lfe-trim" => serde_json::json!(*track.lfe_trim_db.lock().unwrap()),
         "mute" => serde_json::json!(track.mute.load(Ordering::Relaxed)),
         "solo" => serde_json::json!(track.solo.load(Ordering::Relaxed)),
-        "sends" => sends_json(track),
+        "sends" => sends_json(track, &state.mixer),
         "input-patch" => state.mixer.patch.track_in_json(track.id, track.channels),
         "stage" => extra
             .and_then(|s| s.parse::<usize>().ok())
@@ -427,9 +589,17 @@ fn current_track_value(state: &WsState, track: &Track, param: &str, extra: Optio
             .map(|s| s.to_json())
             .unwrap_or(serde_json::Value::Null),
         "chain" => chain_json(&track.chain),
-        "adm-object" => track.adm_object.as_ref().map(|slot| serde_json::to_value(&*slot.lock().unwrap()).unwrap()).unwrap_or(serde_json::Value::Null),
+        "adm-objects" => adm_objects_json(track),
         _ => serde_json::Value::Null,
     }
+}
+
+/// `channel/{id}/adm-objects`'s own value -- one `adm::AdmObjectMetadata` per channel, in channel
+/// order, always (every track has this now, active or not -- see `Track.adm_objects`'s own doc
+/// comment). Factored out (same shape as `chain_json`) so `run_meter_broadcaster`'s periodic tick
+/// and this GET-style lookup share one implementation.
+pub(crate) fn adm_objects_json(track: &Track) -> serde_json::Value {
+    serde_json::json!(track.adm_objects.iter().map(|slot| serde_json::to_value(&*slot.lock().unwrap()).unwrap()).collect::<Vec<_>>())
 }
 
 // Each apply_*/​*_json pair below takes a plain `&Stage` (not `&Option<Stage>`) -- the "is this
@@ -565,7 +735,7 @@ pub(crate) fn chain_json(chain: &[crate::dsp::ProcessingStage]) -> serde_json::V
 /// active for this resource, converted from samples to milliseconds (matching `delay_ms`'s own
 /// real-world-unit convention) using this mixer's own sample rate. Always 0 today -- see
 /// `dsp::ProcessingStage::latency_samples`'s own docs for why.
-fn compensation_delay_ms_json(state: &WsState, samples: &std::sync::atomic::AtomicUsize) -> serde_json::Value {
+pub(crate) fn compensation_delay_ms_json(state: &WsState, samples: &std::sync::atomic::AtomicUsize) -> serde_json::Value {
     let ms = samples.load(Ordering::Relaxed) as f64 / state.mixer.sample_rate as f64 * 1000.0;
     serde_json::json!(ms)
 }
@@ -584,16 +754,38 @@ fn parse_pickoff(v: &serde_json::Value) -> crate::mixer::PickoffPoint {
     }
 }
 
-pub(crate) fn sends_json(track: &Track) -> serde_json::Value {
+/// `mixer` is needed only to look up each send's own target bus layout, for `pan_object` --
+/// takes `&MixerState` rather than `&WsState` so this is callable from `persistence.rs`'s
+/// `capture` too, which has no `WsState` of its own.
+pub(crate) fn sends_json(track: &Track, mixer: &crate::engine::MixerState) -> serde_json::Value {
+    let buses = mixer.buses_snapshot();
     let sends = track.sends.lock().unwrap();
     serde_json::json!(sends
         .iter()
-        .map(|s| serde_json::json!({
-            "bus_id": s.bus_id,
-            "on": s.on.load(Ordering::Relaxed),
-            "level_db": *s.level_db.lock().unwrap(),
-            "pickoff": pickoff_wire(s.pickoff),
-        }))
+        .map(|s| {
+            let bus_layout = buses.iter().find(|b| b.id == s.bus_id).and_then(|b| b.layout);
+            serde_json::json!({
+                "bus_id": s.bus_id,
+                "on": s.on.load(Ordering::Relaxed),
+                "level_db": *s.level_db.lock().unwrap(),
+                "pickoff": pickoff_wire(s.pickoff),
+                "rotation_deg": *s.rotation_deg.lock().unwrap(),
+                "elevation_deg": *s.elevation_deg.lock().unwrap(),
+                // SESSION-2026-09-16-PAN-OBJECT-MATRIX-DESIGN.md's own dashboard follow-up: the
+                // classification this send actually gets, straight from the same PanObject::classify
+                // the engine itself dispatches on, so the dashboard never needs its own copy of the
+                // rule to decide what control to show.
+                "pan_object": crate::mixer::PanObject::classify(track.layout, bus_layout).wire_name(),
+                // SESSION-2026-09-18: this send's own explicit mode selector (mixer::SendPanMode) --
+                // "auto" keeps pan_object above as the real, active classification; "adm" activates
+                // this track's own live per-channel adm-objects position for this bus; "route"
+                // activates the crosspoint matrix below. Exactly one is ever active per send.
+                "pan_mode": s.pan_mode.lock().unwrap().wire_name(),
+                // Explicit crosspoint routing, see mixer::Send::route's own doc comment -- kept/
+                // round-tripped even while a different pan_mode is selected, not cleared on switch.
+                "route": *s.route.lock().unwrap(),
+            })
+        })
         .collect::<Vec<_>>())
 }
 
@@ -605,7 +797,73 @@ pub(crate) fn parse_sends(value: &serde_json::Value) -> Result<Vec<crate::mixer:
             let on = entry.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
             let level_db = entry.get("level_db").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
             let pickoff = entry.get("pickoff").map(parse_pickoff).unwrap_or(crate::mixer::PickoffPoint::PostFader);
-            Ok(crate::mixer::Send { bus_id, pickoff, on: std::sync::atomic::AtomicBool::new(on), level_db: std::sync::Mutex::new(level_db) })
+            let rotation_deg = entry.get("rotation_deg").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let elevation_deg = entry.get("elevation_deg").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let route = match entry.get("route") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => Some(serde_json::from_value::<Vec<Vec<bool>>>(v.clone()).map_err(|e| format!("send route: {e}"))?),
+            };
+            // Unrecognized/missing pan_mode falls back to Auto (today's existing behavior for
+            // every send predating this field) rather than rejecting the whole PUT over one
+            // send's own typo -- same posture SendConfig::to_send already takes at config-load time.
+            let pan_mode = entry
+                .get("pan_mode")
+                .and_then(|v| v.as_str())
+                .and_then(crate::mixer::SendPanMode::from_wire_name)
+                .unwrap_or_default();
+            Ok(crate::mixer::Send {
+                bus_id,
+                pickoff,
+                on: std::sync::atomic::AtomicBool::new(on),
+                level_db: std::sync::Mutex::new(level_db),
+                rotation_deg: std::sync::Mutex::new(rotation_deg),
+                elevation_deg: std::sync::Mutex::new(elevation_deg),
+                pan_mode: std::sync::Mutex::new(pan_mode),
+                route: std::sync::Mutex::new(route),
+            })
+        })
+        .collect()
+}
+
+/// A `Bus`'s or `MasterTrack`'s own `master_sends` -- see `mixer::MasterSend`'s own docs. Same
+/// shape as `sends_json`/`parse_sends` minus `pickoff` (neither sender has one to report).
+/// `src_layout` is the *sender's* own layout (the caller already has its `Bus`/`MasterTrack` in
+/// hand); `mixer` is only needed to look up each send's own target master layout, for
+/// `pan_object` -- see `sends_json`'s own doc comment for why `&MixerState` not `&WsState`.
+pub(crate) fn master_sends_json(sends: &[crate::mixer::MasterSend], src_layout: Option<crate::layout::ChannelLayout>, mixer: &crate::engine::MixerState) -> serde_json::Value {
+    let masters = mixer.masters_snapshot();
+    serde_json::json!(sends
+        .iter()
+        .map(|s| {
+            let dst_layout = masters.iter().find(|m| m.id == s.master_id).and_then(|m| m.layout);
+            serde_json::json!({
+                "master_id": s.master_id,
+                "on": s.on.load(Ordering::Relaxed),
+                "level_db": *s.level_db.lock().unwrap(),
+                "rotation_deg": *s.rotation_deg.lock().unwrap(),
+                "elevation_deg": *s.elevation_deg.lock().unwrap(),
+                "pan_object": crate::mixer::PanObject::classify(src_layout, dst_layout).wire_name(),
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
+pub(crate) fn parse_master_sends(value: &serde_json::Value) -> Result<Vec<crate::mixer::MasterSend>, String> {
+    let arr = value.as_array().ok_or("master_sends must be an array")?;
+    arr.iter()
+        .map(|entry| {
+            let master_id = entry.get("master_id").and_then(|v| v.as_u64()).ok_or("master_sends entry missing 'master_id'")? as u32;
+            let on = entry.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
+            let level_db = entry.get("level_db").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let rotation_deg = entry.get("rotation_deg").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let elevation_deg = entry.get("elevation_deg").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(crate::mixer::MasterSend {
+                master_id,
+                on: std::sync::atomic::AtomicBool::new(on),
+                level_db: std::sync::Mutex::new(level_db),
+                rotation_deg: std::sync::Mutex::new(rotation_deg),
+                elevation_deg: std::sync::Mutex::new(elevation_deg),
+            })
         })
         .collect()
 }
@@ -613,6 +871,7 @@ pub(crate) fn parse_sends(value: &serde_json::Value) -> Result<Vec<crate::mixer:
 fn current_bus_value(state: &WsState, bus: &Bus, param: &str) -> serde_json::Value {
     match param {
         "input-patch" => state.mixer.patch.bus_in_json(bus.id, bus.channels),
+        "master-sends" => master_sends_json(&bus.master_sends.lock().unwrap(), bus.layout, &state.mixer),
         _ => serde_json::Value::Null,
     }
 }
@@ -628,6 +887,7 @@ fn current_master_value(state: &WsState, master: &MasterTrack, param: &str, extr
             .map(|s| s.to_json())
             .unwrap_or(serde_json::Value::Null),
         "chain" => chain_json(&master.chain),
+        "master-sends" => master_sends_json(&master.master_sends.lock().unwrap(), master.layout, &state.mixer),
         _ => serde_json::Value::Null,
     }
 }
@@ -683,9 +943,19 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
             let base = format!("amixer/{}/channel/{}", state.mixer_id, track.id);
             publish(&state, &format!("{base}/peakmeter"), serde_json::json!(*track.meter_db.lock().unwrap()));
             publish(&state, &format!("{base}/input-meter"), serde_json::json!(*track.input_meter_db.lock().unwrap()));
-            publish(&state, &format!("{base}/sends"), sends_json(track));
+            publish(&state, &format!("{base}/sends"), sends_json(track, &state.mixer));
             publish(&state, &format!("{base}/chain"), chain_json(&track.chain));
             publish(&state, &format!("{base}/compensation-delay-ms"), compensation_delay_ms_json(&state, &track.compensation_delay_samples));
+            // A freshly-connected client that missed every prior PUT's own broadcast echo still
+            // needs a way to learn the current value -- this periodic tick is it, same reasoning
+            // as `chain` above. Always a real per-channel array now, never empty -- see
+            // adm_objects_json's own doc comment.
+            publish(&state, &format!("{base}/adm-objects"), adm_objects_json(track));
+            // Same "no other discovery path" reasoning, now for the pickoff-point patch bay's own
+            // crosspoint arrays -- SESSION-2026-09-16-AUDIO-PATH-CHECK-DESIGN.md's own prerequisite:
+            // a client (this app's dashboard, or the new audio-path-check tool) had no way to learn
+            // *which* input actually feeds a track without watching levels change and guessing.
+            publish(&state, &format!("{base}/input-patch"), state.mixer.patch.track_in_json(track.id, track.channels));
         }
         for bus in &state.mixer.buses_snapshot() {
             // A bus is a pure summer now -- just its two meters, no fader/DSP pushes (see
@@ -693,6 +963,8 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
             let base = format!("amixer/{}/sum/{}", state.mixer_id, bus.id);
             publish(&state, &format!("{base}/peakmeter"), serde_json::json!(*bus.meter_db.lock().unwrap()));
             publish(&state, &format!("{base}/input-meter"), serde_json::json!(*bus.input_meter_db.lock().unwrap()));
+            publish(&state, &format!("{base}/input-patch"), state.mixer.patch.bus_in_json(bus.id, bus.channels));
+            publish(&state, &format!("{base}/master-sends"), master_sends_json(&bus.master_sends.lock().unwrap(), bus.layout, &state.mixer));
         }
         for master in &state.mixer.masters_snapshot() {
             let base = format!("amixer/{}/master/{}", state.mixer_id, master.id);
@@ -700,6 +972,8 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
             publish(&state, &format!("{base}/input-meter"), serde_json::json!(*master.input_meter_db.lock().unwrap()));
             publish(&state, &format!("{base}/chain"), chain_json(&master.chain));
             publish(&state, &format!("{base}/compensation-delay-ms"), compensation_delay_ms_json(&state, &master.compensation_delay_samples));
+            publish(&state, &format!("{base}/input-patch"), state.mixer.patch.master_in_json(master.id, master.channels));
+            publish(&state, &format!("{base}/master-sends"), master_sends_json(&master.master_sends.lock().unwrap(), master.layout, &state.mixer));
         }
         // channel-list/sum-list/master-list: how a client discovers what track/bus/master ids
         // exist at all (topology.rs's CREATE/DELETE also re-publish these immediately on success,
@@ -707,6 +981,16 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
         publish_lists(&state);
         publish(&state, &format!("amixer/{}/input-grid", state.mixer_id), state.mixer.input_grid.list_json());
         publish(&state, &format!("amixer/{}/output-grid", state.mixer_id), state.mixer.output_grid.list_json());
+        // Every currently-known downmix matrix (compiled default or PUT override, see
+        // DownmixTable's own docs) -- same "no other way for a fresh client to discover the
+        // current value" reasoning as everything else on this tick.
+        for (src, dst, matrix) in state.mixer.downmix_table.snapshot() {
+            publish(
+                &state,
+                &format!("amixer/{}/downmix/{}/{}", state.mixer_id, layout_wire_name(src), layout_wire_name(dst)),
+                serde_json::json!(matrix),
+            );
+        }
         // input:<id>/output:<id>'s own pickoff meters -- namespaced per-entry the same way
         // channel/sum meters are, rather than folded into the list_json() pushes above, since a
         // meter updates every tick regardless of whether the entry list itself has changed. Kind
@@ -725,6 +1009,11 @@ pub async fn run_meter_broadcaster(state: WsState, hz: f64) {
                 &state,
                 &format!("amixer/{}/output/{}/peakmeter", state.mixer_id, entry.id),
                 serde_json::json!(*entry.meter_db.lock().unwrap()),
+            );
+            publish(
+                &state,
+                &format!("amixer/{}/output/{}/patch", state.mixer_id, entry.id),
+                state.mixer.patch.output_json(&entry.id, entry.channels),
             );
         }
     }

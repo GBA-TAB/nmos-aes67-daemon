@@ -129,18 +129,33 @@ fn apply_diff(state: &NmosState, known: &mut HashMap<String, Candidate>, candida
         let entry_id = format!("{ENTRY_PREFIX}{id}");
         match crate::flow::FlowReader::open(&state.cfg.mxl_domain, &state.mxl_so_path, &candidate.flow_id, candidate.channels) {
             Ok(reader) => {
+                // Reserves this entry's own slice of the SAME running channel numbering
+                // main.rs's static config loop reserves through (InputGrid::reserve_channel_range's
+                // own doc comment) -- a discovered entry gets real "Grid In NN" per-channel
+                // identity too, continuing wherever the config-authored entries (if any) left off,
+                // rather than falling back to a "{label} chN" placeholder that never lined up with
+                // the rest of the grid's own numbering. Not stable across a disconnect/reconnect of
+                // the same sender (see that doc comment) -- an accepted trade-off for a best-effort
+                // discovered source.
+                let grid_channel_start = state.mixer.input_grid.reserve_channel_range(candidate.channels as u32);
+                let channel_labels: Vec<String> =
+                    (0..candidate.channels).map(|i| format!("Grid In {:02}", grid_channel_start + i as u32 + 1)).collect();
                 state.mixer.input_grid.insert(InputGridEntry {
                     receiver_id: crate::ids::instance_input_receiver_id(&state.cfg.instance_name, &entry_id),
                     id: entry_id,
-                    label: candidate.label.clone(),
+                    label: std::sync::Mutex::new(candidate.label.clone()),
                     channels: candidate.channels,
+                    channel_labels,
+                    grid_channel_start,
                     // Auto-discovered from the network, not config-authored -- no layout info is
                     // available to attach here.
                     layout: None,
                     reader: std::sync::Mutex::new(Some(reader)),
+                    flow_id: std::sync::Mutex::new(Some(candidate.flow_id.clone())),
                     meter_db: std::sync::Mutex::new(vec![f32::NEG_INFINITY; candidate.channels]),
                     subscribed_sender_id: std::sync::Mutex::new(None),
                     fault: std::sync::Mutex::new(None),
+                    fault_retry_after: std::sync::Mutex::new(None),
                 });
                 tracing::info!(sender_id = id, label = %candidate.label, channels = candidate.channels, "input grid discovery: entry ready");
             }

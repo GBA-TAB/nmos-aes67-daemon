@@ -159,22 +159,32 @@ async fn device_get(State(state): State<S>, Path(id): Path<String>) -> axum::res
     .into_response()
 }
 
+// `output_ids` is built once at startup from the config-seeded output grid (`NmosState::new`) --
+// every lookup below treats a miss as "not found"/"skip" rather than indexing (which would panic
+// the request), defensively, since nothing creates an output-grid entry outside that startup pass
+// today; see registration.rs's own identical guard for the same reasoning.
 async fn sources_list(State(state): State<S>) -> Json<serde_json::Value> {
     let list: Vec<_> = state
         .mixer
         .output_grid
         .snapshot()
         .iter()
-        .map(|e| resources::source_json(&state.cfg, state.device_id, e, state.output_ids[&e.id].source_id, &state.version()))
+        .filter_map(|e| Some(resources::source_json(&state.cfg, state.device_id, e, state.output_ids.get(&e.id)?.source_id, &state.version())))
         .collect();
     Json(serde_json::json!(list))
 }
 
 async fn source_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    match state.mixer.output_grid.snapshot().into_iter().find(|e| state.output_ids[&e.id].source_id.to_string() == id) {
+    match state
+        .mixer
+        .output_grid
+        .snapshot()
+        .into_iter()
+        .find(|e| state.output_ids.get(&e.id).is_some_and(|ids| ids.source_id.to_string() == id))
+    {
         Some(e) => {
-            Json(resources::source_json(&state.cfg, state.device_id, &e, state.output_ids[&e.id].source_id, &state.version()))
-                .into_response()
+            let source_id = state.output_ids[&e.id].source_id;
+            Json(resources::source_json(&state.cfg, state.device_id, &e, source_id, &state.version())).into_response()
         }
         None => not_found(),
     }
@@ -186,15 +196,19 @@ async fn flows_list(State(state): State<S>) -> Json<serde_json::Value> {
         .output_grid
         .snapshot()
         .iter()
-        .map(|e| resources::flow_json(&state.cfg, state.device_id, e, state.output_ids[&e.id].source_id, e.flow_id, &state.version()))
+        .filter_map(|e| {
+            Some(resources::flow_json(&state.cfg, state.device_id, e, state.output_ids.get(&e.id)?.source_id, e.flow_id, &state.version()))
+        })
         .collect();
     Json(serde_json::json!(list))
 }
 
 async fn flow_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
     match state.mixer.output_grid.snapshot().into_iter().find(|e| e.flow_id.to_string() == id) {
-        Some(e) => Json(resources::flow_json(&state.cfg, state.device_id, &e, state.output_ids[&e.id].source_id, e.flow_id, &state.version()))
-            .into_response(),
+        Some(e) => match state.output_ids.get(&e.id) {
+            Some(ids) => Json(resources::flow_json(&state.cfg, state.device_id, &e, ids.source_id, e.flow_id, &state.version())).into_response(),
+            None => not_found(),
+        },
         None => not_found(),
     }
 }
@@ -203,22 +217,31 @@ async fn sender_ids(State(state): State<S>) -> Json<serde_json::Value> {
     Json(serde_json::json!(all_sender_ids(&state).iter().map(|id| format!("{id}/")).collect::<Vec<_>>()))
 }
 
-fn sender_json_for(state: &NmosState, ip: &str, entry: &crate::patch::OutputGridEntry) -> serde_json::Value {
-    let ids = &state.output_ids[&entry.id];
+fn sender_json_for(state: &NmosState, ip: &str, entry: &crate::patch::OutputGridEntry) -> Option<serde_json::Value> {
+    let ids = state.output_ids.get(&entry.id)?;
     let receiver_id = entry.receiver_id.lock().unwrap().clone();
-    resources::sender_json(&state.cfg, ip, state.device_id, entry, ids.sender_id, entry.flow_id, receiver_id, &state.version())
+    Some(resources::sender_json(&state.cfg, ip, state.device_id, entry, ids.sender_id, entry.flow_id, receiver_id, &state.version()))
 }
 
 async fn senders_list(State(state): State<S>) -> Json<serde_json::Value> {
     let ip = client_ip(&state);
-    let list: Vec<_> = state.mixer.output_grid.snapshot().iter().map(|e| sender_json_for(&state, &ip, e)).collect();
+    let list: Vec<_> = state.mixer.output_grid.snapshot().iter().filter_map(|e| sender_json_for(&state, &ip, e)).collect();
     Json(serde_json::json!(list))
 }
 
 async fn sender_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
     let ip = client_ip(&state);
-    match state.mixer.output_grid.snapshot().into_iter().find(|e| state.output_ids[&e.id].sender_id.to_string() == id) {
-        Some(e) => Json(sender_json_for(&state, &ip, &e)).into_response(),
+    match state
+        .mixer
+        .output_grid
+        .snapshot()
+        .into_iter()
+        .find(|e| state.output_ids.get(&e.id).is_some_and(|ids| ids.sender_id.to_string() == id))
+    {
+        Some(e) => match sender_json_for(&state, &ip, &e) {
+            Some(json) => Json(json).into_response(),
+            None => not_found(),
+        },
         None => not_found(),
     }
 }
@@ -268,7 +291,13 @@ async fn sender_transportfile(Path(_id): Path<String>) -> impl IntoResponse {
 }
 
 async fn sender_staged(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
-    match state.mixer.output_grid.snapshot().into_iter().find(|e| state.output_ids[&e.id].sender_id.to_string() == id) {
+    match state
+        .mixer
+        .output_grid
+        .snapshot()
+        .into_iter()
+        .find(|e| state.output_ids.get(&e.id).is_some_and(|ids| ids.sender_id.to_string() == id))
+    {
         Some(e) => Json(serde_json::json!({
             "master_enable": true,
             "activation": { "mode": null, "requested_time": null, "activation_time": null },
@@ -283,7 +312,13 @@ async fn sender_staged(State(state): State<S>, Path(id): Path<String>) -> axum::
 /// An output-grid entry's Sender is always on (see resources.rs's `sender_json` docs) — this only
 /// records `receiver_id` for informational reporting, `master_enable` is accepted but has no effect.
 async fn sender_patch(State(state): State<S>, Path(id): Path<String>, Json(body): Json<serde_json::Value>) -> axum::response::Response {
-    let Some(entry) = state.mixer.output_grid.snapshot().into_iter().find(|e| state.output_ids[&e.id].sender_id.to_string() == id) else {
+    let Some(entry) = state
+        .mixer
+        .output_grid
+        .snapshot()
+        .into_iter()
+        .find(|e| state.output_ids.get(&e.id).is_some_and(|ids| ids.sender_id.to_string() == id))
+    else {
         return not_found();
     };
     if let Some(v) = body.get("receiver_id") {
@@ -339,6 +374,7 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
 
     if !active {
         *entry.reader.lock().unwrap() = None;
+        *entry.flow_id.lock().unwrap() = None;
         *entry.subscribed_sender_id.lock().unwrap() = None;
         return receiver_staged(State(state), Path(id)).await;
     }
@@ -351,8 +387,13 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
             .into_response();
     };
 
-    let own_flow_id =
-        state.mixer.output_grid.snapshot().into_iter().find(|e| state.output_ids[&e.id].sender_id.to_string() == *sid).map(|e| e.flow_id);
+    let own_flow_id = state
+        .mixer
+        .output_grid
+        .snapshot()
+        .into_iter()
+        .find(|e| state.output_ids.get(&e.id).is_some_and(|ids| ids.sender_id.to_string() == *sid))
+        .map(|e| e.flow_id);
     let resolved = match own_flow_id {
         Some(fid) => Ok(fid.to_string()),
         None => registration::resolve_sender_flow_id(&state, sid).await,
@@ -372,9 +413,22 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
     match crate::flow::FlowReader::open(&state.cfg.mxl_domain, &state.mxl_so_path, &flow_id, entry.channels) {
         Ok(reader) => {
             *entry.reader.lock().unwrap() = Some(reader);
+            *entry.flow_id.lock().unwrap() = Some(flow_id);
             *entry.subscribed_sender_id.lock().unwrap() = sender_id;
         }
         Err(e) => {
+            // A real channel-count mismatch (the sender being subscribed to has more channels
+            // than this receiver's own standard-sized placeholder) is a client-caused validation
+            // failure, not a server fault -- real IS-05-correct 400, not 500. Everything else
+            // (flow not found, MXL subsystem fault, ...) stays 500, a genuine server-side problem.
+            if e.downcast_ref::<crate::flow::ChannelCountExceedsPlaceholder>().is_some() {
+                tracing::warn!(error = %e, "receiver activation rejected: sender exceeds this receiver's placeholder size");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"code": 400, "error": e.to_string(), "debug": null})),
+                )
+                    .into_response();
+            }
             tracing::error!(error = %e, "receiver activation failed to open flow");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

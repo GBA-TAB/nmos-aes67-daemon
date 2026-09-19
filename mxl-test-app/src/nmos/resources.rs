@@ -203,7 +203,22 @@ pub fn receiver_json(
         "transport": TRANSPORT_TYPE,
         "interface_bindings": [cfg.interface_name],
         "format": "urn:x-nmos:format:audio",
-        "caps": { "media_types": ["audio/float32"] },
+        // Real AMWA BCP-004-01 Receiver Capabilities -- verified directly against the spec's own
+        // published example (specs.amwa.tv/bcp-004-01/releases/v1.0.0/examples/receiver-audio.html),
+        // not guessed: `urn:x-nmos:cap:format:channel_count`'s real shape is `{"maximum": N}` inside
+        // a `constraint_sets` entry, with a sibling `version` attribute on `caps` itself ("indicate
+        // when the caps last changed" -- reusing this resource's own `version` is correct here,
+        // since caps only ever changes when the entry itself is (re)created). Advertises this
+        // entry's own standard-sized placeholder (`entry.channels`, `layout::is_standard_stream_size`)
+        // as a real maximum a controller can see before attempting a subscription -- see
+        // SESSION-2026-09-15-STANDARD-SIZE-GRID-PLAN.md's Phase F.
+        "caps": {
+            "media_types": ["audio/float32"],
+            "constraint_sets": [
+                { "urn:x-nmos:cap:format:channel_count": { "maximum": entry.channels } }
+            ],
+            "version": version
+        },
         "subscription": { "sender_id": sender_id, "active": active }
     })
 }

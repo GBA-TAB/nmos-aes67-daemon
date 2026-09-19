@@ -114,8 +114,37 @@ impl SourceRef {
 /// from track count (the old per-track Receiver + ephemeral `"recv:<track_id>"` entry synthesis is gone).
 pub struct InputGridEntry {
     pub id: String,
-    pub label: String,
+    /// `Mutex<String>`, not a plain `String` -- this entry's own block-level name is live-
+    /// renamable (`amixer/{mixerId}/input/{entryId}/label`, `ws.rs`), closing the one real gap
+    /// the grid CRUD design doc flagged: everything else about a grid entry (which channels it
+    /// has, its per-channel `channel_labels`, its own subscription) was already either fixed at
+    /// construction by design or genuinely live-editable (IS-05 `receiver_patch`) -- only this
+    /// field was frozen for no real reason. Independent of `channel_labels` (the per-channel "app
+    /// side" position identity within the grid's own running numbering) -- renaming a block never
+    /// renumbers its channels.
+    pub label: Mutex<String>,
     pub channels: usize,
+    /// This entry's own *per-channel* app-facing identity -- exactly `channels` long, one real
+    /// name per individually-addressable channel (`SourceRef::Input { entry_id, channel }`'s own
+    /// existing per-channel addressing, `patch.rs`'s crosspoint model already supported this, only
+    /// the naming was missing). Deliberately independent of `label` (the Receiver/"stream side"'s
+    /// own human name, e.g. "COP1 Audio Rx") -- these are the "app side" position identity within
+    /// the whole grid's own channel numbering (`main.rs`'s `Grid In NN` scheme, same running-offset
+    /// convention `label` itself is auto-generated from when unset), so a controller/dashboard can
+    /// offer each channel as its own real, individually-named audio source when patching a track's
+    /// input, not just a generic "{label} chN" placeholder.
+    pub channel_labels: Vec<String>,
+    /// This entry's own reserved starting position (0-based) within the whole input grid's one
+    /// shared running numbering -- e.g. an entry whose first `channel_labels` entry reads
+    /// "Grid In 09" has `grid_channel_start == 8`. Set once at construction from
+    /// `InputGrid::reserve_channel_range` (both `main.rs`'s static config loop and
+    /// `nmos/discovery.rs`'s runtime registry path reserve through the same counter, so every
+    /// entry -- config-authored or discovered -- participates in one coherent, 1-based numbering
+    /// starting at "Grid In 01"). Exists as a real field, not re-parsed from `channel_labels`,
+    /// so `InputGrid::resolve_grid_channel` (a global grid-channel-number -> entry+local-channel
+    /// lookup, used by `TrackConfig.auto_input`'s `grid_channel` addressing) stays a plain
+    /// arithmetic range check.
+    pub grid_channel_start: u32,
     /// This entry's own standard layout, if any -- see `layout::ChannelLayout`. Not yet consumed
     /// anywhere (a Receiver's NMOS JSON has no `channels[]` label array to fill in, unlike a
     /// Source/Flow) -- stored here for parity with `OutputGridEntry::layout` and any future use.
@@ -125,6 +154,15 @@ pub struct InputGridEntry {
     /// open/replace it at insert time, never across an `.await` — same reasoning as `mixer.rs`'s
     /// pre-existing fields of this shape.
     pub reader: Mutex<Option<FlowReader>>,
+    /// The real MXL flow id `reader` is (or, if `reader` is currently `None`, was last) opened
+    /// against -- set alongside `reader` at every one of its three construction/replacement sites
+    /// (`main.rs`'s config-source path, `nmos/discovery.rs`'s registry auto-discovery, and
+    /// `nmos/server.rs::receiver_patch`'s IS-05 activation). Exists purely so `engine.rs`'s
+    /// read-failure handling can re-open a fresh `FlowReader` against the *same* flow on a
+    /// `mxl::Error::FlowInvalid` (its data file was replaced out from under the existing reader --
+    /// see that error variant's own doc comment) -- `resync_to_head` alone can't recover from this,
+    /// it only moves the read position within a reader whose underlying mapping is already stale.
+    pub flow_id: Mutex<Option<String>>,
     /// This `input:<id>` pickoff point's own peak, one value per channel, in dBFS — written by the
     /// engine once per period (`engine.rs` step 1, right where this entry's buffer is read),
     /// `f32::NEG_INFINITY` for silence *and* for "nothing read this period" (no reader, or a read
@@ -142,16 +180,58 @@ pub struct InputGridEntry {
     /// sync - a stalled/dead flow this way reads honestly as inactive instead of silently still
     /// claiming to be receiving.
     pub fault: Mutex<Option<String>>,
+    /// While faulted, `engine.rs`'s input-read step skips its own read+resync attempt (both real
+    /// MXL SDK calls, not free) until this instant, instead of retrying a known-broken flow every
+    /// single ~10ms period forever - found the hard way when a genuinely-invalid flow drove the
+    /// engine 10ms behind schedule *every period* for 20+ minutes straight. `None` while healthy
+    /// (no backoff in effect); set to "now + backoff" on a read failure, cleared on success.
+    pub fault_retry_after: Mutex<Option<std::time::Instant>>,
 }
 
 #[derive(Default)]
 pub struct InputGrid {
     entries: Mutex<HashMap<String, Arc<InputGridEntry>>>,
+    /// The whole grid's own running channel-numbering counter -- see `reserve_channel_range`.
+    next_offset: std::sync::atomic::AtomicU32,
 }
 
 impl InputGrid {
     pub fn insert(&self, entry: InputGridEntry) {
         self.entries.lock().unwrap().insert(entry.id.clone(), Arc::new(entry));
+    }
+
+    /// Atomically reserves the next `channels`-wide slice of this grid's own shared running
+    /// channel numbering (the "Grid In NN" scheme every entry's `channel_labels` are built from)
+    /// and returns its starting offset (0-based -- add 1 for the human "Grid In NN" number).
+    /// Called once per entry at construction, by both `main.rs`'s static config loop and
+    /// `nmos/discovery.rs`'s runtime registry path, so the whole grid presents one coherent,
+    /// 1-based numbering starting at "Grid In 01" regardless of an entry's origin. A registry-
+    /// discovered entry that disconnects and later reconnects is NOT guaranteed to get the same
+    /// range back -- this is a plain monotonic counter, not a per-sender-id sticky cache -- which
+    /// is an acceptable trade-off for a best-effort auto-discovered source (the registry itself
+    /// offers no stronger identity guarantee either); a config-authored entry never disconnects
+    /// this way, so its own range is stable for the life of the process.
+    pub fn reserve_channel_range(&self, channels: u32) -> u32 {
+        self.next_offset.fetch_add(channels, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves a 1-based position in the grid's own unified running numbering (e.g. `9` for
+    /// "Grid In 09") down to which entry owns it and that channel's 0-based position within that
+    /// entry's own local numbering -- the lookup `TrackConfig.auto_input`'s `grid_channel`
+    /// addressing needs to turn "start this track at the grid's own channel 9" into the
+    /// `(entry_id, local_channel)` pair `SourceRef::Input` actually patches against. `None` if no
+    /// current entry's reserved range covers that position (e.g. it names a channel beyond every
+    /// entry reserved so far, or a discovered entry that has since disconnected).
+    pub fn resolve_grid_channel(&self, grid_channel_1based: u32) -> Option<(String, usize)> {
+        if grid_channel_1based == 0 {
+            return None;
+        }
+        let zero_based = grid_channel_1based - 1;
+        self.entries.lock().unwrap().values().find_map(|e| {
+            let start = e.grid_channel_start;
+            let end = start + e.channels as u32;
+            (zero_based >= start && zero_based < end).then(|| (e.id.clone(), (zero_based - start) as usize))
+        })
     }
 
     pub fn remove(&self, id: &str) {
@@ -169,8 +249,10 @@ impl InputGrid {
     /// `[{"id","label","channels"}, ...]`, sorted by id for a stable client-side rendering order.
     pub fn list_json(&self) -> serde_json::Value {
         let entries = self.entries.lock().unwrap();
-        let mut list: Vec<_> =
-            entries.values().map(|e| serde_json::json!({"id": e.id, "label": e.label, "channels": e.channels})).collect();
+        let mut list: Vec<_> = entries
+            .values()
+            .map(|e| serde_json::json!({"id": e.id, "label": *e.label.lock().unwrap(), "channels": e.channels, "channel_labels": e.channel_labels}))
+            .collect();
         list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         serde_json::json!(list)
     }
@@ -183,7 +265,9 @@ impl InputGrid {
 /// Source+Flow+Sender (plan §14) — neither `Bus` nor `MasterTrack` has NMOS presence of its own.
 pub struct OutputGridEntry {
     pub id: String,
-    pub label: String,
+    /// `Mutex<String>` -- see `InputGridEntry.label`'s own doc comment, same live-rename gap and
+    /// same fix, PUT at `amixer/{mixerId}/output/{entryId}/label`.
+    pub label: Mutex<String>,
     pub channels: usize,
     /// This entry's own standard layout, if any -- see `layout::ChannelLayout`. When set,
     /// `nmos/resources.rs::channels_json` emits each channel's real speaker label instead of the
@@ -226,7 +310,7 @@ impl OutputGrid {
     pub fn list_json(&self) -> serde_json::Value {
         let entries = self.entries.lock().unwrap();
         let mut list: Vec<_> =
-            entries.values().map(|e| serde_json::json!({"id": e.id, "label": e.label, "channels": e.channels})).collect();
+            entries.values().map(|e| serde_json::json!({"id": e.id, "label": *e.label.lock().unwrap(), "channels": e.channels})).collect();
         list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         serde_json::json!(list)
     }
@@ -668,7 +752,7 @@ mod tests {
                         label: format!("T{i}"),
                         channels: None,
                         layout: None,
-                        adm_object: None,
+                        adm_objects: vec![], auto_input: None, lfe_trim_db: 0.0,
                         sends: vec![],
                         gain_db: 0.0,
                         fader_db: 0.0,
@@ -685,16 +769,21 @@ mod tests {
     fn test_input_grid(entries: &[(&str, usize)]) -> InputGrid {
         let grid = InputGrid::default();
         for &(id, channels) in entries {
+            let grid_channel_start = grid.reserve_channel_range(channels as u32);
             grid.insert(InputGridEntry {
                 id: id.to_string(),
-                label: id.to_string(),
+                label: Mutex::new(id.to_string()),
                 channels,
+                channel_labels: (0..channels).map(|i| format!("{id} ch{}", i + 1)).collect(),
+                grid_channel_start,
                 layout: None,
                 reader: Mutex::new(None),
+                flow_id: Mutex::new(None),
                 meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
                 receiver_id: uuid::Uuid::new_v4(),
                 subscribed_sender_id: Mutex::new(None),
                 fault: Mutex::new(None),
+                fault_retry_after: Mutex::new(None),
             });
         }
         grid
@@ -932,5 +1021,37 @@ mod tests {
         // With the entry gone, master_in_json falls back to its own "channels" default (empty
         // per-channel lists), same as a master that never had a patch set at all.
         assert_eq!(patch_state.master_in_json(0, 1)[0].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn reserve_channel_range_hands_out_contiguous_non_overlapping_slices_starting_at_zero() {
+        let grid = InputGrid::default();
+        assert_eq!(grid.reserve_channel_range(8), 0);
+        assert_eq!(grid.reserve_channel_range(8), 8);
+        assert_eq!(grid.reserve_channel_range(4), 16);
+    }
+
+    #[test]
+    fn resolve_grid_channel_maps_a_1_based_grid_position_to_its_owning_entry_and_local_channel() {
+        // Three 8-channel entries reserved in order -- "Grid In 01".."Grid In 24" -- test_input_grid
+        // itself now reserves through InputGrid::reserve_channel_range (same as real startup code),
+        // so this exercises the exact same numbering main.rs/discovery.rs produce.
+        let grid = test_input_grid(&[("in-gen", 8), ("in-cop1", 8), ("in-cop2", 8)]);
+
+        // "Grid In 01" -- the grid's very first channel -- lands on in-gen's own local channel 0.
+        assert_eq!(grid.resolve_grid_channel(1), Some(("in-gen".to_string(), 0)));
+        // "Grid In 08" -- in-gen's own last channel.
+        assert_eq!(grid.resolve_grid_channel(8), Some(("in-gen".to_string(), 7)));
+        // "Grid In 09" -- the second entry's own first channel.
+        assert_eq!(grid.resolve_grid_channel(9), Some(("in-cop1".to_string(), 0)));
+        // "Grid In 17" -- the third entry's own first channel.
+        assert_eq!(grid.resolve_grid_channel(17), Some(("in-cop2".to_string(), 0)));
+    }
+
+    #[test]
+    fn resolve_grid_channel_is_none_for_zero_or_past_every_reserved_range() {
+        let grid = test_input_grid(&[("a", 4)]);
+        assert_eq!(grid.resolve_grid_channel(0), None);
+        assert_eq!(grid.resolve_grid_channel(5), None);
     }
 }

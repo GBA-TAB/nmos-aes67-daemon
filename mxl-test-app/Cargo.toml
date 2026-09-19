@@ -19,3 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 tower-http = { version = "0.7.1", features = ["cors"] }
 quick-xml = "0.36"
+# WS client only, for src/bin/audio-path-check.rs (SESSION-2026-09-16-AUDIO-PATH-CHECK-DESIGN.md)
+# -- the main app is a WS *server* (axum) and never previously needed a client of its own.
+tokio-tungstenite = "0.24"
+clap = { version = "4", features = ["derive"] }

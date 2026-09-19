@@ -30,13 +30,13 @@ use std::sync::atomic::Ordering;
 use crate::engine::MixerState;
 use crate::mixer::MasterTrack;
 
-/// `null` for an ordinary bed track (no `adm_object` slot at all -- `mixer::Track::adm_object` is
-/// `None`), the live `adm::AdmObjectMetadata` value otherwise. Shared by both `capture`'s per-track
-/// live-value section and its dynamically-created-topology section (a dynamically-created
-/// ADM-object track's own topology reconstruction, `main.rs`, re-creates the slot itself from the
-/// same field -- see `config::TrackConfig::adm_object`'s own doc comment).
-fn adm_object_json(t: &crate::mixer::Track) -> serde_json::Value {
-    t.adm_object.as_ref().map(|slot| serde_json::to_value(&*slot.lock().unwrap()).unwrap()).unwrap_or(serde_json::Value::Null)
+/// One live `adm::AdmObjectMetadata` per channel, in channel order, always (every track has this
+/// now, active or not -- `mixer::Track.adm_objects`'s own doc comment). Shared by both `capture`'s
+/// per-track live-value section and its dynamically-created-topology section (a dynamically-
+/// created track's own topology reconstruction, `main.rs`, re-creates the slots itself from the
+/// same field -- see `config::TrackConfig::adm_objects`'s own doc comment).
+fn adm_objects_json(t: &crate::mixer::Track) -> serde_json::Value {
+    serde_json::json!(t.adm_objects.iter().map(|slot| serde_json::to_value(&*slot.lock().unwrap()).unwrap()).collect::<Vec<_>>())
 }
 
 /// Snapshots every track's, bus's, and master's current live state into one JSON document. A bus
@@ -53,12 +53,13 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
             let value = serde_json::json!({
                 "gain_db": *t.gain_db.lock().unwrap(),
                 "fader_db": *t.fader_db.lock().unwrap(),
+                "lfe_trim_db": *t.lfe_trim_db.lock().unwrap(),
                 "mute": t.mute.load(Ordering::Relaxed),
                 "solo": t.solo.load(Ordering::Relaxed),
-                "sends": crate::ws::sends_json(t),
+                "sends": crate::ws::sends_json(t, mixer),
                 "chain": crate::ws::chain_json(&t.chain),
                 "input_patch": mixer.patch.track_in_json(t.id, t.channels),
-                "adm_object": adm_object_json(t),
+                "adm_objects": adm_objects_json(t),
             });
             (t.id.to_string(), value)
         })
@@ -67,7 +68,10 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
     let buses: serde_json::Map<String, serde_json::Value> = bus_list
         .iter()
         .map(|b| {
-            let value = serde_json::json!({ "input_patch": mixer.patch.bus_in_json(b.id, b.channels) });
+            let value = serde_json::json!({
+                "input_patch": mixer.patch.bus_in_json(b.id, b.channels),
+                "master_sends": crate::ws::master_sends_json(&b.master_sends.lock().unwrap(), b.layout, mixer),
+            });
             (b.id.to_string(), value)
         })
         .collect();
@@ -80,6 +84,7 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
                 "mute": m.mute.load(Ordering::Relaxed),
                 "chain": crate::ws::chain_json(&m.chain),
                 "input_patch": mixer.patch.master_in_json(m.id, m.channels),
+                "master_sends": crate::ws::master_sends_json(&m.master_sends.lock().unwrap(), m.layout, mixer),
             });
             (m.id.to_string(), value)
         })
@@ -98,10 +103,11 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
                 "label": t.label,
                 "channels": t.channels,
                 "chain": crate::ws::chain_json(&t.chain),
-                "sends": crate::ws::sends_json(t),
+                "sends": crate::ws::sends_json(t, mixer),
                 "gain_db": *t.gain_db.lock().unwrap(),
                 "fader_db": *t.fader_db.lock().unwrap(),
-                "adm_object": adm_object_json(t),
+                "lfe_trim_db": *t.lfe_trim_db.lock().unwrap(),
+                "adm_objects": adm_objects_json(t),
             });
             (t.id.to_string(), value)
         })
@@ -109,7 +115,15 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
     let dyn_buses: serde_json::Map<String, serde_json::Value> = bus_list
         .iter()
         .filter(|b| b.dynamically_created)
-        .map(|b| (b.id.to_string(), serde_json::json!({ "id": b.id, "label": b.label, "channels": b.channels })))
+        .map(|b| {
+            let value = serde_json::json!({
+                "id": b.id,
+                "label": b.label,
+                "channels": b.channels,
+                "master_sends": crate::ws::master_sends_json(&b.master_sends.lock().unwrap(), b.layout, mixer),
+            });
+            (b.id.to_string(), value)
+        })
         .collect();
     let dyn_masters: serde_json::Map<String, serde_json::Value> = master_list
         .iter()
@@ -121,9 +135,22 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
                 "channels": m.channels,
                 "chain": crate::ws::chain_json(&m.chain),
                 "fader_db": *m.fader_db.lock().unwrap(),
+                "master_sends": crate::ws::master_sends_json(&m.master_sends.lock().unwrap(), m.layout, mixer),
             });
             (m.id.to_string(), value)
         })
+        .collect();
+
+    // Runtime-editable downmix coefficient tables (SESSION-2026-09-16-PAN-OBJECT-MATRIX-DESIGN.md's
+    // addendum) -- captured wholesale as a flat list (not keyed by two layout names glued into one
+    // JSON object key) so a "src|dst" separator choice is never something a future reader needs to
+    // know about. Only entries that differ from the compiled default matter in principle, but
+    // capturing every known entry costs nothing and needs no "is this an override" bookkeeping.
+    let downmix: Vec<serde_json::Value> = mixer
+        .downmix_table
+        .snapshot()
+        .into_iter()
+        .map(|(src, dst, matrix)| serde_json::json!({ "src": src, "dst": dst, "matrix": matrix }))
         .collect();
 
     serde_json::json!({
@@ -131,6 +158,7 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
         "buses": buses,
         "masters": masters,
         "topology": { "tracks": dyn_tracks, "buses": dyn_buses, "masters": dyn_masters },
+        "downmix": downmix,
     })
 }
 
@@ -159,6 +187,9 @@ pub fn apply_snapshot(mixer: &MixerState, snapshot: &serde_json::Value) {
             if let Some(v) = t.get("fader_db").and_then(|v| v.as_f64()) {
                 *track.fader_db.lock().unwrap() = v as f32;
             }
+            if let Some(v) = t.get("lfe_trim_db").and_then(|v| v.as_f64()) {
+                *track.lfe_trim_db.lock().unwrap() = v as f32;
+            }
             if let Some(v) = t.get("mute").and_then(|v| v.as_bool()) {
                 track.mute.store(v, Ordering::Relaxed);
             }
@@ -172,10 +203,20 @@ pub fn apply_snapshot(mixer: &MixerState, snapshot: &serde_json::Value) {
                 }
             }
             apply_chain_snapshot(&track.chain, t.get("chain"));
-            if let (Some(slot), Some(v)) = (&track.adm_object, t.get("adm_object").filter(|v| !v.is_null())) {
-                match serde_json::from_value::<crate::adm::AdmObjectMetadata>(v.clone()) {
-                    Ok(meta) => *slot.lock().unwrap() = meta,
-                    Err(e) => tracing::warn!(track_id = track.id, error = %e, "state file: malformed adm_object, skipped"),
+            if let Some(v) = t.get("adm_objects") {
+                match serde_json::from_value::<Vec<crate::adm::AdmObjectMetadata>>(v.clone()) {
+                    Ok(metas) if metas.len() == track.adm_objects.len() => {
+                        for (slot, meta) in track.adm_objects.iter().zip(metas) {
+                            *slot.lock().unwrap() = meta;
+                        }
+                    }
+                    Ok(metas) => tracing::warn!(
+                        track_id = track.id,
+                        got = metas.len(),
+                        expected = track.adm_objects.len(),
+                        "state file: adm_objects length mismatch, skipped"
+                    ),
+                    Err(e) => tracing::warn!(track_id = track.id, error = %e, "state file: malformed adm_objects, skipped"),
                 }
             }
             if let Some(v) = t.get("input_patch") {
@@ -210,6 +251,12 @@ pub fn apply_snapshot(mixer: &MixerState, snapshot: &serde_json::Value) {
                     Err(e) => tracing::warn!(bus_id = bus.id, error = %e, "state file: malformed input_patch, skipped"),
                 }
             }
+            if let Some(v) = b.get("master_sends") {
+                match crate::ws::parse_master_sends(v) {
+                    Ok(sends) => *bus.master_sends.lock().unwrap() = sends,
+                    Err(e) => tracing::warn!(bus_id = bus.id, error = %e, "state file: malformed master_sends, skipped"),
+                }
+            }
         }
     }
 
@@ -217,6 +264,12 @@ pub fn apply_snapshot(mixer: &MixerState, snapshot: &serde_json::Value) {
         for master in &master_list {
             let Some(m) = masters.get(&master.id.to_string()) else { continue };
             apply_master_fields(master, m);
+            if let Some(v) = m.get("master_sends") {
+                match crate::ws::parse_master_sends(v) {
+                    Ok(sends) => *master.master_sends.lock().unwrap() = sends,
+                    Err(e) => tracing::warn!(master_id = master.id, error = %e, "state file: malformed master_sends, skipped"),
+                }
+            }
             if let Some(v) = m.get("input_patch") {
                 match crate::patch::PatchState::parse_master_in(v) {
                     Ok(patch) => {
@@ -234,6 +287,22 @@ pub fn apply_snapshot(mixer: &MixerState, snapshot: &serde_json::Value) {
                     }
                     Err(e) => tracing::warn!(master_id = master.id, error = %e, "state file: malformed input_patch, skipped"),
                 }
+            }
+        }
+    }
+
+    // Runtime-editable downmix coefficient tables -- see capture()'s own "downmix" doc comment.
+    // Unlike tracks/buses/masters (skipped when the id no longer exists in the live collection),
+    // there's no "does this pair still exist" question here: a (src, dst) pair from an older state
+    // file is just set back into the table exactly as before, whatever it is.
+    if let Some(entries) = snapshot.get("downmix").and_then(|v| v.as_array()) {
+        for entry in entries {
+            let src = entry.get("src").and_then(|v| serde_json::from_value::<crate::layout::ChannelLayout>(v.clone()).ok());
+            let dst = entry.get("dst").and_then(|v| serde_json::from_value::<crate::layout::ChannelLayout>(v.clone()).ok());
+            let matrix = entry.get("matrix").and_then(|v| serde_json::from_value::<Vec<Vec<f32>>>(v.clone()).ok());
+            match (src, dst, matrix) {
+                (Some(src), Some(dst), Some(matrix)) => mixer.downmix_table.set(src, dst, matrix),
+                _ => tracing::warn!(?entry, "state file: malformed downmix entry, skipped"),
             }
         }
     }
@@ -333,7 +402,7 @@ mod tests {
                         label: format!("T{i}"),
                         channels: None,
                         layout: None,
-                        adm_object: None,
+                        adm_objects: vec![], auto_input: None, lfe_trim_db: 0.0,
                         sends: vec![],
                         gain_db: 0.0,
                         fader_db: 0.0,
@@ -360,6 +429,7 @@ mod tests {
                         fader_db: 0.0,
                         template: ChannelTemplate::FullChannel,
                         chain: vec![],
+                        master_sends: vec![],
                     },
                     ch,
                     48000,
@@ -380,6 +450,9 @@ mod tests {
             fault_notify_rx: Mutex::new(None),
             period_frames: 480,
             sample_rate: 48000,
+            mxl_domain: String::new(),
+            mxl_so_path: std::path::PathBuf::new(),
+            downmix_table: crate::mixer::DownmixTable::new(),
         }
     }
 
@@ -404,21 +477,26 @@ mod tests {
         assert!(fresh_track0.solo.load(Ordering::Relaxed));
     }
 
-    fn track_with_adm_object(id: u32, channels: usize, name: &str) -> Arc<Track> {
+    fn track_with_adm_objects(id: u32, names: &[&str]) -> Arc<Track> {
+        let channels = names.len();
         Arc::new(Track::new(
             &TrackConfig {
                 id,
                 label: format!("T{id}"),
                 channels: None,
                 layout: None,
-                adm_object: Some(crate::adm::AdmObjectMetadata {
-                    name: name.to_string(),
-                    gain_db: 0.0,
-                    position: crate::adm::AdmPosition::default(),
-                    width: 0.0,
-                    height: 0.0,
-                    depth: 0.0,
-                }),
+                adm_objects: names
+                    .iter()
+                    .map(|name| crate::adm::AdmObjectMetadata {
+                        name: name.to_string(),
+                        gain_db: 0.0,
+                        position: crate::adm::AdmPosition::default(),
+                        width: 0.0,
+                        height: 0.0,
+                        depth: 0.0,
+                    })
+                    .collect(),
+                auto_input: None, lfe_trim_db: 0.0,
                 sends: vec![],
                 gain_db: 0.0,
                 fader_db: 0.0,
@@ -432,10 +510,12 @@ mod tests {
 
     #[test]
     fn capture_apply_round_trips_adm_object_metadata() {
+        // Two independent objects bundled into one 2-channel track -- confirms the round trip
+        // preserves each channel's own object, not just "a" value shared across the whole track.
         let mixer = test_mixer(&[2]);
-        mixer.tracks.lock().unwrap().insert(0, track_with_adm_object(0, 2, "Dialogue"));
+        mixer.tracks.lock().unwrap().insert(0, track_with_adm_objects(0, &["Dialogue", "FX"]));
         let track0 = mixer.tracks.lock().unwrap().get(&0).unwrap().clone();
-        *track0.adm_object.as_ref().unwrap().lock().unwrap() = crate::adm::AdmObjectMetadata {
+        *track0.adm_objects[0].lock().unwrap() = crate::adm::AdmObjectMetadata {
             name: "Dialogue".to_string(),
             gain_db: -6.0,
             position: crate::adm::AdmPosition { azimuth: 45.0, elevation: 15.0, distance: 1.0 },
@@ -443,28 +523,60 @@ mod tests {
             height: 0.0,
             depth: 0.0,
         };
+        *track0.adm_objects[1].lock().unwrap() = crate::adm::AdmObjectMetadata {
+            name: "FX".to_string(),
+            gain_db: 3.0,
+            position: crate::adm::AdmPosition { azimuth: -90.0, elevation: 0.0, distance: 1.0 },
+            width: 0.0,
+            height: 0.0,
+            depth: 0.0,
+        };
 
         let snapshot = capture(&mixer);
-        assert_eq!(snapshot["tracks"]["0"]["adm_object"]["name"], "Dialogue");
+        assert_eq!(snapshot["tracks"]["0"]["adm_objects"][0]["name"], "Dialogue");
+        assert_eq!(snapshot["tracks"]["0"]["adm_objects"][1]["name"], "FX");
 
         let fresh = test_mixer(&[2]);
-        fresh.tracks.lock().unwrap().insert(0, track_with_adm_object(0, 2, "Dialogue"));
+        fresh.tracks.lock().unwrap().insert(0, track_with_adm_objects(0, &["Dialogue", "FX"]));
         apply_snapshot(&fresh, &snapshot);
         let fresh_track0 = fresh.tracks.lock().unwrap().get(&0).unwrap().clone();
-        let resumed = fresh_track0.adm_object.as_ref().unwrap().lock().unwrap().clone();
-        assert_eq!(resumed.gain_db, -6.0);
-        assert_eq!(resumed.position.azimuth, 45.0);
-        assert_eq!(resumed.position.elevation, 15.0);
-        assert_eq!(resumed.width, 0.1);
+        let resumed0 = fresh_track0.adm_objects[0].lock().unwrap().clone();
+        let resumed1 = fresh_track0.adm_objects[1].lock().unwrap().clone();
+        assert_eq!(resumed0.gain_db, -6.0);
+        assert_eq!(resumed0.position.azimuth, 45.0);
+        assert_eq!(resumed0.position.elevation, 15.0);
+        assert_eq!(resumed0.width, 0.1);
+        assert_eq!(resumed1.gain_db, 3.0);
+        assert_eq!(resumed1.position.azimuth, -90.0);
     }
 
     #[test]
-    fn capture_reports_null_adm_object_for_an_ordinary_bed_track() {
-        // test_mixer's own tracks are all ordinary bed tracks (adm_object: None) -- confirms
-        // capture doesn't invent a value for a track that never had a slot to begin with.
+    fn capture_apply_round_trips_a_downmix_override() {
+        let mixer = test_mixer(&[2]);
+        let custom = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        mixer.downmix_table.set(crate::layout::ChannelLayout::Quad, crate::layout::ChannelLayout::Stereo, custom.clone());
+
+        let snapshot = capture(&mixer);
+        let fresh = test_mixer(&[2]);
+        // fresh's own table starts at the compiled defaults, which has no Quad->Stereo entry at
+        // all -- confirms this is really the override round-tripping, not a coincidental default.
+        assert_eq!(fresh.downmix_table.get(crate::layout::ChannelLayout::Quad, crate::layout::ChannelLayout::Stereo), None);
+        apply_snapshot(&fresh, &snapshot);
+        assert_eq!(fresh.downmix_table.get(crate::layout::ChannelLayout::Quad, crate::layout::ChannelLayout::Stereo), Some(custom));
+    }
+
+    #[test]
+    fn capture_reports_auto_generated_latent_adm_objects_for_an_ordinary_bed_track() {
+        // SESSION-2026-09-18: test_mixer's own tracks are built with an empty TrackConfig.
+        // adm_objects (no seed values) -- every track now always gets real, auto-generated
+        // per-channel latent metadata regardless (mixer::Track.adm_objects's own doc comment), so
+        // capture reports 2 real entries here, not an empty array (whether they're ever actually
+        // *used* by a send is a separate, per-send question this test isn't exercising).
         let mixer = test_mixer(&[2]);
         let snapshot = capture(&mixer);
-        assert!(snapshot["tracks"]["0"]["adm_object"].is_null());
+        let objects = snapshot["tracks"]["0"]["adm_objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0]["position"]["azimuth"], 0.0);
     }
 
     /// `test_mixer`'s tracks/masters are built with `template: FullChannel` and an empty `chain`,
@@ -529,6 +641,54 @@ mod tests {
     }
 
     #[test]
+    fn capture_apply_round_trips_bus_and_master_master_sends() {
+        let mixer = test_mixer(&[2]);
+        let bus = std::sync::Arc::new(crate::mixer::Bus::new(
+            &crate::config::BusConfig { id: 0, label: "B0".into(), channels: Some(2), layout: None, auto_master: None, master_sends: vec![] },
+            2,
+        ));
+        *bus.master_sends.lock().unwrap() = vec![crate::mixer::MasterSend {
+            master_id: 0,
+            on: std::sync::atomic::AtomicBool::new(true),
+            level_db: std::sync::Mutex::new(-3.0),
+            rotation_deg: std::sync::Mutex::new(45.0),
+            elevation_deg: std::sync::Mutex::new(0.0),
+        }];
+        mixer.buses.lock().unwrap().insert(0, bus);
+        let master0 = mixer.masters.lock().unwrap().get(&0).unwrap().clone();
+        *master0.master_sends.lock().unwrap() = vec![crate::mixer::MasterSend {
+            master_id: 1,
+            on: std::sync::atomic::AtomicBool::new(false),
+            level_db: std::sync::Mutex::new(0.0),
+            rotation_deg: std::sync::Mutex::new(0.0),
+            elevation_deg: std::sync::Mutex::new(0.0),
+        }];
+
+        let snapshot = capture(&mixer);
+
+        let fresh = test_mixer(&[2]);
+        let fresh_bus = std::sync::Arc::new(crate::mixer::Bus::new(
+            &crate::config::BusConfig { id: 0, label: "B0".into(), channels: Some(2), layout: None, auto_master: None, master_sends: vec![] },
+            2,
+        ));
+        fresh.buses.lock().unwrap().insert(0, fresh_bus);
+        apply_snapshot(&fresh, &snapshot);
+
+        let fresh_bus = fresh.buses.lock().unwrap().get(&0).unwrap().clone();
+        let bus_sends = fresh_bus.master_sends.lock().unwrap();
+        assert_eq!(bus_sends.len(), 1);
+        assert_eq!(bus_sends[0].master_id, 0);
+        assert_eq!(*bus_sends[0].level_db.lock().unwrap(), -3.0);
+        assert_eq!(*bus_sends[0].rotation_deg.lock().unwrap(), 45.0);
+
+        let fresh_master0 = fresh.masters.lock().unwrap().get(&0).unwrap().clone();
+        let master_sends = fresh_master0.master_sends.lock().unwrap();
+        assert_eq!(master_sends.len(), 1);
+        assert_eq!(master_sends[0].master_id, 1);
+        assert!(!master_sends[0].on.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn capture_writes_topology_only_for_dynamically_created_resources() {
         let mixer = test_mixer(&[2]);
         // test_mixer's own tracks/masters are all dynamically_created == false (built via the
@@ -540,7 +700,7 @@ mod tests {
 
         let created = crate::topology::create_track(
             &mixer,
-            &TrackConfig { id: 99, label: "Dyn".into(), channels: Some(2), layout: None, adm_object: None, sends: vec![], gain_db: 1.0, fader_db: 0.0, template: ChannelTemplate::Simple, chain: vec![] },
+            &TrackConfig { id: 99, label: "Dyn".into(), channels: Some(2), layout: None, adm_objects: vec![], auto_input: None, lfe_trim_db: 0.0, sends: vec![], gain_db: 1.0, fader_db: 0.0, template: ChannelTemplate::Simple, chain: vec![] },
         )
         .unwrap();
         assert!(created.dynamically_created);

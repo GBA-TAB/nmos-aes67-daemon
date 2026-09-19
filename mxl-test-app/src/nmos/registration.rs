@@ -79,7 +79,15 @@ async fn register_all(client: &reqwest::Client, base: &str, state: &NmosState, i
     .await?;
 
     for e in state.mixer.output_grid.snapshot() {
-        let ids = &state.output_ids[&e.id];
+        // `output_ids` is built once at startup from the config-seeded output grid
+        // (`NmosState::new`) -- a lookup miss here would mean an output-grid entry exists that
+        // wasn't known at construction time (only possible today via a bug, since nothing creates
+        // one at runtime yet), so this is a defensive skip against a startup-fixed-set assumption
+        // silently going stale, not a case this can hit in the current codebase.
+        let Some(ids) = state.output_ids.get(&e.id) else {
+            tracing::warn!(output_id = %e.id, "output grid entry has no registered NMOS ids, skipping registration");
+            continue;
+        };
         register_resource(client, base, "source", resources::source_json(&state.cfg, state.device_id, &e, ids.source_id, &state.version()))
             .await?;
         register_resource(
@@ -146,6 +154,14 @@ pub async fn resolve_sender_flow_id(state: &NmosState, sender_id: &str) -> anyho
 /// resync. Drains any further pending notifications before each pass: several faults can transition
 /// around the same time (e.g. a shared MXL domain hiccup), and one full re-registration already
 /// covers all of them. Exits quietly once the channel closes or if no registry is configured.
+/// A hard floor under how often a fault-triggered pass can hit the registry, regardless of how
+/// often `mark_fault`/`clear_fault` notify (a single stuck flow only ever notifies once per
+/// transition, but several entries flapping around the same moment, or a re-registration that
+/// itself keeps failing and thus never clears whatever's still faulted, could otherwise drive this
+/// close to once per notification). `register_all` is a full sequential pass (Node/Device/every
+/// grid entry, one POST each) — worth not re-running back-to-back.
+const MIN_FAULT_REGISTRATION_INTERVAL: Duration = Duration::from_secs(2);
+
 pub async fn run_fault_push(state: Arc<NmosState>, ip: String, mut rx: tokio::sync::mpsc::UnboundedReceiver<()>) {
     let Some(base) = registry_base(&state) else {
         return;
@@ -157,5 +173,10 @@ pub async fn run_fault_push(state: Arc<NmosState>, ip: String, mut rx: tokio::sy
         if let Err(e) = register_all(&client, &base, &state, &ip).await {
             tracing::warn!(error = %e, "fault-triggered re-registration failed");
         }
+        // Coalesce any further transitions that arrive during the cooldown into the *next* pass
+        // rather than firing one immediately after — bounds this loop to at most one full
+        // registration pass per MIN_FAULT_REGISTRATION_INTERVAL no matter how fast faults flap.
+        tokio::time::sleep(MIN_FAULT_REGISTRATION_INTERVAL).await;
+        while rx.try_recv().is_ok() {}
     }
 }

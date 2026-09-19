@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::mixer::{
-    compute_compensation, db_to_linear, is_muted, is_on, is_soloed, mix_into_scaled, mix_into_scaled_with_layout, peak_to_db, Bus, LatencyCompensation, MasterTrack,
-    PickoffPoint, Track,
+    compute_compensation, db_to_linear, is_muted, is_on, is_soloed, mix_into_scaled, mix_into_scaled_with_balance, mix_into_scaled_with_downmix_table, mix_into_scaled_with_layout,
+    mix_into_scaled_with_object_pan, mix_into_scaled_with_per_channel_object_pan, mix_into_scaled_with_rigid_array_pan, mix_into_scaled_with_route, peak_to_db, Bus, DownmixTable, LatencyCompensation,
+    MasterTrack, PanObject, PickoffPoint, Track,
 };
 use crate::patch::{InputGrid, OutputGrid, PatchState};
 
@@ -51,6 +52,17 @@ pub struct MixerState {
     pub fault_notify_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<()>>>,
     pub period_frames: usize,
     pub sample_rate: u32,
+    /// Only ever read by this file's own read-failure handling, to re-open a fresh `FlowReader`
+    /// against an input-grid entry's own `flow_id` on `mxl::Error::FlowInvalid` -- everywhere else
+    /// that opens a `FlowReader` already has these from `Config`/`NmosState` directly at the point
+    /// it needs them (`main.rs`, `nmos/discovery.rs`, `nmos/server.rs::receiver_patch`); the engine
+    /// thread is the one place that didn't, since it never opened a reader itself before now.
+    pub mxl_domain: String,
+    pub mxl_so_path: std::path::PathBuf,
+    /// Runtime-editable downmix coefficients for every `PanObject::Downmix`-classified send
+    /// (SESSION-2026-09-16-PAN-OBJECT-MATRIX-DESIGN.md's own addendum). Seeded at construction
+    /// with today's compiled defaults -- see `DownmixTable`'s own docs.
+    pub downmix_table: DownmixTable,
 }
 
 impl MixerState {
@@ -276,6 +288,14 @@ fn compute_max_channels(tracks: &[Arc<Track>], buses: &[Arc<Bus>], masters: &[Ar
 pub fn run(state: Arc<MixerState>) {
     let period = state.period_frames;
     let read_timeout = Duration::from_secs_f64(2.0 * period as f64 / state.sample_rate as f64);
+    // How long a faulted input-grid entry's read+resync attempt is skipped for before trying
+    // again -- without this, a genuinely broken flow (not just a transient hiccup) gets retried
+    // every single period forever, each attempt a real MXL SDK read *and* resync call. Found the
+    // hard way: a permanently-invalid flow drove the engine ~10ms behind schedule on *every*
+    // period for 20+ minutes straight, since read+resync alone consumed close to this period's
+    // entire time budget. 500ms keeps a real transient recovering promptly while capping the
+    // steady-state cost of a stuck flow at roughly 2 attempts/sec instead of ~1 per period.
+    const FAULT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
     let period_duration = Duration::from_secs_f64(period as f64 / state.sample_rate as f64);
     let mut next_tick = std::time::Instant::now() + period_duration;
 
@@ -309,8 +329,34 @@ pub fn run(state: Arc<MixerState>) {
                 *entry.meter_db.lock().unwrap() = vec![f32::NEG_INFINITY; entry.channels];
                 continue;
             };
+            {
+                let mut retry_after = entry.fault_retry_after.lock().unwrap();
+                if let Some(t) = *retry_after {
+                    if std::time::Instant::now() < t {
+                        // Still backed off from an earlier failure -- same silent-meter, no-buffer
+                        // outcome a genuine read failure below produces, just without spending a
+                        // real read+resync attempt on a flow that's very unlikely to have healed
+                        // in under FAULT_RETRY_INTERVAL.
+                        *entry.meter_db.lock().unwrap() = vec![f32::NEG_INFINITY; entry.channels];
+                        continue;
+                    }
+                    *retry_after = None;
+                }
+            }
             match r.read_next(period, read_timeout) {
-                Ok(planar) => {
+                Ok(mut planar) => {
+                    // A real subscribed flow narrower than this entry's own standard-sized
+                    // placeholder is the normal case now (FlowReader::open accepts up to the
+                    // placeholder, not exactly it -- see flow.rs's own doc comment) -- pad the
+                    // remaining placeholder channels with silence so the meter broadcast and
+                    // input_bufs always show the full placeholder width, not just whatever's
+                    // actually subscribed. patch.rs's own SourceRef::Input resolution is already
+                    // safe against a shorter buffer either way (a channel index past the end
+                    // resolves to silence, not a panic) -- this is purely for a consistent
+                    // operator-facing display.
+                    while planar.len() < entry.channels {
+                        planar.push(vec![0.0; period]);
+                    }
                     let meters: Vec<f32> =
                         planar.iter().map(|ch| peak_to_db(ch.iter().fold(0.0f32, |m, &s| m.max(s.abs())))).collect();
                     *entry.meter_db.lock().unwrap() = meters;
@@ -318,12 +364,45 @@ pub fn run(state: Arc<MixerState>) {
                     state.clear_fault(&mut entry.fault.lock().unwrap());
                 }
                 Err(e) => {
-                    tracing::warn!(entry_id = %entry.id, error = %e, "input grid read failed, resyncing to flow head");
                     *entry.meter_db.lock().unwrap() = vec![f32::NEG_INFINITY; entry.channels];
-                    if let Err(e) = r.resync_to_head() {
-                        tracing::error!(entry_id = %entry.id, error = %e, "failed to resync input grid entry to flow head");
+
+                    // A resync only moves the read *position* within the existing reader -- no
+                    // help at all against `FlowInvalid` specifically, since that means the
+                    // reader's own underlying mapping is stale (its data file was replaced, e.g.
+                    // by a writer that restarted and recreated the flow -- see that error variant's
+                    // own doc comment in the mxl crate), not just its position. Found the hard way:
+                    // mxl-test-app's own discovery can open a reader *before* a sender's IS-05
+                    // activation, and activation can itself recreate the flow's file without
+                    // changing its flow_id -- discovery's own staleness check (label/flow_id/
+                    // channels) is blind to exactly that case, so nothing else would ever recover
+                    // it. Re-open a fresh reader against the same flow_id instead when this is
+                    // that specific error; every other failure keeps the plain resync, unchanged.
+                    let is_flow_invalid = matches!(e.downcast_ref::<mxl::Error>(), Some(mxl::Error::FlowInvalid));
+                    if is_flow_invalid {
+                        tracing::warn!(entry_id = %entry.id, error = ?e, "input grid read failed (flow invalidated), reopening a fresh reader");
+                        match entry.flow_id.lock().unwrap().clone() {
+                            Some(flow_id) => match crate::flow::FlowReader::open(&state.mxl_domain, &state.mxl_so_path, &flow_id, entry.channels) {
+                                Ok(new_reader) => {
+                                    tracing::info!(entry_id = %entry.id, %flow_id, "input grid entry: reopened successfully");
+                                    *reader = Some(new_reader);
+                                }
+                                Err(open_err) => {
+                                    tracing::error!(entry_id = %entry.id, %flow_id, error = %open_err, "failed to reopen input grid entry after flow invalidation");
+                                }
+                            },
+                            None => {
+                                tracing::error!(entry_id = %entry.id, "flow invalidated but this entry has no known flow_id to reopen against");
+                            }
+                        }
+                    } else {
+                        tracing::warn!(entry_id = %entry.id, error = ?e, "input grid read failed, resyncing to flow head");
+                        if let Err(resync_err) = r.resync_to_head() {
+                            tracing::error!(entry_id = %entry.id, error = %resync_err, "failed to resync input grid entry to flow head");
+                        }
                     }
+
                     state.mark_fault(&mut entry.fault.lock().unwrap(), e.to_string());
+                    *entry.fault_retry_after.lock().unwrap() = Some(std::time::Instant::now() + FAULT_RETRY_INTERVAL);
                 }
             }
         }
@@ -399,6 +478,11 @@ pub fn run(state: Arc<MixerState>) {
                 }
             }
 
+            // LFE trim -- an extra multiply on top of the uniform gain above, applied only to this
+            // track's own Lfe-role channel(s) per its layout -- see Track.lfe_trim_db's/
+            // mixer::apply_lfe_trim's own doc comments.
+            crate::mixer::apply_lfe_trim(pre, track.layout, *track.lfe_trim_db.lock().unwrap());
+
             // This track's own ordered processing chain (dsp.rs) -- runs after gain, before fader,
             // in whatever order the chain's own Vec has (no hardcoded per-kind ordering here).
             for stage in &track.chain {
@@ -453,7 +537,86 @@ pub fn run(state: Arc<MixerState>) {
                     // about any track/bus channel-count pairing neither a real downmix matrix nor
                     // the count-only rule can handle -- mix_into_scaled_with_layout itself just
                     // quietly no-ops for one, doesn't need to log here too.
-                    mix_into_scaled_with_layout(src, dst, period, level, track.layout, bus.layout);
+                    //
+                    // This send's own explicit SendPanMode (SESSION-2026-09-18) decides which of
+                    // three mix paths applies -- see that enum's own doc comment for why "every
+                    // track always carries latent per-channel ADM position data, activated per
+                    // send" replaced the old rule ("a track's adm_objects non-empty always wins,
+                    // for every one of its sends, unconditionally"). Exactly one arm runs per send
+                    // per period.
+                    match *send.pan_mode.lock().unwrap() {
+                        // A real fixed alternative for a bus with no named layout to pan into (or
+                        // for an operator who just wants a plain patch-cable-style route instead
+                        // of any automatic panning at all) -- a no-op if no matrix has been set
+                        // yet (mixer::Send.route's own doc comment).
+                        crate::mixer::SendPanMode::Route => {
+                            if let Some(route) = &*send.route.lock().unwrap() {
+                                mix_into_scaled_with_route(src, dst, period, level, route);
+                            }
+                        }
+                        // This channel's own live per-channel position (mixer::Track.adm_objects)
+                        // drives real VBAP panning for this bus specifically
+                        // (mix_into_scaled_with_per_channel_object_pan's own doc comment) --
+                        // independent of PanObject::classify for this track/bus pair, and
+                        // independent of whether any of this track's *other* sends also use Adm.
+                        crate::mixer::SendPanMode::Adm => {
+                            let positions: Vec<(f64, f64)> =
+                                track.adm_objects.iter().map(|slot| { let p = slot.lock().unwrap().position; (p.azimuth, p.elevation) }).collect();
+                            mix_into_scaled_with_per_channel_object_pan(src, dst, period, level, &positions, bus.layout);
+                        }
+                        // SESSION-2026-09-16-PAN-OBJECT-MATRIX-DESIGN.md's own matrix decides:
+                        // Rigid(n) gets the N-point rigid-array panner (rotated/elevated by this
+                        // send's own live rotation_deg/elevation_deg; a Rigid(1) -- Mono into a
+                        // named bed -- has no existing bed-role angle to rotate from and degrades
+                        // to the same single-point object-pan treatment PanPot/Adm use, see that
+                        // function's own doc comment). PanPot (Mono -> Stereo specifically) gets
+                        // that same single-point object-pan treatment directly, rotation_deg/
+                        // elevation_deg read as an absolute azimuth/elevation rather than an
+                        // offset. Every remaining classification (MonoSum/Balance/Downmix/
+                        // CountOnly) still only has mix_into_scaled_with_layout's existing
+                        // downmix-or-count-only behavior for a real mechanism -- Balance has no
+                        // dedicated live control of its own yet, so it falls back to that same
+                        // existing behavior unchanged, same as before this classification existed.
+                        crate::mixer::SendPanMode::Auto => match PanObject::classify(track.layout, bus.layout) {
+                            PanObject::Rigid(_) => {
+                                let rotation = *send.rotation_deg.lock().unwrap();
+                                let elevation = *send.elevation_deg.lock().unwrap();
+                                mix_into_scaled_with_rigid_array_pan(src, dst, period, level, rotation, elevation, track.layout, bus.layout);
+                            }
+                            // Downmix consults the runtime-editable table first (an override if
+                            // one was ever PUT, else its own seeded compiled default -- see
+                            // DownmixTable's own docs) rather than calling
+                            // mix_into_scaled_with_layout directly, so a user edit
+                            // (SESSION-2026-09-16-PAN-OBJECT-MATRIX-DESIGN.md's addendum) actually
+                            // takes effect at mix time.
+                            PanObject::Downmix => {
+                                mix_into_scaled_with_downmix_table(&state.downmix_table, src, dst, period, level, track.layout, bus.layout);
+                            }
+                            // A PanPot send (classify() only ever returns this for a Mono track
+                            // into a Stereo bus) is the classic single-point panner -- rotation_deg/
+                            // elevation_deg are its absolute azimuth/elevation directly (a mono
+                            // source has no existing role angle to rotate *from*, unlike Rigid),
+                            // same object-pan machinery a live ADM object's own position already
+                            // uses. Falls back to mix_into_scaled_with_layout on its own if
+                            // vbap_bed_gains has no ring data for bus.layout.
+                            PanObject::PanPot => {
+                                let azimuth = *send.rotation_deg.lock().unwrap();
+                                let elevation = *send.elevation_deg.lock().unwrap();
+                                mix_into_scaled_with_object_pan(src, dst, period, level, azimuth, elevation, track.layout, bus.layout);
+                            }
+                            // Classic console balance (Stereo -> Stereo only) -- deliberately NOT
+                            // PanPot's own constant-power pan law, see mix_into_scaled_with_balance's
+                            // own doc comment for why. rotation_deg is degrees over the real +-30
+                            // Stereo L/R span here, same field/unit PanPot reads, different meaning.
+                            PanObject::Balance => {
+                                let balance = *send.rotation_deg.lock().unwrap();
+                                mix_into_scaled_with_balance(src, dst, period, level, balance);
+                            }
+                            PanObject::MonoSum | PanObject::CountOnly => {
+                                mix_into_scaled_with_layout(src, dst, period, level, track.layout, bus.layout);
+                            }
+                        },
+                    }
                 }
             }
             // --- Step 4: resolve this bus's input-patch (summing, alongside the sends above) into
@@ -492,11 +655,86 @@ pub fn run(state: Arc<MixerState>) {
             }
             state.patch.resolve_master_in(master.id, &input_bufs, &track_out_this_period, &bus_out_this_period, &master_out_prev, dst);
 
-            // master-in:<id>'s own pickoff meter -- measured here, before the fader touches `dst`,
-            // and safe to measure directly (unlike a bus, a master has only one contributor, so
-            // nothing else has touched `dst` yet at this point -- see the module doc comment).
+            // master-in:<id>'s own pickoff meter -- measured here, before the fader touches `dst`
+            // *and* before any MasterSend below reaches it, so this stays what its own name
+            // promises (the *patch's* own contribution only) -- same "measure before the second
+            // contributor arrives" rule bus.input_meter_db already follows for bus-in vs sends.
             let input_meters: Vec<f32> = dst.iter().map(|ch| peak_to_db(ch.iter().fold(0.0f32, |m, &s| m.max(s.abs())))).collect();
             *master.input_meter_db.lock().unwrap() = input_meters;
+
+            // MasterSend contributions (SESSION-2026-09-16-PAN-OBJECT-MATRIX-DESIGN.md's bus/
+            // master-to-master follow-up): every bus's and every *other* master's own automatic-
+            // panning sends targeting this master, mixed in via the same PanObject::classify
+            // dispatch the track-send loop above already uses. A bus sends its own this-period
+            // output (bus summing already finished in step 4, matching resolve_master_in's own
+            // this-period bus-out read above); another master sends its own *previous* period
+            // output (master_out_prev) -- same ordering rule every other master-to-master read in
+            // this pipeline already follows, so this needs no new cycle detection either.
+            for bus in &buses {
+                for send in bus.master_sends.lock().unwrap().iter() {
+                    if send.master_id != master.id || !is_on(&send.on) {
+                        continue;
+                    }
+                    let Some(src) = bus_out_this_period.get(&bus.id) else { continue };
+                    let level = db_to_linear(*send.level_db.lock().unwrap());
+                    match PanObject::classify(bus.layout, master.layout) {
+                        PanObject::Rigid(_) => {
+                            let rotation = *send.rotation_deg.lock().unwrap();
+                            let elevation = *send.elevation_deg.lock().unwrap();
+                            mix_into_scaled_with_rigid_array_pan(src, dst, period, level, rotation, elevation, bus.layout, master.layout);
+                        }
+                        PanObject::Downmix => {
+                            mix_into_scaled_with_downmix_table(&state.downmix_table, src, dst, period, level, bus.layout, master.layout);
+                        }
+                        PanObject::PanPot => {
+                            let azimuth = *send.rotation_deg.lock().unwrap();
+                            let elevation = *send.elevation_deg.lock().unwrap();
+                            mix_into_scaled_with_object_pan(src, dst, period, level, azimuth, elevation, bus.layout, master.layout);
+                        }
+                        PanObject::Balance => {
+                            let balance = *send.rotation_deg.lock().unwrap();
+                            mix_into_scaled_with_balance(src, dst, period, level, balance);
+                        }
+                        PanObject::MonoSum | PanObject::CountOnly => {
+                            mix_into_scaled_with_layout(src, dst, period, level, bus.layout, master.layout);
+                        }
+                    }
+                }
+            }
+            for other in &masters {
+                if other.id == master.id {
+                    continue;
+                }
+                for send in other.master_sends.lock().unwrap().iter() {
+                    if send.master_id != master.id || !is_on(&send.on) {
+                        continue;
+                    }
+                    let Some(src) = master_out_prev.get(&other.id) else { continue };
+                    let level = db_to_linear(*send.level_db.lock().unwrap());
+                    match PanObject::classify(other.layout, master.layout) {
+                        PanObject::Rigid(_) => {
+                            let rotation = *send.rotation_deg.lock().unwrap();
+                            let elevation = *send.elevation_deg.lock().unwrap();
+                            mix_into_scaled_with_rigid_array_pan(src, dst, period, level, rotation, elevation, other.layout, master.layout);
+                        }
+                        PanObject::Downmix => {
+                            mix_into_scaled_with_downmix_table(&state.downmix_table, src, dst, period, level, other.layout, master.layout);
+                        }
+                        PanObject::PanPot => {
+                            let azimuth = *send.rotation_deg.lock().unwrap();
+                            let elevation = *send.elevation_deg.lock().unwrap();
+                            mix_into_scaled_with_object_pan(src, dst, period, level, azimuth, elevation, other.layout, master.layout);
+                        }
+                        PanObject::Balance => {
+                            let balance = *send.rotation_deg.lock().unwrap();
+                            mix_into_scaled_with_balance(src, dst, period, level, balance);
+                        }
+                        PanObject::MonoSum | PanObject::CountOnly => {
+                            mix_into_scaled_with_layout(src, dst, period, level, other.layout, master.layout);
+                        }
+                    }
+                }
+            }
 
             // This master's own ordered processing chain (dsp.rs) -- runs before the fader (a
             // master has no separate gain stage, unlike a track -- see mixer.rs's MasterTrack).
@@ -569,15 +807,19 @@ mod tests {
     use crate::config::{BusConfig, MasterTrackConfig, TrackConfig};
 
     fn track(id: u32, channels: usize) -> Arc<Track> {
-        Arc::new(Track::new(&TrackConfig { id, label: format!("T{id}"), channels: None, layout: None, adm_object: None, sends: vec![], gain_db: 0.0, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels, 48000))
+        Arc::new(Track::new(&TrackConfig { id, label: format!("T{id}"), channels: None, layout: None, adm_objects: vec![], auto_input: None, lfe_trim_db: 0.0, sends: vec![], gain_db: 0.0, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels, 48000))
     }
 
     fn bus(id: u32, channels: usize) -> Arc<Bus> {
-        Arc::new(Bus::new(&BusConfig { id, label: format!("B{id}"), channels: None, layout: None, auto_master: None }, channels))
+        Arc::new(Bus::new(&BusConfig { id, label: format!("B{id}"), channels: None, layout: None, auto_master: None, master_sends: vec![] }, channels))
     }
 
     fn master(id: u32, channels: usize) -> Arc<MasterTrack> {
-        Arc::new(MasterTrack::new(&MasterTrackConfig { id, label: format!("M{id}"), channels: None, layout: None, fader_db: 0.0, template: Default::default(), chain: vec![] }, channels, 48000))
+        Arc::new(MasterTrack::new(
+            &MasterTrackConfig { id, label: format!("M{id}"), channels: None, layout: None, fader_db: 0.0, template: Default::default(), chain: vec![], master_sends: vec![] },
+            channels,
+            48000,
+        ))
     }
 
     #[test]

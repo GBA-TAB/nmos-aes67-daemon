@@ -122,6 +122,25 @@ fn bytemuck_cast_f32_slice(src: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, std::mem::size_of_val(src)) }
 }
 
+/// A real, genuine mismatch (not a server-side fault) — the flow being subscribed to has more
+/// channels than this grid entry's own standard-sized placeholder can hold. Distinguishable out of
+/// `FlowReader::open`'s `anyhow::Result` via `downcast_ref` specifically so `nmos/server.rs`'s
+/// receiver-activation handler can map this one case to a real IS-05-correct `400 Bad Request`
+/// instead of the generic `500` every other `FlowReader::open` failure still gets.
+#[derive(Debug)]
+pub struct ChannelCountExceedsPlaceholder {
+    pub actual: usize,
+    pub placeholder: usize,
+}
+
+impl std::fmt::Display for ChannelCountExceedsPlaceholder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "flow has {} channel(s), this receiver's placeholder only accepts up to {}", self.actual, self.placeholder)
+    }
+}
+
+impl std::error::Error for ChannelCountExceedsPlaceholder {}
+
 /// Reads an existing MXL audio flow — some other producer (mxl-bridge, or another MXL app) writes
 /// it, this app consumes and mixes it.
 pub struct FlowReader {
@@ -131,7 +150,18 @@ pub struct FlowReader {
 }
 
 impl FlowReader {
-    pub fn open(mxl_domain: &str, mxl_so_path: &std::path::Path, flow_id: &str, expected_channels: usize) -> anyhow::Result<Self> {
+    /// `placeholder_channels` is a grid entry's own standard-sized ("Stream Rx") receive capacity
+    /// (`layout::is_standard_stream_size`, e.g. 8), not an exact count the real flow must match --
+    /// see `SESSION-2026-09-15-DYNAMIC-RX-SIZING-DESIGN.md`/`SESSION-2026-09-15-STANDARD-SIZE-GRID-PLAN.md`
+    /// for the full design. Accepts any real flow whose own channel count fits within the
+    /// placeholder (`channels <= placeholder_channels`); a real flow *larger* than the placeholder
+    /// is a genuine, distinguishable rejection (`ChannelCountExceedsPlaceholder`, downcastable out
+    /// of the returned `anyhow::Error` -- see `nmos/server.rs`'s receiver-activation handler, which
+    /// maps exactly this case to a real `400`, not `500`). A real flow *smaller* than the
+    /// placeholder is the normal case, not an error -- `read_next`'s own returned buffer stays the
+    /// real (smaller) channel count; padding the placeholder's remaining channels with silence for
+    /// display purposes is the caller's job (`engine.rs`'s per-period read step), not this type's.
+    pub fn open(mxl_domain: &str, mxl_so_path: &std::path::Path, flow_id: &str, placeholder_channels: usize) -> anyhow::Result<Self> {
         let api = mxl::load_api(mxl_so_path).map_err(|e| anyhow::anyhow!("mxl::load_api({mxl_so_path:?}) failed: {e:?}"))?;
         let instance =
             mxl::MxlInstance::new(api, mxl_domain, "").map_err(|e| anyhow::anyhow!("MxlInstance::new({mxl_domain}) failed: {e:?}"))?;
@@ -143,8 +173,8 @@ impl FlowReader {
             .continuous()
             .map_err(|e| anyhow::anyhow!("flow {flow_id} is not a continuous (audio) flow: {e:?}"))?
             .channelCount as usize;
-        if channels != expected_channels {
-            anyhow::bail!("MXL flow channel_count ({channels}) does not match expected ({expected_channels})");
+        if channels > placeholder_channels {
+            return Err(ChannelCountExceedsPlaceholder { actual: channels, placeholder: placeholder_channels }.into());
         }
 
         let reader = reader.to_samples_reader().map_err(|e| anyhow::anyhow!("to_samples_reader failed: {e:?}"))?;
@@ -152,7 +182,12 @@ impl FlowReader {
     }
 
     pub fn head_index(&self) -> anyhow::Result<u64> {
-        Ok(self.reader.get_runtime_info().map_err(|e| anyhow::anyhow!("get_runtime_info failed: {e:?}"))?.headIndex)
+        // `anyhow::Error::from(e)` (not a formatted `anyhow::anyhow!("...: {e:?}")` string) keeps
+        // the real `mxl::Error` downcastable out of the returned error -- `engine.rs`'s own
+        // read-failure handling needs to tell `mxl::Error::FlowInvalid` (needs a fresh reopen, not
+        // just a resync) apart from every other failure (where resync is the right response), and
+        // a string-formatted error can't be downcast back to anything.
+        Ok(self.reader.get_runtime_info().map_err(|e| anyhow::Error::from(e).context("get_runtime_info failed"))?.headIndex)
     }
 
     pub fn resync_to_head(&mut self) -> anyhow::Result<()> {
@@ -171,7 +206,8 @@ impl FlowReader {
     }
 
     fn read_samples_at(&self, index: u64, count: usize, timeout: std::time::Duration) -> anyhow::Result<Vec<Vec<f32>>> {
-        let data = self.reader.get_samples(index, count, timeout).map_err(|e| anyhow::anyhow!("get_samples failed: {e:?}"))?;
+        // Same downcast-preserving wrap as `head_index` above, same reason.
+        let data = self.reader.get_samples(index, count, timeout).map_err(|e| anyhow::Error::from(e).context("get_samples failed"))?;
 
         let mut planar = Vec::with_capacity(self.channels);
         for ch in 0..self.channels {
