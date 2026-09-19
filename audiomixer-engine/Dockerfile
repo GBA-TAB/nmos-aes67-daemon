@@ -1,20 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Builds mxl-test-app against a from-source MXL SDK build, the same way mxl-sys's own build.rs
+# Builds audiomixer-engine against a from-source MXL SDK build, the same way mxl-sys's own build.rs
 # does it outside a container (clang + cmake/ninja + vcpkg + libfabric) -- mirrors the builder
 # stage of mxl/examples/Dockerfile, trimmed to what mxl-sys's build actually needs (no GStreamer
 # plugin build, no top-level SDK `ninja install`: mxl-sys vendors and builds its own copy of the
 # SDK into its own OUT_DIR, it doesn't link against a system-installed one here).
 #
-# IMPORTANT — build context: mxl-test-app's Cargo.toml depends on the sibling `mxl` repo via a
-# relative path (`../../mxl/rust/mxl`), so this can't be built with `mxl-test-app/` as the Docker
+# IMPORTANT — build context: audiomixer-engine's Cargo.toml depends on the sibling `mxl` repo via a
+# relative path (`../../mxl/rust/mxl`), so this can't be built with `audiomixer-engine/` as the Docker
 # context (Docker can't see outside its context root). Build from the common parent of both repos
 # instead, e.g. from `~/DEV/nmos/`:
 #
-#   docker build -f aes67-linux-daemon/mxl-test-app/Dockerfile -t mxl-test-app .
+#   docker build -f aes67-linux-daemon/audiomixer-engine/Dockerfile -t audiomixer-engine .
 #
 # (adjust the two path arguments if your checkout layout differs, but keep the *relative* distance
-# between `mxl/` and `aes67-linux-daemon/mxl-test-app/` at exactly two levels, matching the crate's
+# between `mxl/` and `aes67-linux-daemon/audiomixer-engine/` at exactly two levels, matching the crate's
 # own `../../mxl/rust/mxl` path -- that relationship, not any specific absolute path, is what has
 # to be preserved inside the build context).
 
@@ -63,17 +63,17 @@ RUN git clone https://github.com/microsoft/vcpkg.git "${HOME}/vcpkg" \
     && cd "${HOME}/vcpkg" && ./bootstrap-vcpkg.sh -disableMetrics
 ENV VCPKG_ROOT="${HOME}/vcpkg"
 
-# Preserve the exact two-levels-up relationship mxl-test-app/Cargo.toml's `../../mxl/rust/mxl`
+# Preserve the exact two-levels-up relationship audiomixer-engine/Cargo.toml's `../../mxl/rust/mxl`
 # path dependency expects — see the module-level comment above.
 COPY mxl/ /build/mxl/
-COPY aes67-linux-daemon/mxl-test-app/ /build/aes67-linux-daemon/mxl-test-app/
+COPY aes67-linux-daemon/audiomixer-engine/ /build/aes67-linux-daemon/audiomixer-engine/
 RUN /build/mxl/.devcontainer/scripts/common/libfabric/install.sh
 RUN /build/mxl/.devcontainer/scripts/common/rust/install-rust.sh
 ENV CARGO_HOME="${HOME}/.cargo/"
 ENV RUSTUP_HOME="${HOME}/.rustup/"
 ENV PATH="${CARGO_HOME}bin:${PATH}"
 
-WORKDIR /build/aes67-linux-daemon/mxl-test-app
+WORKDIR /build/aes67-linux-daemon/audiomixer-engine
 RUN cargo build --release
 
 #-----------------------------------------------------------------
@@ -84,11 +84,11 @@ RUN cargo build --release
 # the `mxl-sys-` prefix).
 FROM base AS runtime
 WORKDIR /app
-COPY --from=builder /build/aes67-linux-daemon/mxl-test-app/target/release/mxl-test-app /app/mxl-test-app
+COPY --from=builder /build/aes67-linux-daemon/audiomixer-engine/target/release/audiomixer-engine /app/audiomixer-engine
 COPY --from=builder \
-    /build/aes67-linux-daemon/mxl-test-app/target/release/build/mxl-sys-*/out/lib/libmxl.so \
+    /build/aes67-linux-daemon/audiomixer-engine/target/release/build/mxl-sys-*/out/lib/libmxl.so \
     /app/build/mxl-sys-0/out/lib/libmxl.so
-COPY aes67-linux-daemon/mxl-test-app/docker-entrypoint.sh /app/docker-entrypoint.sh
+COPY aes67-linux-daemon/audiomixer-engine/docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 
 RUN useradd -m mxl && chown -R mxl:mxl /app

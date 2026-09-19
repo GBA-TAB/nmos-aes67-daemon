@@ -25,7 +25,7 @@ pub fn node_json(cfg: &Config, node_id: uuid::Uuid, ip: &str, version: &str) -> 
         "id": node_id.to_string(),
         "version": version,
         "label": cfg.nmos_label,
-        "description": "mxl-test-app: a third-party MXL mixer app, for testing mxl-bridge",
+        "description": "audiomixer-engine: a third-party MXL mixer app, for testing mxl-bridge",
         "tags": {},
         "href": format!("{base}/"),
         // The real system hostname - not `instance_name` (a former choice here, reverted: IS-04's
@@ -113,7 +113,7 @@ pub fn source_json(cfg: &Config, device_id: uuid::Uuid, entry: &OutputGridEntry,
         "id": source_id.to_string(),
         "version": version,
         "label": entry.label,
-        "description": format!("mxl-test-app output grid entry '{}'", entry.id),
+        "description": format!("audiomixer-engine output grid entry '{}'", entry.id),
         "tags": {},
         "device_id": device_id.to_string(),
         "parents": [],
@@ -197,7 +197,7 @@ pub fn receiver_json(
         "id": receiver_id.to_string(),
         "version": version,
         "label": entry.label,
-        "description": format!("mxl-test-app input grid entry '{}'", entry.id),
+        "description": format!("audiomixer-engine input grid entry '{}'", entry.id),
         "tags": {},
         "device_id": device_id.to_string(),
         "transport": TRANSPORT_TYPE,
@@ -230,7 +230,7 @@ fn hostname() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "mxl-test-app".to_string())
+        .unwrap_or_else(|| "audiomixer-engine".to_string())
 }
 
 #[cfg(test)]

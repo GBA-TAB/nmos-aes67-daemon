@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Deploys mxl-test-app sized purely via env vars/replica count -- no custom app-manager, matching
+# Deploys audiomixer-engine sized purely via env vars/replica count -- no custom app-manager, matching
 # MXL's own reference deployment pattern (mxl/examples/kube-example.yaml: plain Deployments +
 # PersistentVolumeClaim, nothing MXL-specific beyond the shared domain mount). Assumes the
 # `domain-pv`/`domain-pvc` (and the `mxl-domain-volume-lifecycle-controller` that creates the
@@ -15,24 +15,24 @@
 # a STATE_PATH keyed off that name (the ids::instance_output_flow_id / config.rs `instance_name`
 # convention this app already uses) would never find its predecessor's state -- the replacement
 # would be looking under a name that never existed. A StatefulSet gives each replica a stable
-# ordinal identity (mxl-test-app-0, mxl-test-app-1, ...) *and*, via volumeClaimTemplates below, its
+# ordinal identity (audiomixer-engine-0, audiomixer-engine-1, ...) *and*, via volumeClaimTemplates below, its
 # own dedicated PVC that Kubernetes reattaches to that same ordinal on every replacement, wherever
 # it lands. If you don't need state resume, a plain Deployment (drop volumeClaimTemplates, the
 # `state` volume, and STATE_PATH) is simpler and works exactly as before.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: mxl-test-app
+  name: audiomixer-engine
 spec:
-  serviceName: mxl-test-app # pairs with the headless Service below -- required for a StatefulSet
+  serviceName: audiomixer-engine # pairs with the headless Service below -- required for a StatefulSet
   replicas: 2 # "more than one container" -- each replica is a fully independent MXL app instance
   selector:
     matchLabels:
-      app.kubernetes.io/name: mxl-test-app
+      app.kubernetes.io/name: audiomixer-engine
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: mxl-test-app
+        app.kubernetes.io/name: audiomixer-engine
     spec:
       nodeSelector:
         kubernetes.io/hostname: __HOSTNAME__ # !! CHANGEME, same convention as mxl's own example
@@ -47,8 +47,8 @@ spec:
           persistentVolumeClaim:
             claimName: domain-pvc
       containers:
-        - name: mxl-test-app
-          image: mxl-test-app:latest
+        - name: audiomixer-engine
+          image: audiomixer-engine:latest
           imagePullPolicy: IfNotPresent
           volumeMounts:
             - name: domain
@@ -81,7 +81,7 @@ spec:
             # any per-replica config authoring (see ids::instance_output_flow_id / config.rs's
             # `instance_name` docs). Kubernetes' downward API is the normalized way to get a pod
             # its own identity from inside itself. Stable across replacement here specifically
-            # *because* this is a StatefulSet (mxl-test-app-0 is always mxl-test-app-0) -- a plain
+            # *because* this is a StatefulSet (audiomixer-engine-0 is always audiomixer-engine-0) -- a plain
             # Deployment's pod names are random and would defeat both this and STATE_PATH above.
             - name: INSTANCE_NAME
               valueFrom:
@@ -116,17 +116,17 @@ spec:
 ---
 # Headless (clusterIP: None) -- required to pair with the StatefulSet's `serviceName` above, and
 # also the right choice on its own merits: gives each replica a stable DNS name
-# (<pod-name>.mxl-test-app.<namespace>.svc.cluster.local), which is what a controller actually
+# (<pod-name>.audiomixer-engine.<namespace>.svc.cluster.local), which is what a controller actually
 # needs to reach one *specific* replica's tracks/buses rather than an arbitrary one a plain
 # load-balanced Service would route to.
 apiVersion: v1
 kind: Service
 metadata:
-  name: mxl-test-app
+  name: audiomixer-engine
 spec:
   clusterIP: None
   selector:
-    app.kubernetes.io/name: mxl-test-app
+    app.kubernetes.io/name: audiomixer-engine
   ports:
     - port: 9090
       targetPort: amixer-ws

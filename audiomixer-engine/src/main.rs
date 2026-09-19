@@ -46,7 +46,7 @@ fn find_mxl_so() -> anyhow::Result<std::path::PathBuf> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
 
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| "mxl-test-app.conf".to_string());
+    let config_path = std::env::args().nth(1).unwrap_or_else(|| "audiomixer-engine.conf".to_string());
     let cfg = Config::load(&config_path)?;
     tracing::info!(
         tracks = cfg.tracks.len(),

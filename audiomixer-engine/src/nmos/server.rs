@@ -287,7 +287,7 @@ async fn sender_transportfile(Path(_id): Path<String>) -> impl IntoResponse {
     // Same note as mxl-bridge's own handler: nothing here actually consumes this (a receiver
     // activating against one of this app's Senders self-resolves flow_id via sender_id + registry
     // query), it exists only so controllers that unconditionally GET it before PATCHing don't break.
-    ([(axum::http::header::CONTENT_TYPE, "text/plain")], "mxl-test-app: not used")
+    ([(axum::http::header::CONTENT_TYPE, "text/plain")], "audiomixer-engine: not used")
 }
 
 async fn sender_staged(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {

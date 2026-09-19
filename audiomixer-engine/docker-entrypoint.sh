@@ -74,7 +74,7 @@ METER_HZ="${METER_HZ:-25}"
 # hostname is its short container id by default) for docker-compose/plain `docker run` use, so
 # output-grid flow ids are still deterministic-per-container without extra config there either.
 INSTANCE_NAME="${INSTANCE_NAME:-$(hostname)}"
-NMOS_LABEL="${NMOS_LABEL:-mxl-test-app ${INSTANCE_NAME}}"
+NMOS_LABEL="${NMOS_LABEL:-audiomixer-engine ${INSTANCE_NAME}}"
 NMOS_REGISTRY_ADDRESS="${NMOS_REGISTRY_ADDRESS:-}"
 NMOS_REGISTRY_PORT="${NMOS_REGISTRY_PORT:-80}"
 INTERFACE_NAME="${INTERFACE_NAME:-eth0}"
@@ -88,7 +88,7 @@ IP_ADDR="${IP_ADDR:-$(hostname -i 2>/dev/null | awk '{print $1}')}"
 # kube-example.yaml) for a pod restart/reschedule to resume live state, not just static config.
 STATE_PATH="${STATE_PATH:-}"
 
-CONFIG_PATH="${CONFIG_PATH:-/tmp/mxl-test-app.conf}"
+CONFIG_PATH="${CONFIG_PATH:-/tmp/audiomixer-engine.conf}"
 
 # Splits a "key:value" target spec (e.g. "packed_tx_name:testmix2" or "flow_id:<uuid>") into a
 # `"target":{"key":"value"}` JSON fragment, or the empty string if $1 is unset/empty -- shared by
@@ -201,4 +201,4 @@ cat > "$CONFIG_PATH" <<EOF
 EOF
 
 echo "generated ${CONFIG_PATH} (${TRACK_COUNT} tracks, ${BUS_COUNT} buses, masters '${MASTER_COUNT:-auto-paired}', ${INPUT_GRID_COUNT} input-grid x ${input_grid_channels}ch, ${OUTPUT_GRID_COUNT} output-grid x ${output_grid_channels}ch, template '${CHANNEL_TEMPLATE}', instance '${INSTANCE_NAME}')" >&2
-exec /app/mxl-test-app "$CONFIG_PATH"
+exec /app/audiomixer-engine "$CONFIG_PATH"
