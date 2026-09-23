@@ -68,14 +68,33 @@ pub struct Config {
     /// 3 of the plan replaces/augments this with NMOS registry auto-discovery; for now this is the
     /// only way an entry gets into the pool (besides the ephemeral ones IS-05 receiver activation
     /// synthesizes at runtime, `nmos/server.rs`).
-    #[serde(default)]
+    ///
+    /// Accepts either the explicit per-entry array shown above, or a compact `ChannelPlan` object
+    /// (`{"sizes": [8,8,32]}` or `{"count": 16, "channels": 8}`, optional `"id_prefix"`) that
+    /// expands to the same shape at load time — see `ChannelPlan`'s own doc comment. Both forms
+    /// produce identical `InputGridEntryConfig`s; nothing downstream of `Config::load` can tell
+    /// which one was used.
+    #[serde(default, deserialize_with = "deserialize_input_grid")]
     pub input_grid: Vec<InputGridEntryConfig>,
     /// Output-grid entries (Milestone 2, `OutputGridEntryConfig`) -- receiver-capacity-sized
     /// transmit slots patched from tracks/buses/input-grid entries, each with its own real MXL
     /// flow. Empty by default (no output grid) -- a deployment that only needs buses' own always-on
     /// flows doesn't need to configure any.
-    #[serde(default)]
+    ///
+    /// Same `ChannelPlan` shorthand as `input_grid` (`id_prefix` defaults to `"out"` here).
+    #[serde(default, deserialize_with = "deserialize_output_grid")]
     pub output_grid: Vec<OutputGridEntryConfig>,
+
+    /// Size of the fixed "app input grid" pool (`patch::AppInputGrid`) a track/bus/master can
+    /// patch from via `SourceRef::AppInput{channel}`, decoupled from `input_grid`'s own total
+    /// channel capacity -- see `nmos/is08.rs`'s module docs for why a real NMOS controller needs
+    /// this indirection (it's IS-08's Output side; `input_grid`'s entries are its Input side).
+    /// `0` (default) disables the feature entirely: no app-input-grid buffer is ever populated,
+    /// no `SourceRef::AppInput` patch can validate, and the IS-08 HTTP surface advertises no
+    /// Outputs (still advertises Inputs -- one per `input_grid` entry -- since those exist
+    /// independent of whether anything downstream consumes them).
+    #[serde(default)]
+    pub app_input_grid_channels: u32,
 
     pub tracks: Vec<TrackConfig>,
     pub buses: Vec<BusConfig>,
@@ -111,6 +130,110 @@ fn default_channels() -> u32 {
 
 fn default_meter_hz() -> f64 {
     25.0
+}
+
+/// Compact alternative to hand-writing every `input_grid`/`output_grid` entry: declares the
+/// grid's channel-grouping shape (how many entries, how many channels each) without a per-entry
+/// `id`/`label`. Two mutually-exclusive ways to size the groups:
+/// - `sizes`: one number per entry, explicit and possibly uneven (e.g. `[8, 8, 8, 8, 32]`).
+/// - `count` + `channels`: `count` entries, all `channels` wide (e.g. `{"count": 16, "channels": 8}`
+///   for sixteen 8-channel entries) — sugar for `sizes` repeating the same value.
+///
+/// Expands (`expand_input`/`expand_output`) into plain `id`-`{prefix}-{n:02}` entries in
+/// declaration order, identical in every other respect to a hand-authored `InputGridEntryConfig`/
+/// `OutputGridEntryConfig` (`label`/`source`/`target`/`layout` all left at their own defaults —
+/// this shorthand is for grid *shape*, not per-entry content; an entry needing a real `source`/
+/// `target`/`layout` should stay in the explicit array form instead). Downstream code (`main.rs`'s
+/// grid-building loop, NMOS resource JSON, standard-size validation) never sees a `ChannelPlan` —
+/// it only ever sees the `Vec<...>` this expands into, same as the explicit form.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPlan {
+    #[serde(default)]
+    id_prefix: Option<String>,
+    #[serde(default)]
+    sizes: Option<Vec<u32>>,
+    #[serde(default)]
+    count: Option<u32>,
+    #[serde(default)]
+    channels: Option<u32>,
+}
+
+impl ChannelPlan {
+    fn resolve_sizes(&self) -> Result<Vec<u32>, String> {
+        match (&self.sizes, self.count, self.channels) {
+            (Some(sizes), None, None) if !sizes.is_empty() => Ok(sizes.clone()),
+            (None, Some(count), Some(channels)) if count > 0 => Ok(vec![channels; count as usize]),
+            (Some(_), None, None) | (None, Some(_), Some(_)) => {
+                Err("channel plan's `sizes`/`count` must be non-empty/non-zero".to_string())
+            }
+            _ => Err("channel plan must set either `sizes` on its own, or `count` and `channels` together".to_string()),
+        }
+    }
+
+    fn expand_input(&self) -> Result<Vec<InputGridEntryConfig>, String> {
+        let prefix = self.id_prefix.as_deref().unwrap_or("in");
+        Ok(self
+            .resolve_sizes()?
+            .into_iter()
+            .enumerate()
+            .map(|(i, channels)| InputGridEntryConfig {
+                id: format!("{prefix}-{:02}", i + 1),
+                label: None,
+                source: None,
+                channels: Some(channels),
+                layout: None,
+            })
+            .collect())
+    }
+
+    fn expand_output(&self) -> Result<Vec<OutputGridEntryConfig>, String> {
+        let prefix = self.id_prefix.as_deref().unwrap_or("out");
+        Ok(self
+            .resolve_sizes()?
+            .into_iter()
+            .enumerate()
+            .map(|(i, channels)| OutputGridEntryConfig {
+                id: format!("{prefix}-{:02}", i + 1),
+                label: None,
+                target: None,
+                channels: Some(channels),
+                layout: None,
+            })
+            .collect())
+    }
+}
+
+fn deserialize_input_grid<'de, D>(deserializer: D) -> Result<Vec<InputGridEntryConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Explicit(Vec<InputGridEntryConfig>),
+        Plan(ChannelPlan),
+    }
+    match Repr::deserialize(deserializer)? {
+        Repr::Explicit(entries) => Ok(entries),
+        Repr::Plan(plan) => plan.expand_input().map_err(serde::de::Error::custom),
+    }
+}
+
+fn deserialize_output_grid<'de, D>(deserializer: D) -> Result<Vec<OutputGridEntryConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Explicit(Vec<OutputGridEntryConfig>),
+        Plan(ChannelPlan),
+    }
+    match Repr::deserialize(deserializer)? {
+        Repr::Explicit(entries) => Ok(entries),
+        Repr::Plan(plan) => plan.expand_output().map_err(serde::de::Error::custom),
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -608,6 +731,61 @@ mod entrypoint_tests {
         assert!(cfg.buses[0].auto_master.is_some());
         assert!(cfg.buses[1].auto_master.is_some());
         assert!(cfg.output_grid[0].target.is_some());
+    }
+
+    fn base_config_json() -> serde_json::Value {
+        serde_json::json!({
+            "mxl_domain": "/tmp/fake-domain",
+            "sample_rate": 48000,
+            "period_frames": 480,
+            "channels": 2,
+            "ws_port": 9090,
+            "nmos_label": "audiomixer-engine test",
+            "interface_name": "eth0",
+            "ip_addr": "127.0.0.1",
+            "tracks": [],
+            "buses": []
+        })
+    }
+
+    #[test]
+    fn channel_plan_with_explicit_sizes_expands_to_one_entry_per_size_in_order() {
+        let mut json = base_config_json();
+        json["input_grid"] = serde_json::json!({"sizes": [8, 8, 8, 8, 32]});
+        let cfg: Config = serde_json::from_str(&json.to_string()).unwrap();
+        assert_eq!(cfg.input_grid.len(), 5);
+        assert_eq!(cfg.input_grid[0].id, "in-01");
+        assert_eq!(cfg.input_grid[0].channels, Some(8));
+        assert_eq!(cfg.input_grid[4].id, "in-05");
+        assert_eq!(cfg.input_grid[4].channels, Some(32));
+    }
+
+    #[test]
+    fn channel_plan_with_count_and_channels_expands_to_equal_sized_entries() {
+        let mut json = base_config_json();
+        json["output_grid"] = serde_json::json!({"count": 16, "channels": 8, "id_prefix": "grid"});
+        let cfg: Config = serde_json::from_str(&json.to_string()).unwrap();
+        assert_eq!(cfg.output_grid.len(), 16);
+        assert!(cfg.output_grid.iter().all(|e| e.channels == Some(8)));
+        assert_eq!(cfg.output_grid[0].id, "grid-01");
+        assert_eq!(cfg.output_grid[15].id, "grid-16");
+    }
+
+    #[test]
+    fn channel_plan_rejects_mixing_sizes_with_count_or_channels() {
+        let mut json = base_config_json();
+        json["input_grid"] = serde_json::json!({"sizes": [8, 8], "count": 2});
+        let err = serde_json::from_str::<Config>(&json.to_string()).unwrap_err();
+        assert!(err.to_string().contains("channel plan"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn explicit_grid_array_form_still_works_unchanged() {
+        let mut json = base_config_json();
+        json["input_grid"] = serde_json::json!([{"id": "in-gen", "channels": 8}]);
+        let cfg: Config = serde_json::from_str(&json.to_string()).unwrap();
+        assert_eq!(cfg.input_grid.len(), 1);
+        assert_eq!(cfg.input_grid[0].id, "in-gen");
     }
 }
 

@@ -65,6 +65,29 @@ pub fn device_json(
     receiver_ids: &[uuid::Uuid],
 ) -> serde_json::Value {
     let base = base_url(cfg, ip);
+    let mut controls = vec![
+        serde_json::json!({
+            "href": format!("{base}/x-nmos/connection/v1.1/"),
+            "type": "urn:x-nmos:control:sr-ctrl/v1.1",
+            "authorization": false
+        }),
+        serde_json::json!({
+            // Kept alongside v1.1, not replacing it - see `TRANSPORT_TYPE`'s doc comment for why.
+            "href": format!("{base}/x-nmos/connection/v1.2/"),
+            "type": "urn:x-nmos:control:sr-ctrl/v1.2",
+            "authorization": false
+        }),
+    ];
+    // Only advertised once there's an app-input-grid Output for it to expose (`nmos/is08.rs`'s own
+    // module docs) -- a deployment that never sets `app_input_grid_channels` gets no IS-08 control
+    // at all, matching that whole feature's "0 channels disables it entirely" convention.
+    if cfg.app_input_grid_channels > 0 {
+        controls.push(serde_json::json!({
+            "href": format!("{base}/x-nmos/channelmapping/v1.0/"),
+            "type": "urn:x-nmos:control:cm-ctrl/v1.0",
+            "authorization": false
+        }));
+    }
     serde_json::json!({
         "id": device_id.to_string(),
         "version": version,
@@ -76,21 +99,22 @@ pub fn device_json(
         // external topology tool (visualUniverse-nmosrouter's "MXL-world topology" view) group
         // Devices into the real Host/Domain/App/Flow graph without a second, MXL-specific
         // discovery mechanism.
-        "tags": { "urn:x-mxl:tag:domain/v1.0": [cfg.mxl_domain] },
+        // Second additive tag, same convention as the domain one above: lets a generic control
+        // proxy (mxl-proxy) discover this Device's own amixer WebSocket control surface purely
+        // from the registry, instead of needing a hand-maintained URL in that proxy's own config --
+        // wire format "<kind>:<path>", kind matching mxl-proxy's own config.json `type` values
+        // exactly ("ws"/"rest") so its discovery code and static-config code share one branch.
+        // `path` is combined with this Device's own real host:port, already present in
+        // `controls[]` below.
+        "tags": {
+            "urn:x-mxl:tag:domain/v1.0": [cfg.mxl_domain],
+            "urn:x-mxl:tag:control-surface/v1.0": ["ws:/amixer/api/socket"]
+        },
         "type": "urn:x-nmos:device:generic",
         "node_id": node_id.to_string(),
         "senders": sender_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
         "receivers": receiver_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-        "controls": [{
-            "href": format!("{base}/x-nmos/connection/v1.1/"),
-            "type": "urn:x-nmos:control:sr-ctrl/v1.1",
-            "authorization": false
-        }, {
-            // Kept alongside v1.1, not replacing it - see `TRANSPORT_TYPE`'s doc comment for why.
-            "href": format!("{base}/x-nmos/connection/v1.2/"),
-            "type": "urn:x-nmos:control:sr-ctrl/v1.2",
-            "authorization": false
-        }]
+        "controls": controls
     })
 }
 

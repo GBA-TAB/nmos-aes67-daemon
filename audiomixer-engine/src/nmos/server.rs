@@ -7,7 +7,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use tower_http::cors::CorsLayer;
 
-use super::{registration, resources, NmosState};
+use super::{is08, registration, resources, NmosState};
 
 type S = Arc<NmosState>;
 
@@ -16,8 +16,8 @@ type S = Arc<NmosState>;
 /// `BUILDING-AN-MXL-NMOS-NODE.md` for the full investigation behind each one.
 pub fn router(state: S) -> Router {
     Router::new()
-        .route("/x-nmos/", get(|| list(&["node/", "connection/"])))
-        .route("/x-nmos", get(|| list(&["node/", "connection/"])))
+        .route("/x-nmos/", get(|| list(&["node/", "connection/", "channelmapping/"])))
+        .route("/x-nmos", get(|| list(&["node/", "connection/", "channelmapping/"])))
         .route("/x-nmos/connection/", get(|| list(&["v1.1/", "v1.2/"])))
         .route("/x-nmos/connection", get(|| list(&["v1.1/", "v1.2/"])))
         .route("/x-nmos/node/", get(|| list(&["v1.3/"])))
@@ -54,6 +54,7 @@ pub fn router(state: S) -> Router {
         .route("/x-nmos/connection/v1.2/bulk", get(|| async { bulk_not_implemented() }))
         .route("/x-nmos/connection/v1.2/bulk/senders", get(|| async { bulk_not_implemented() }))
         .route("/x-nmos/connection/v1.2/bulk/receivers", get(|| async { bulk_not_implemented() }))
+        .merge(is08::router())
         .fallback(|| async { not_found() })
         .with_state(state)
         .layer(

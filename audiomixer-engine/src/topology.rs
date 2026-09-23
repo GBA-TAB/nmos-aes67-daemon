@@ -122,7 +122,7 @@ pub fn create_track(mixer: &MixerState, cfg: &TrackConfig) -> Result<Arc<Track>,
     }
     warn_incompatible_sends(&track, &mixer.buses_snapshot());
     mixer.topology_generation.fetch_add(1, Ordering::Relaxed);
-    tracing::info!(track_id = track.id, label = %track.label, channels = track.channels, "track created at runtime");
+    tracing::info!(track_id = track.id, label = %track.label.lock().unwrap(), channels = track.channels, "track created at runtime");
     Ok(track)
 }
 
@@ -139,7 +139,7 @@ pub fn create_bus(mixer: &MixerState, cfg: &BusConfig) -> Result<Arc<Bus>, Strin
         tracing::warn!(bus_id = bus.id, "auto_master is a startup-only convenience and is ignored on a runtime-created bus -- CREATE a master and PUT its master-in explicitly instead");
     }
     mixer.topology_generation.fetch_add(1, Ordering::Relaxed);
-    tracing::info!(bus_id = bus.id, label = %bus.label, channels = bus.channels, "bus created at runtime");
+    tracing::info!(bus_id = bus.id, label = %bus.label.lock().unwrap(), channels = bus.channels, "bus created at runtime");
     Ok(bus)
 }
 
@@ -153,7 +153,7 @@ pub fn create_master(mixer: &MixerState, cfg: &MasterTrackConfig) -> Result<Arc<
         masters.insert(cfg.id, master.clone());
     }
     mixer.topology_generation.fetch_add(1, Ordering::Relaxed);
-    tracing::info!(master_id = master.id, label = %master.label, channels = master.channels, "master created at runtime");
+    tracing::info!(master_id = master.id, label = %master.label.lock().unwrap(), channels = master.channels, "master created at runtime");
     Ok(master)
 }
 

@@ -121,6 +121,7 @@ fn param_schemas_json() -> serde_json::Value {
     let patch_entry_shape = "null | {\"source\": \"input:<id>\"|\"track-out:<id>\"|\"bus-out:<id>\"|\"master-out:<id>\", \"channel\": int}";
 
     let channel = serde_json::json!({
+        "label": param("string", serde_json::json!({})),
         "gain": param("float", serde_json::json!({"unit": "dB", "min": -20, "max": 20, "default": 0})),
         "fader": param("float", serde_json::json!({"unit": "dB", "min": -128, "max": 12, "default": 0})),
         "lfe-trim": param("float", serde_json::json!({"unit": "dB", "min": -20, "max": 12, "default": 0, "applicability": "layout has an Lfe role (see schema.layouts)"})),
@@ -135,12 +136,14 @@ fn param_schemas_json() -> serde_json::Value {
         "compensation-delay-ms": readonly(param("float", serde_json::json!({"unit": "ms"}))),
     });
     let sum = serde_json::json!({
+        "label": param("string", serde_json::json!({})),
         "input-patch": param("array", serde_json::json!({"item": patch_entry_shape, "summing": true, "note": "a bus is a pure summer -- no gain/fader/mute of its own"})),
         "master-sends": param("array", serde_json::json!({"item": send_shape, "note": "same shape as a channel's own sends, minus pickoff (a bus has no fader stage to tap pre/post of)"})),
         "peakmeter": readonly(param("array", serde_json::json!({"item": "float (dBFS) | null"}))),
         "input-meter": readonly(param("array", serde_json::json!({"item": "float (dBFS) | null"}))),
     });
     let master = serde_json::json!({
+        "label": param("string", serde_json::json!({})),
         "fader": param("float", serde_json::json!({"unit": "dB", "min": -128, "max": 12, "default": 0})),
         "mute": param("bool", serde_json::json!({"default": false})),
         "chain": readonly(param("array", serde_json::json!({"item": "see channel.chain"}))),
@@ -179,7 +182,7 @@ fn topology_json(state: &WsState) -> serde_json::Value {
         .iter()
         .map(|t| {
             serde_json::json!({
-                "id": t.id, "label": t.label, "channels": t.channels, "layout": t.layout,
+                "id": t.id, "label": *t.label.lock().unwrap(), "channels": t.channels, "layout": t.layout,
                 "gain": *t.gain_db.lock().unwrap(),
                 "fader": *t.fader_db.lock().unwrap(),
                 "lfe-trim": *t.lfe_trim_db.lock().unwrap(),
@@ -196,7 +199,7 @@ fn topology_json(state: &WsState) -> serde_json::Value {
         .iter()
         .map(|b| {
             serde_json::json!({
-                "id": b.id, "label": b.label, "channels": b.channels, "layout": b.layout,
+                "id": b.id, "label": *b.label.lock().unwrap(), "channels": b.channels, "layout": b.layout,
                 "input-patch": mixer.patch.bus_in_json(b.id, b.channels),
                 "master-sends": crate::ws::master_sends_json(&b.master_sends.lock().unwrap(), b.layout, mixer),
             })
@@ -206,7 +209,7 @@ fn topology_json(state: &WsState) -> serde_json::Value {
         .iter()
         .map(|m| {
             serde_json::json!({
-                "id": m.id, "label": m.label, "channels": m.channels, "layout": m.layout,
+                "id": m.id, "label": *m.label.lock().unwrap(), "channels": m.channels, "layout": m.layout,
                 "fader": *m.fader_db.lock().unwrap(),
                 "mute": m.mute.load(std::sync::atomic::Ordering::Relaxed),
                 "chain": crate::ws::chain_json(&m.chain),

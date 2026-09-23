@@ -100,7 +100,7 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
         .map(|t| {
             let value = serde_json::json!({
                 "id": t.id,
-                "label": t.label,
+                "label": *t.label.lock().unwrap(),
                 "channels": t.channels,
                 "chain": crate::ws::chain_json(&t.chain),
                 "sends": crate::ws::sends_json(t, mixer),
@@ -118,7 +118,7 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
         .map(|b| {
             let value = serde_json::json!({
                 "id": b.id,
-                "label": b.label,
+                "label": *b.label.lock().unwrap(),
                 "channels": b.channels,
                 "master_sends": crate::ws::master_sends_json(&b.master_sends.lock().unwrap(), b.layout, mixer),
             });
@@ -131,7 +131,7 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
         .map(|m| {
             let value = serde_json::json!({
                 "id": m.id,
-                "label": m.label,
+                "label": *m.label.lock().unwrap(),
                 "channels": m.channels,
                 "chain": crate::ws::chain_json(&m.chain),
                 "fader_db": *m.fader_db.lock().unwrap(),
@@ -222,9 +222,15 @@ pub fn apply_snapshot(mixer: &MixerState, snapshot: &serde_json::Value) {
             if let Some(v) = t.get("input_patch") {
                 match crate::patch::PatchState::parse_track_in(v) {
                     Ok(patch) => {
-                        if let Err(e) =
-                            mixer.patch.set_track_in(&track_list, &bus_channels, &master_channels, &mixer.input_grid, track.id, patch)
-                        {
+                        if let Err(e) = mixer.patch.set_track_in(
+                            &track_list,
+                            &bus_channels,
+                            &master_channels,
+                            &mixer.input_grid,
+                            &mixer.app_input_grid,
+                            track.id,
+                            patch,
+                        ) {
                             tracing::warn!(track_id = track.id, error = %e, "state file: input_patch rejected, skipped");
                         }
                     }
@@ -242,9 +248,16 @@ pub fn apply_snapshot(mixer: &MixerState, snapshot: &serde_json::Value) {
             if let Some(v) = b.get("input_patch") {
                 match crate::patch::PatchState::parse_bus_in(v) {
                     Ok(patch) => {
-                        if let Err(e) =
-                            mixer.patch.set_bus_in(&track_list, &bus_channels, &master_channels, &mixer.input_grid, bus.id, bus.channels, patch)
-                        {
+                        if let Err(e) = mixer.patch.set_bus_in(
+                            &track_list,
+                            &bus_channels,
+                            &master_channels,
+                            &mixer.input_grid,
+                            &mixer.app_input_grid,
+                            bus.id,
+                            bus.channels,
+                            patch,
+                        ) {
                             tracing::warn!(bus_id = bus.id, error = %e, "state file: input_patch rejected, skipped");
                         }
                     }
@@ -278,6 +291,7 @@ pub fn apply_snapshot(mixer: &MixerState, snapshot: &serde_json::Value) {
                             &bus_channels,
                             &master_channels,
                             &mixer.input_grid,
+                            &mixer.app_input_grid,
                             master.id,
                             master.channels,
                             patch,
@@ -443,6 +457,7 @@ mod tests {
             masters: Mutex::new(masters),
             input_grid: crate::patch::InputGrid::default(),
             output_grid: crate::patch::OutputGrid::default(),
+            app_input_grid: crate::patch::AppInputGrid::default(),
             patch: crate::patch::PatchState::default(),
             default_channels: channels.iter().copied().max().unwrap_or(2),
             topology_generation: AtomicU64::new(0),

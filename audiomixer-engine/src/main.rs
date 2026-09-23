@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tracks = Vec::with_capacity(cfg.tracks.len());
     for t in &cfg.tracks {
         let track = topology::build_track(t, default_channels, cfg.sample_rate, false).map_err(|e| anyhow::anyhow!(e))?;
-        tracing::info!(track_id = track.id, label = %track.label, channels = track.channels, "track ready (unpatched -- see input_grid/input-patch)");
+        tracing::info!(track_id = track.id, label = %track.label.lock().unwrap(), channels = track.channels, "track ready (unpatched -- see input_grid/input-patch)");
         tracks.push(track);
     }
 
@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     let mut buses = Vec::with_capacity(cfg.buses.len());
     for b in &cfg.buses {
         let bus = topology::build_bus(b, default_channels, false).map_err(|e| anyhow::anyhow!(e))?;
-        tracing::info!(bus_id = bus.id, label = %bus.label, channels = bus.channels, "bus ready (pure summer)");
+        tracing::info!(bus_id = bus.id, label = %bus.label.lock().unwrap(), channels = bus.channels, "bus ready (pure summer)");
         buses.push(bus);
     }
 
@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
     let mut masters = Vec::with_capacity(master_configs.len());
     for m in &master_configs {
         let master = topology::build_master(m, default_channels, cfg.sample_rate, false).map_err(|e| anyhow::anyhow!(e))?;
-        tracing::info!(master_id = master.id, label = %master.label, channels = master.channels, "master track ready");
+        tracing::info!(master_id = master.id, label = %master.label.lock().unwrap(), channels = master.channels, "master track ready");
         masters.push(master);
     }
 
@@ -180,6 +180,11 @@ async fn main() -> anyhow::Result<()> {
     // Auto-master patches only ever reference BusOut sources, never Input -- an empty grid is
     // exactly as valid for validate_source's purposes here as the real one would be.
     let empty_input_grid = patch::InputGrid::default();
+    // Built this early (needs only its own fixed size from config, unlike input_grid/output_grid
+    // which each need real MXL flows opened per entry) so every validate_source call site below --
+    // including this file's own auto-master/auto-input patching, which all predate MixerState --
+    // can pass the one real instance instead of a placeholder.
+    let app_input_grid = patch::AppInputGrid::new(cfg.app_input_grid_channels as usize);
     for b in &cfg.buses {
         if b.auto_master.is_none() {
             continue;
@@ -192,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
         }
         let patch: Vec<Vec<patch::SourceRef>> =
             (0..master.channels).map(|ch| if ch < n { vec![patch::SourceRef::BusOut { bus_id: b.id, channel: ch }] } else { vec![] }).collect();
-        if let Err(e) = patch_state.set_master_in(&tracks, &bus_channel_list, &master_channel_list, &empty_input_grid, master.id, master.channels, patch) {
+        if let Err(e) = patch_state.set_master_in(&tracks, &bus_channel_list, &master_channel_list, &empty_input_grid, &app_input_grid, master.id, master.channels, patch) {
             tracing::warn!(bus_id = b.id, master_id = master.id, error = %e, "failed to auto-patch bus into its paired master");
         }
     }
@@ -206,6 +211,12 @@ async fn main() -> anyhow::Result<()> {
     // same way, waiting for IS-05 activation (`nmos/server.rs::receiver_patch`).
     let input_grid = patch::InputGrid::default();
     for entry in &cfg.input_grid {
+        if entry.id == patch::APP_INPUT_GRID_ID {
+            anyhow::bail!(
+                "input grid entry '{}' collides with the reserved app-input-grid id -- rename this entry",
+                patch::APP_INPUT_GRID_ID
+            );
+        }
         let channels = layout::resolve_channels(&format!("input grid entry {}", entry.id), entry.channels, entry.layout)
             .map_err(|e| anyhow::anyhow!(e))?
             .unwrap_or(cfg.channels);
@@ -304,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
         let patch: Vec<Option<patch::SourceRef>> = (0..track.channels)
             .map(|ch| Some(patch::SourceRef::Input { entry_id: entry_id.clone(), channel: start_channel + ch }))
             .collect();
-        if let Err(e) = patch_state.set_track_in(&tracks, &bus_channel_list, &master_channel_list, &input_grid, track.id, patch) {
+        if let Err(e) = patch_state.set_track_in(&tracks, &bus_channel_list, &master_channel_list, &input_grid, &app_input_grid, track.id, patch) {
             tracing::warn!(track_id = track.id, %entry_id, start_channel, error = %e, "failed to auto-patch track input from grid entry");
         }
     }
@@ -373,6 +384,7 @@ async fn main() -> anyhow::Result<()> {
         masters: Mutex::new(masters.into_iter().map(|m| (m.id, m)).collect::<HashMap<_, _>>()),
         input_grid,
         output_grid,
+        app_input_grid,
         patch: patch_state,
         default_channels,
         topology_generation: AtomicU64::new(0),

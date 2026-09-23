@@ -277,7 +277,7 @@ pub fn to_sadm_xml(mixer: &crate::engine::MixerState) -> String {
         if layout.roles().is_empty() {
             continue;
         }
-        write_bed_channel_format(&mut writer, &mut next_id, &track.label, layout);
+        write_bed_channel_format(&mut writer, &mut next_id, &track.label.lock().unwrap(), layout);
     }
 
     writer.write_event(Event::End(BytesEnd::new("audioFormatExtended"))).unwrap();
@@ -465,6 +465,7 @@ mod tests {
             masters: Mutex::new(HashMap::new()),
             input_grid: crate::patch::InputGrid::default(),
             output_grid: crate::patch::OutputGrid::default(),
+            app_input_grid: crate::patch::AppInputGrid::default(),
             patch: crate::patch::PatchState::default(),
             default_channels: 2,
             topology_generation: AtomicU64::new(0),

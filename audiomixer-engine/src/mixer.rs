@@ -137,7 +137,9 @@ pub struct MasterSend {
 /// back to the plain count-only rule (`mix_into`) this app always had.
 pub struct Track {
     pub id: u32,
-    pub label: String,
+    /// `Mutex<String>` -- live-renamable via `PUT channel/{id}/label` (`ws.rs`), same convention
+    /// `InputGridEntry.label`/`OutputGridEntry.label` already established (`patch.rs`).
+    pub label: Mutex<String>,
     /// This track's own channel count (1 = mono, 2 = stereo, ...) — independent of every other
     /// track's and bus's own count, resolved once at startup from `TrackConfig::channels` (see
     /// `main.rs`).
@@ -220,7 +222,7 @@ impl Track {
     pub fn new_with_origin(cfg: &TrackConfig, channels: usize, sample_rate: u32, dynamically_created: bool) -> Self {
         Self {
             id: cfg.id,
-            label: cfg.label.clone(),
+            label: Mutex::new(cfg.label.clone()),
             channels,
             layout: cfg.layout,
             gain_db: Mutex::new(cfg.gain_db),
@@ -268,7 +270,9 @@ fn latent_adm_objects(cfg: &TrackConfig, channels: usize) -> Vec<Mutex<crate::ad
 /// "always produce, never stall" rule as everything else in this pipeline.
 pub struct Bus {
     pub id: u32,
-    pub label: String,
+    /// `Mutex<String>` -- live-renamable via `PUT sum/{id}/label` (`ws.rs`), same convention
+    /// `InputGridEntry.label`/`OutputGridEntry.label` already established (`patch.rs`).
+    pub label: Mutex<String>,
     /// This bus's own channel count — see `Track::channels`'s docs, same idea.
     pub channels: usize,
     /// This bus's own standard layout, if any -- see `Track::layout`'s own doc, same idea and
@@ -304,7 +308,7 @@ impl Bus {
     pub fn new_with_origin(cfg: &BusConfig, channels: usize, dynamically_created: bool) -> Self {
         Self {
             id: cfg.id,
-            label: cfg.label.clone(),
+            label: Mutex::new(cfg.label.clone()),
             channels,
             layout: cfg.layout,
             meter_db: Mutex::new(vec![f32::NEG_INFINITY; channels]),
@@ -328,7 +332,9 @@ impl Bus {
 /// decorrelated from bus count and wired explicitly via `master-in`.
 pub struct MasterTrack {
     pub id: u32,
-    pub label: String,
+    /// `Mutex<String>` -- live-renamable via `PUT master/{id}/label` (`ws.rs`), same convention
+    /// `InputGridEntry.label`/`OutputGridEntry.label` already established (`patch.rs`).
+    pub label: Mutex<String>,
     /// This master's own channel count — see `Track::channels`'s docs, same idea.
     pub channels: usize,
     /// This master's own standard layout, if any -- see `Track::layout`'s own doc. Used both by
@@ -378,7 +384,7 @@ impl MasterTrack {
     pub fn new_with_origin(cfg: &MasterTrackConfig, channels: usize, sample_rate: u32, dynamically_created: bool) -> Self {
         Self {
             id: cfg.id,
-            label: cfg.label.clone(),
+            label: Mutex::new(cfg.label.clone()),
             channels,
             layout: cfg.layout,
             fader_db: Mutex::new(cfg.fader_db),

@@ -156,6 +156,7 @@ fn handle_put(state: &WsState, path: &str, value: Option<&serde_json::Value>) {
                                 &bus_channels(state),
                                 &master_channels(state),
                                 &state.mixer.input_grid,
+                                &state.mixer.app_input_grid,
                                 &entry.id,
                                 entry.channels,
                                 patch,
@@ -336,7 +337,7 @@ fn tracks_list_json(state: &WsState) -> serde_json::Value {
         .mixer
         .tracks_snapshot()
         .iter()
-        .map(|t| serde_json::json!({"id": t.id, "label": t.label, "channels": t.channels, "layout": t.layout}))
+        .map(|t| serde_json::json!({"id": t.id, "label": *t.label.lock().unwrap(), "channels": t.channels, "layout": t.layout}))
         .collect();
     list.sort_by_key(|v| v["id"].as_u64());
     serde_json::json!(list)
@@ -347,7 +348,7 @@ fn buses_list_json(state: &WsState) -> serde_json::Value {
         .mixer
         .buses_snapshot()
         .iter()
-        .map(|b| serde_json::json!({"id": b.id, "label": b.label, "channels": b.channels, "layout": b.layout}))
+        .map(|b| serde_json::json!({"id": b.id, "label": *b.label.lock().unwrap(), "channels": b.channels, "layout": b.layout}))
         .collect();
     list.sort_by_key(|v| v["id"].as_u64());
     serde_json::json!(list)
@@ -358,7 +359,7 @@ fn masters_list_json(state: &WsState) -> serde_json::Value {
         .mixer
         .masters_snapshot()
         .iter()
-        .map(|m| serde_json::json!({"id": m.id, "label": m.label, "channels": m.channels, "layout": m.layout}))
+        .map(|m| serde_json::json!({"id": m.id, "label": *m.label.lock().unwrap(), "channels": m.channels, "layout": m.layout}))
         .collect();
     list.sort_by_key(|v| v["id"].as_u64());
     serde_json::json!(list)
@@ -472,6 +473,7 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, extra: Option<
                     &bus_channels(state),
                     &master_channels(state),
                     &state.mixer.input_grid,
+                    &state.mixer.app_input_grid,
                     track.id,
                     patch,
                 ) {
@@ -509,6 +511,19 @@ fn apply_track_param(state: &WsState, track: &Track, param: &str, extra: Option<
             ),
             Err(e) => tracing::warn!(track_id = track.id, error = %e, "PUT adm-objects: malformed value"),
         },
+        // Live rename -- see mixer::Track.label's own doc comment. Mirrors the grid-entry label
+        // handlers above (empty/whitespace-only rejected, same "don't accept a blank name" guard),
+        // just addressed at a track id instead of a grid entry id. Republishes `channel-list` (not
+        // just this param's own echo, though that still happens below too) so a client watching the
+        // list -- not this specific track's own param stream -- also sees the rename immediately.
+        "label" => {
+            if let Some(new_label) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                *track.label.lock().unwrap() = new_label.to_string();
+                publish(state, &format!("amixer/{}/channel-list", state.mixer_id), tracks_list_json(state));
+            } else {
+                tracing::warn!(track_id = track.id, "PUT label rejected: empty/missing value");
+            }
+        }
         _ => {}
     }
     let echo_param = match extra { Some(idx) => format!("{param}/{idx}"), None => param.to_string() };
@@ -526,6 +541,7 @@ fn apply_bus_param(state: &WsState, bus: &Bus, param: &str, value: &serde_json::
                     &bus_channels(state),
                     &master_channels(state),
                     &state.mixer.input_grid,
+                    &state.mixer.app_input_grid,
                     bus.id,
                     bus.channels,
                     patch,
@@ -542,6 +558,16 @@ fn apply_bus_param(state: &WsState, bus: &Bus, param: &str, value: &serde_json::
             Ok(sends) => *bus.master_sends.lock().unwrap() = sends,
             Err(e) => tracing::warn!(bus_id = bus.id, error = %e, "PUT master-sends: malformed value"),
         },
+        // Live rename -- see mixer::Bus.label's own doc comment. Same guard/mirroring as
+        // apply_track_param's own "label" arm.
+        "label" => {
+            if let Some(new_label) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                *bus.label.lock().unwrap() = new_label.to_string();
+                publish(state, &format!("amixer/{}/sum-list", state.mixer_id), buses_list_json(state));
+            } else {
+                tracing::warn!(bus_id = bus.id, "PUT label rejected: empty/missing value");
+            }
+        }
         _ => {}
     }
 }
@@ -570,6 +596,7 @@ fn apply_master_param(state: &WsState, master: &MasterTrack, param: &str, extra:
                     &bus_channels(state),
                     &master_channels(state),
                     &state.mixer.input_grid,
+                    &state.mixer.app_input_grid,
                     master.id,
                     master.channels,
                     patch,
@@ -589,6 +616,16 @@ fn apply_master_param(state: &WsState, master: &MasterTrack, param: &str, extra:
             Ok(sends) => *master.master_sends.lock().unwrap() = sends,
             Err(e) => tracing::warn!(master_id = master.id, error = %e, "PUT master-sends: malformed value"),
         },
+        // Live rename -- see mixer::MasterTrack.label's own doc comment. Same guard/mirroring as
+        // apply_track_param's own "label" arm.
+        "label" => {
+            if let Some(new_label) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                *master.label.lock().unwrap() = new_label.to_string();
+                publish(state, &format!("amixer/{}/master-list", state.mixer_id), masters_list_json(state));
+            } else {
+                tracing::warn!(master_id = master.id, "PUT label rejected: empty/missing value");
+            }
+        }
         _ => {}
     }
 }
@@ -609,6 +646,7 @@ fn current_track_value(state: &WsState, track: &Track, param: &str, extra: Optio
             .unwrap_or(serde_json::Value::Null),
         "chain" => chain_json(&track.chain),
         "adm-objects" => adm_objects_json(track),
+        "label" => serde_json::json!(*track.label.lock().unwrap()),
         _ => serde_json::Value::Null,
     }
 }
@@ -891,6 +929,7 @@ fn current_bus_value(state: &WsState, bus: &Bus, param: &str) -> serde_json::Val
     match param {
         "input-patch" => state.mixer.patch.bus_in_json(bus.id, bus.channels),
         "master-sends" => master_sends_json(&bus.master_sends.lock().unwrap(), bus.layout, &state.mixer),
+        "label" => serde_json::json!(*bus.label.lock().unwrap()),
         _ => serde_json::Value::Null,
     }
 }
@@ -907,6 +946,7 @@ fn current_master_value(state: &WsState, master: &MasterTrack, param: &str, extr
             .unwrap_or(serde_json::Value::Null),
         "chain" => chain_json(&master.chain),
         "master-sends" => master_sends_json(&master.master_sends.lock().unwrap(), master.layout, &state.mixer),
+        "label" => serde_json::json!(*master.label.lock().unwrap()),
         _ => serde_json::Value::Null,
     }
 }

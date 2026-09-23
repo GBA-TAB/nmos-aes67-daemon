@@ -8,7 +8,7 @@ use crate::mixer::{
     mix_into_scaled_with_object_pan, mix_into_scaled_with_per_channel_object_pan, mix_into_scaled_with_rigid_array_pan, mix_into_scaled_with_route, peak_to_db, Bus, DownmixTable, LatencyCompensation,
     MasterTrack, PanObject, PickoffPoint, Track,
 };
-use crate::patch::{InputGrid, OutputGrid, PatchState};
+use crate::patch::{AppInputGrid, InputGrid, OutputGrid, PatchState};
 
 pub struct MixerState {
     /// `Mutex<HashMap<id, Arc<T>>>`, not a plain `Vec` -- lets `topology.rs`'s CREATE/DELETE
@@ -26,6 +26,11 @@ pub struct MixerState {
     /// `patch.rs`) — empty (no output grid configured) is a perfectly normal, common case; a
     /// deployment that only needs buses' own always-on flows doesn't need any.
     pub output_grid: OutputGrid,
+    /// A fixed-size, separately-sized pool a track/bus/master/output-grid entry can patch from via
+    /// `SourceRef::AppInput` -- IS-08's Output side (`nmos/is08.rs`), fed from `input_grid`'s
+    /// entries as IS-08's Input side. `0` channels (`Config.app_input_grid_channels` unset) is a
+    /// normal, common case -- the feature is entirely opt-in.
+    pub app_input_grid: AppInputGrid,
     /// The crosspoint itself: which source feeds each `track-in`/`bus-in`/`output` destination
     /// channel.
     pub patch: PatchState,
@@ -405,6 +410,14 @@ pub fn run(state: Arc<MixerState>) {
                     *entry.fault_retry_after.lock().unwrap() = Some(std::time::Instant::now() + FAULT_RETRY_INTERVAL);
                 }
             }
+        }
+
+        // --- Step 1b: build the app-input-grid's own synthetic buffer from what was just read
+        // above, so every SourceRef::AppInput{channel} resolves the exact same way SourceRef::Input
+        // does (patch.rs's own resolve()) -- a no-op when the feature is unused (0 channels). ---
+        if state.app_input_grid.channels() > 0 {
+            let buf = state.app_input_grid.build_period_buffer(&input_bufs, period);
+            input_bufs.insert(crate::patch::APP_INPUT_GRID_ID.to_string(), buf);
         }
 
         // --- Tier A: always fresh, every period, unconditionally (matches input_grid/output_grid's

@@ -61,6 +61,14 @@ pub enum SourceRef {
     /// cascades of arbitrary shape (including a master feeding its own `master-in`) never need
     /// cycle detection, exactly matching `BusOut`'s own reasoning for why bus-in/track-in never do.
     MasterOut { master_id: u32, channel: usize },
+    /// One channel of the fixed-size "app input grid" (`AppInputGrid`) -- a single pool, not
+    /// namespaced by id the way `Input` is, since there's ever only one. Which real input-grid
+    /// channel currently feeds this slot is IS-08's own crosspoint to decide (`nmos/is08.rs`), not
+    /// something resolved here: `validate_source` only range-checks `channel` against the pool's
+    /// own fixed size, and `resolve()` reads whatever engine.rs already copied into this period's
+    /// `input_bufs` under `APP_INPUT_GRID_ID` (`AppInputGrid::build_period_buffer`) -- the exact
+    /// same lookup `Input` itself uses, just with a reserved, non-configurable id.
+    AppInput { channel: usize },
 }
 
 impl SourceRef {
@@ -70,6 +78,7 @@ impl SourceRef {
             SourceRef::TrackOut { track_id, .. } => format!("track-out:{track_id}"),
             SourceRef::BusOut { bus_id, .. } => format!("bus-out:{bus_id}"),
             SourceRef::MasterOut { master_id, .. } => format!("master-out:{master_id}"),
+            SourceRef::AppInput { .. } => "app-input".to_string(),
         }
     }
 
@@ -78,7 +87,8 @@ impl SourceRef {
             SourceRef::Input { channel, .. }
             | SourceRef::TrackOut { channel, .. }
             | SourceRef::BusOut { channel, .. }
-            | SourceRef::MasterOut { channel, .. } => *channel,
+            | SourceRef::MasterOut { channel, .. }
+            | SourceRef::AppInput { channel, .. } => *channel,
         }
     }
 
@@ -100,6 +110,8 @@ impl SourceRef {
         } else if let Some(id) = source.strip_prefix("master-out:") {
             let master_id: u32 = id.parse().map_err(|_| format!("invalid master id in source '{source}'"))?;
             Ok(SourceRef::MasterOut { master_id, channel })
+        } else if source == "app-input" {
+            Ok(SourceRef::AppInput { channel })
         } else {
             Err(format!("unknown source point '{source}'"))
         }
@@ -316,6 +328,84 @@ impl OutputGrid {
     }
 }
 
+/// The reserved `input_bufs` key `AppInputGrid`'s own synthetic per-period buffer is inserted
+/// under (`engine.rs`) -- `SourceRef::AppInput`'s own `resolve()` arm reads it back through
+/// exactly the same `input_bufs.get(id).and_then(|b| b.get(channel))` lookup `SourceRef::Input`
+/// itself uses. Validated at startup (`main.rs`) to never collide with a real config-authored
+/// `input_grid` entry id.
+pub const APP_INPUT_GRID_ID: &str = "app-input-grid";
+
+/// A fixed-size pool of channels, separately sized from `InputGrid`'s own total capacity, that a
+/// track/bus/master/output-grid entry can patch from via `SourceRef::AppInput{channel}` --
+/// IS-08's Output side (`nmos/is08.rs`), fed from `InputGrid`'s entries as IS-08's Input side.
+/// Exists so a real NMOS controller can re-route "which physical/network stream feeds this
+/// app-facing slot" (a channel-level crosspoint, `map`) without any track/bus/master's own patch
+/// ever needing to know or care which `input_grid` entry currently backs it -- that indirection
+/// is the entire reason to prefer this over patching `SourceRef::Input{entry_id, channel}`
+/// directly, which ties a track's patch to a specific grid entry's identity.
+///
+/// Deliberately dumb: this struct only stores the map and builds the per-period buffer from
+/// already-read data; it has no idea what's on the other end of a mapped slot, doesn't open any
+/// flow of its own, and needs no `fault`/`meter_db` (a stale/dangling mapped entry_id just
+/// resolves to silence, same as `SourceRef::Input` already does for one). All the real IS-08
+/// semantics -- validating a `map/active` PATCH against `InputGrid`'s current entries, rejecting
+/// an out-of-range or unroutable request -- live in `nmos/is08.rs`, which is the only thing that
+/// ever calls `set_map`.
+pub struct AppInputGrid {
+    channels: usize,
+    map: Mutex<Vec<Option<(String, usize)>>>,
+}
+
+impl AppInputGrid {
+    pub fn new(channels: usize) -> Self {
+        Self { channels, map: Mutex::new(vec![None; channels]) }
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Current map, one entry per app-grid channel -- `None` for an unmapped slot, `Some((entry_id,
+    /// channel))` for a mapped one. Used by IS-08's `GET map/active`.
+    pub fn snapshot(&self) -> Vec<Option<(String, usize)>> {
+        self.map.lock().unwrap().clone()
+    }
+
+    /// Replaces the whole map at once. `nmos/is08.rs::apply_action` always validates a complete,
+    /// self-consistent target map before calling this (resolve-then-commit, same shape as
+    /// `PatchState`'s own setters below) -- there's no partial-update path here to keep atomic.
+    pub fn set_map(&self, new_map: Vec<Option<(String, usize)>>) {
+        debug_assert_eq!(new_map.len(), self.channels, "AppInputGrid::set_map called with the wrong-sized map");
+        *self.map.lock().unwrap() = new_map;
+    }
+
+    /// Builds this period's synthetic buffer from the real input-grid's already-read
+    /// `input_bufs` (engine.rs, called right after the real input-grid read step) -- an unmapped
+    /// slot, or one whose mapped entry_id/channel has since vanished (a discovered entry that
+    /// disconnected, or a channel index that no longer exists), resolves to silence, not a panic
+    /// or a shortened buffer -- the same "dangling reference is silence" convention every other
+    /// pickoff point in this module already follows.
+    pub fn build_period_buffer(&self, input_bufs: &HashMap<String, Vec<Vec<f32>>>, period: usize) -> Vec<Vec<f32>> {
+        self.map
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|slot| match slot {
+                Some((entry_id, channel)) => {
+                    input_bufs.get(entry_id).and_then(|b| b.get(*channel)).cloned().unwrap_or_else(|| vec![0.0; period])
+                }
+                None => vec![0.0; period],
+            })
+            .collect()
+    }
+}
+
+impl Default for AppInputGrid {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
 #[derive(Default)]
 pub struct PatchState {
     /// track_id -> per-channel single source (exclusive — see module docs).
@@ -341,6 +431,7 @@ impl PatchState {
         buses: &[(u32, usize)],
         masters: &[(u32, usize)],
         input_grid: &InputGrid,
+        app_input_grid: &AppInputGrid,
         self_track_id: Option<u32>,
         s: &SourceRef,
     ) -> Result<(), String> {
@@ -349,6 +440,12 @@ impl PatchState {
                 let entry = input_grid.get(entry_id).ok_or_else(|| format!("unknown input grid entry '{entry_id}'"))?;
                 if *channel >= entry.channels {
                     return Err(format!("channel {channel} out of range for input '{entry_id}' ({} channels)", entry.channels));
+                }
+                Ok(())
+            }
+            SourceRef::AppInput { channel } => {
+                if *channel >= app_input_grid.channels() {
+                    return Err(format!("channel {channel} out of range for app-input grid ({} channels)", app_input_grid.channels()));
                 }
                 Ok(())
             }
@@ -390,6 +487,7 @@ impl PatchState {
         buses: &[(u32, usize)],
         masters: &[(u32, usize)],
         input_grid: &InputGrid,
+        app_input_grid: &AppInputGrid,
         track_id: u32,
         patch: Vec<Option<SourceRef>>,
     ) -> Result<(), String> {
@@ -398,7 +496,7 @@ impl PatchState {
             return Err(format!("input-patch length {} does not match track's {} channels", patch.len(), track.channels));
         }
         for s in patch.iter().flatten() {
-            Self::validate_source(tracks, buses, masters, input_grid, Some(track_id), s)?;
+            Self::validate_source(tracks, buses, masters, input_grid, app_input_grid, Some(track_id), s)?;
         }
         self.track_in.lock().unwrap().insert(track_id, patch);
         Ok(())
@@ -413,6 +511,7 @@ impl PatchState {
         buses: &[(u32, usize)],
         masters: &[(u32, usize)],
         input_grid: &InputGrid,
+        app_input_grid: &AppInputGrid,
         bus_id: u32,
         bus_channels: usize,
         patch: Vec<Vec<SourceRef>>,
@@ -422,7 +521,7 @@ impl PatchState {
         }
         for slot in &patch {
             for s in slot {
-                Self::validate_source(tracks, buses, masters, input_grid, None, s)?;
+                Self::validate_source(tracks, buses, masters, input_grid, app_input_grid, None, s)?;
             }
         }
         self.bus_in.lock().unwrap().insert(bus_id, patch);
@@ -438,6 +537,7 @@ impl PatchState {
         buses: &[(u32, usize)],
         masters: &[(u32, usize)],
         input_grid: &InputGrid,
+        app_input_grid: &AppInputGrid,
         master_id: u32,
         master_channels: usize,
         patch: Vec<Vec<SourceRef>>,
@@ -447,7 +547,7 @@ impl PatchState {
         }
         for slot in &patch {
             for s in slot {
-                Self::validate_source(tracks, buses, masters, input_grid, None, s)?;
+                Self::validate_source(tracks, buses, masters, input_grid, app_input_grid, None, s)?;
             }
         }
         self.master_in.lock().unwrap().insert(master_id, patch);
@@ -462,6 +562,7 @@ impl PatchState {
         buses: &[(u32, usize)],
         masters: &[(u32, usize)],
         input_grid: &InputGrid,
+        app_input_grid: &AppInputGrid,
         output_id: &str,
         output_channels: usize,
         patch: Vec<Option<SourceRef>>,
@@ -470,7 +571,7 @@ impl PatchState {
             return Err(format!("input-patch length {} does not match output's {output_channels} channels", patch.len()));
         }
         for s in patch.iter().flatten() {
-            Self::validate_source(tracks, buses, masters, input_grid, None, s)?;
+            Self::validate_source(tracks, buses, masters, input_grid, app_input_grid, None, s)?;
         }
         self.output.lock().unwrap().insert(output_id.to_string(), patch);
         Ok(())
@@ -703,6 +804,7 @@ fn resolve<'a>(
         SourceRef::TrackOut { track_id, channel } => track_out.get(track_id).and_then(|b| b.get(*channel)).map(Vec::as_slice),
         SourceRef::BusOut { bus_id, channel } => bus_out.get(bus_id).and_then(|b| b.get(*channel)).map(Vec::as_slice),
         SourceRef::MasterOut { master_id, channel } => master_out.get(master_id).and_then(|b| b.get(*channel)).map(Vec::as_slice),
+        SourceRef::AppInput { channel } => input_bufs.get(APP_INPUT_GRID_ID).and_then(|b| b.get(*channel)).map(Vec::as_slice),
     }
 }
 
@@ -768,6 +870,7 @@ mod tests {
 
     fn test_input_grid(entries: &[(&str, usize)]) -> InputGrid {
         let grid = InputGrid::default();
+        let app_grid = AppInputGrid::new(0);
         for &(id, channels) in entries {
             let grid_channel_start = grid.reserve_channel_range(channels as u32);
             grid.insert(InputGridEntry {
@@ -793,27 +896,69 @@ mod tests {
     fn rejects_out_of_range_input_channel() {
         let tracks = test_tracks(&[2]);
         let grid = test_input_grid(&[("a", 2)]);
+        let app_grid = AppInputGrid::new(0);
         let patch_state = PatchState::default();
         let patch = vec![Some(SourceRef::Input { entry_id: "a".into(), channel: 5 }), None];
-        assert!(patch_state.set_track_in(&tracks, &[], &[], &grid, 0, patch).is_err());
+        assert!(patch_state.set_track_in(&tracks, &[], &[], &grid, &app_grid, 0, patch).is_err());
+    }
+
+    #[test]
+    fn app_input_accepts_valid_channel_and_rejects_out_of_range() {
+        let tracks = test_tracks(&[2]);
+        let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(2);
+        let patch_state = PatchState::default();
+
+        let ok_patch = vec![Some(SourceRef::AppInput { channel: 1 }), None];
+        patch_state.set_track_in(&tracks, &[], &[], &grid, &app_grid, 0, ok_patch).unwrap();
+        let json = patch_state.track_in_json(0, 2);
+        assert_eq!(json[0]["source"], "app-input");
+        assert_eq!(json[0]["channel"], 1);
+
+        let out_of_range = vec![Some(SourceRef::AppInput { channel: 2 }), None];
+        assert!(patch_state.set_track_in(&tracks, &[], &[], &grid, &app_grid, 0, out_of_range).is_err());
+    }
+
+    #[test]
+    fn app_input_grid_build_period_buffer_reads_the_mapped_real_channel_and_is_silent_when_unmapped_or_dangling() {
+        let app_grid = AppInputGrid::new(3);
+        app_grid.set_map(vec![Some(("a".to_string(), 1)), None, Some(("gone".to_string(), 0))]);
+
+        let mut input_bufs: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
+        input_bufs.insert("a".to_string(), vec![vec![1.0, 1.0], vec![2.0, 2.0]]);
+
+        let buf = app_grid.build_period_buffer(&input_bufs, 2);
+        assert_eq!(buf[0], vec![2.0, 2.0]); // slot 0 <- "a" channel 1
+        assert_eq!(buf[1], vec![0.0, 0.0]); // slot 1 unmapped
+        assert_eq!(buf[2], vec![0.0, 0.0]); // slot 2 mapped to a since-vanished entry -- silence, not a panic
+    }
+
+    #[test]
+    fn source_ref_app_input_round_trips_through_wire_json() {
+        let s = SourceRef::AppInput { channel: 4 };
+        let json = s.to_json();
+        assert_eq!(json, serde_json::json!({"source": "app-input", "channel": 4}));
+        assert_eq!(SourceRef::parse(&json).unwrap(), s);
     }
 
     #[test]
     fn rejects_self_loop() {
         let tracks = test_tracks(&[2]);
         let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(0);
         let patch_state = PatchState::default();
         let patch = vec![Some(SourceRef::TrackOut { track_id: 0, channel: 0 }), None];
-        assert!(patch_state.set_track_in(&tracks, &[], &[], &grid, 0, patch).is_err());
+        assert!(patch_state.set_track_in(&tracks, &[], &[], &grid, &app_grid, 0, patch).is_err());
     }
 
     #[test]
     fn accepts_valid_track_in_and_reports_it_back() {
         let tracks = test_tracks(&[2]);
         let grid = test_input_grid(&[("a", 2)]);
+        let app_grid = AppInputGrid::new(0);
         let patch_state = PatchState::default();
         let patch = vec![Some(SourceRef::Input { entry_id: "a".into(), channel: 0 }), None];
-        patch_state.set_track_in(&tracks, &[], &[], &grid, 0, patch).unwrap();
+        patch_state.set_track_in(&tracks, &[], &[], &grid, &app_grid, 0, patch).unwrap();
         let json = patch_state.track_in_json(0, 2);
         assert_eq!(json[0]["source"], "input:a");
         assert!(json[1].is_null());
@@ -823,48 +968,53 @@ mod tests {
     fn bus_in_allows_multiple_sources_on_one_channel() {
         let tracks = test_tracks(&[]);
         let grid = test_input_grid(&[("a", 2), ("b", 1)]);
+        let app_grid = AppInputGrid::new(0);
         let patch_state = PatchState::default();
         let patch = vec![vec![
             SourceRef::Input { entry_id: "a".into(), channel: 0 },
             SourceRef::Input { entry_id: "b".into(), channel: 0 },
         ]];
-        assert!(patch_state.set_bus_in(&tracks, &[], &[], &grid, 0, 1, patch).is_ok());
+        assert!(patch_state.set_bus_in(&tracks, &[], &[], &grid, &app_grid, 0, 1, patch).is_ok());
     }
 
     #[test]
     fn track_in_rejects_wrong_length() {
         let tracks = test_tracks(&[2]);
         let grid = test_input_grid(&[("a", 2)]);
+        let app_grid = AppInputGrid::new(0);
         let patch_state = PatchState::default();
         let patch = vec![Some(SourceRef::Input { entry_id: "a".into(), channel: 0 })];
-        assert!(patch_state.set_track_in(&tracks, &[], &[], &grid, 0, patch).is_err());
+        assert!(patch_state.set_track_in(&tracks, &[], &[], &grid, &app_grid, 0, patch).is_err());
     }
 
     #[test]
     fn rejects_unknown_bus_out() {
         let tracks = test_tracks(&[2]);
         let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(0);
         let patch_state = PatchState::default();
         let patch = vec![Some(SourceRef::BusOut { bus_id: 9, channel: 0 }), None];
-        assert!(patch_state.set_track_in(&tracks, &[], &[], &grid, 0, patch).is_err());
+        assert!(patch_state.set_track_in(&tracks, &[], &[], &grid, &app_grid, 0, patch).is_err());
     }
 
     #[test]
     fn output_grid_accepts_track_out_and_bus_out() {
         let tracks = test_tracks(&[2]);
         let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(0);
         let patch_state = PatchState::default();
         let patch = vec![Some(SourceRef::TrackOut { track_id: 0, channel: 0 }), Some(SourceRef::BusOut { bus_id: 0, channel: 1 })];
-        assert!(patch_state.set_output(&tracks, &[(0, 2)], &[], &grid, "tx1", 2, patch).is_ok());
+        assert!(patch_state.set_output(&tracks, &[(0, 2)], &[], &grid, &app_grid, "tx1", 2, patch).is_ok());
     }
 
     #[test]
     fn output_grid_rejects_out_of_range_bus_channel() {
         let tracks = test_tracks(&[]);
         let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(0);
         let patch_state = PatchState::default();
         let patch = vec![Some(SourceRef::BusOut { bus_id: 0, channel: 5 })];
-        assert!(patch_state.set_output(&tracks, &[(0, 2)], &[], &grid, "tx1", 1, patch).is_err());
+        assert!(patch_state.set_output(&tracks, &[(0, 2)], &[], &grid, &app_grid, "tx1", 1, patch).is_err());
     }
 
     #[test]
@@ -872,8 +1022,9 @@ mod tests {
         let patch_state = PatchState::default();
         let tracks = test_tracks(&[]);
         let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(0);
         let patch = vec![Some(SourceRef::BusOut { bus_id: 0, channel: 0 })];
-        patch_state.set_output(&tracks, &[(0, 1)], &[], &grid, "tx1", 1, patch).unwrap();
+        patch_state.set_output(&tracks, &[(0, 1)], &[], &grid, &app_grid, "tx1", 1, patch).unwrap();
 
         let input_bufs = HashMap::new();
         let track_out = HashMap::new();
@@ -890,38 +1041,41 @@ mod tests {
     fn rejects_unknown_master_out() {
         let tracks = test_tracks(&[2]);
         let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(0);
         let patch_state = PatchState::default();
         let patch = vec![Some(SourceRef::MasterOut { master_id: 9, channel: 0 }), None];
-        assert!(patch_state.set_track_in(&tracks, &[], &[], &grid, 0, patch).is_err());
+        assert!(patch_state.set_track_in(&tracks, &[], &[], &grid, &app_grid, 0, patch).is_err());
     }
 
     #[test]
     fn master_out_accepted_as_source_for_track_in_bus_in_and_output() {
         let tracks = test_tracks(&[2]);
         let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(0);
         let masters = [(0u32, 2usize)];
         let patch_state = PatchState::default();
 
         let track_patch = vec![Some(SourceRef::MasterOut { master_id: 0, channel: 0 }), None];
-        assert!(patch_state.set_track_in(&tracks, &[], &masters, &grid, 0, track_patch).is_ok());
+        assert!(patch_state.set_track_in(&tracks, &[], &masters, &grid, &app_grid, 0, track_patch).is_ok());
 
         let bus_patch = vec![vec![SourceRef::MasterOut { master_id: 0, channel: 0 }]];
-        assert!(patch_state.set_bus_in(&tracks, &[], &masters, &grid, 0, 1, bus_patch).is_ok());
+        assert!(patch_state.set_bus_in(&tracks, &[], &masters, &grid, &app_grid, 0, 1, bus_patch).is_ok());
 
         let output_patch = vec![Some(SourceRef::MasterOut { master_id: 0, channel: 1 })];
-        assert!(patch_state.set_output(&tracks, &[], &masters, &grid, "tx1", 1, output_patch).is_ok());
+        assert!(patch_state.set_output(&tracks, &[], &masters, &grid, &app_grid, "tx1", 1, output_patch).is_ok());
     }
 
     #[test]
     fn master_in_allows_multiple_sources_on_one_channel() {
         let tracks = test_tracks(&[]);
         let grid = test_input_grid(&[("a", 2), ("b", 1)]);
+        let app_grid = AppInputGrid::new(0);
         let patch_state = PatchState::default();
         let patch = vec![vec![
             SourceRef::Input { entry_id: "a".into(), channel: 0 },
             SourceRef::Input { entry_id: "b".into(), channel: 0 },
         ]];
-        assert!(patch_state.set_master_in(&tracks, &[], &[], &grid, 0, 1, patch).is_ok());
+        assert!(patch_state.set_master_in(&tracks, &[], &[], &grid, &app_grid, 0, 1, patch).is_ok());
     }
 
     /// Deliberately the *inverse* of `rejects_self_loop`: a master patching its own `master-out`
@@ -931,20 +1085,22 @@ mod tests {
     fn master_in_allows_self_loop_from_own_master_out() {
         let tracks = test_tracks(&[]);
         let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(0);
         let masters = [(0u32, 1usize)];
         let patch_state = PatchState::default();
         let patch = vec![vec![SourceRef::MasterOut { master_id: 0, channel: 0 }]];
-        assert!(patch_state.set_master_in(&tracks, &[], &masters, &grid, 0, 1, patch).is_ok());
+        assert!(patch_state.set_master_in(&tracks, &[], &masters, &grid, &app_grid, 0, 1, patch).is_ok());
     }
 
     #[test]
     fn resolve_master_in_reads_this_period_bus_out_and_previous_period_master_out() {
         let tracks = test_tracks(&[]);
         let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(0);
         let masters = [(1u32, 1usize)];
         let patch_state = PatchState::default();
         let patch = vec![vec![SourceRef::BusOut { bus_id: 0, channel: 0 }, SourceRef::MasterOut { master_id: 1, channel: 0 }]];
-        patch_state.set_master_in(&tracks, &[(0, 1)], &masters, &grid, 0, 1, patch).unwrap();
+        patch_state.set_master_in(&tracks, &[(0, 1)], &masters, &grid, &app_grid, 0, 1, patch).unwrap();
 
         let input_bufs = HashMap::new();
         let track_out = HashMap::new();
@@ -966,13 +1122,14 @@ mod tests {
         // deleted) resolves to untouched (still-zeroed) dst, never a panic/out-of-bounds.
         let tracks = test_tracks(&[]);
         let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(0);
         let masters = [(0u32, 1usize)];
         let patch_state = PatchState::default();
         let patch = vec![vec![
             SourceRef::BusOut { bus_id: 9, channel: 0 },
             SourceRef::MasterOut { master_id: 0, channel: 0 },
         ]];
-        patch_state.set_master_in(&tracks, &[(9, 1)], &masters, &grid, 0, 1, patch).unwrap();
+        patch_state.set_master_in(&tracks, &[(9, 1)], &masters, &grid, &app_grid, 0, 1, patch).unwrap();
 
         // Neither bus 9 nor master 0 actually appear in this period's maps -- simulating both
         // having been deleted after the patch was set.
@@ -985,20 +1142,21 @@ mod tests {
     fn scrub_track_out_references_removes_dangling_refs_from_every_destination_kind() {
         let tracks = test_tracks(&[2]);
         let grid = test_input_grid(&[]);
+        let app_grid = AppInputGrid::new(0);
         let masters = [(0u32, 1usize)];
         let patch_state = PatchState::default();
 
-        patch_state.set_track_in(&tracks, &[], &[], &grid, 0, vec![None, None]).unwrap();
+        patch_state.set_track_in(&tracks, &[], &[], &grid, &app_grid, 0, vec![None, None]).unwrap();
         // A second track referencing track 0's own output (allowed -- not a self-loop).
         let tracks2 = test_tracks(&[2, 2]);
         patch_state
-            .set_track_in(&tracks2, &[], &[], &grid, 1, vec![Some(SourceRef::TrackOut { track_id: 0, channel: 0 }), None])
+            .set_track_in(&tracks2, &[], &[], &grid, &app_grid, 1, vec![Some(SourceRef::TrackOut { track_id: 0, channel: 0 }), None])
             .unwrap();
-        patch_state.set_bus_in(&tracks2, &[], &[], &grid, 0, 1, vec![vec![SourceRef::TrackOut { track_id: 0, channel: 1 }]]).unwrap();
+        patch_state.set_bus_in(&tracks2, &[], &[], &grid, &app_grid, 0, 1, vec![vec![SourceRef::TrackOut { track_id: 0, channel: 1 }]]).unwrap();
         patch_state
-            .set_master_in(&tracks2, &[], &masters, &grid, 0, 1, vec![vec![SourceRef::TrackOut { track_id: 0, channel: 0 }]])
+            .set_master_in(&tracks2, &[], &masters, &grid, &app_grid, 0, 1, vec![vec![SourceRef::TrackOut { track_id: 0, channel: 0 }]])
             .unwrap();
-        patch_state.set_output(&tracks2, &[], &[], &grid, "tx1", 1, vec![Some(SourceRef::TrackOut { track_id: 0, channel: 0 })]).unwrap();
+        patch_state.set_output(&tracks2, &[], &[], &grid, &app_grid, "tx1", 1, vec![Some(SourceRef::TrackOut { track_id: 0, channel: 0 })]).unwrap();
 
         patch_state.scrub_track_out_references(0);
 
@@ -1012,9 +1170,10 @@ mod tests {
     fn remove_master_in_drops_the_stored_entry() {
         let tracks = test_tracks(&[]);
         let grid = test_input_grid(&[("a", 1)]);
+        let app_grid = AppInputGrid::new(0);
         let masters = [(0u32, 1usize)];
         let patch_state = PatchState::default();
-        patch_state.set_master_in(&tracks, &[], &masters, &grid, 0, 1, vec![vec![SourceRef::Input { entry_id: "a".into(), channel: 0 }]]).unwrap();
+        patch_state.set_master_in(&tracks, &[], &masters, &grid, &app_grid, 0, 1, vec![vec![SourceRef::Input { entry_id: "a".into(), channel: 0 }]]).unwrap();
         assert_eq!(patch_state.master_in_json(0, 1)[0].as_array().unwrap().len(), 1);
 
         patch_state.remove_master_in(0);
@@ -1026,6 +1185,7 @@ mod tests {
     #[test]
     fn reserve_channel_range_hands_out_contiguous_non_overlapping_slices_starting_at_zero() {
         let grid = InputGrid::default();
+        let app_grid = AppInputGrid::new(0);
         assert_eq!(grid.reserve_channel_range(8), 0);
         assert_eq!(grid.reserve_channel_range(8), 8);
         assert_eq!(grid.reserve_channel_range(4), 16);
@@ -1037,6 +1197,7 @@ mod tests {
         // itself now reserves through InputGrid::reserve_channel_range (same as real startup code),
         // so this exercises the exact same numbering main.rs/discovery.rs produce.
         let grid = test_input_grid(&[("in-gen", 8), ("in-cop1", 8), ("in-cop2", 8)]);
+        let app_grid = AppInputGrid::new(0);
 
         // "Grid In 01" -- the grid's very first channel -- lands on in-gen's own local channel 0.
         assert_eq!(grid.resolve_grid_channel(1), Some(("in-gen".to_string(), 0)));
@@ -1051,6 +1212,7 @@ mod tests {
     #[test]
     fn resolve_grid_channel_is_none_for_zero_or_past_every_reserved_range() {
         let grid = test_input_grid(&[("a", 4)]);
+        let app_grid = AppInputGrid::new(0);
         assert_eq!(grid.resolve_grid_channel(0), None);
         assert_eq!(grid.resolve_grid_channel(5), None);
     }

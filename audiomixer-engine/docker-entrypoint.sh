@@ -40,6 +40,11 @@
 # possible -- `InputGridEntryConfig`/`OutputGridEntryConfig` already took an arbitrary `channels`
 # count and `flow.rs`'s `FlowReader`/`FlowWriter` already wrap MXL's own native multi-channel flow
 # support end to end; this generator simply wasn't exposing that per-entry knob until now.
+#
+# INPUT_GRID_SIZES/OUTPUT_GRID_SIZES (comma-separated, e.g. "8,8,8,8,32") replace COUNT/CHANNELS
+# entirely when set, for a deployment whose grid entries aren't all the same width -- entry count
+# is just however many values are listed. Mirrors config.rs's own `ChannelPlan` `sizes` form
+# one-for-one, just expressed as env vars instead of JSON for deployments that generate this file.
 
 set -eu
 
@@ -55,6 +60,13 @@ OUTPUT_GRID_COUNT="${OUTPUT_GRID_COUNT:-0}"
 # applied when each entry is actually built).
 INPUT_GRID_CHANNELS="${INPUT_GRID_CHANNELS:-}"
 OUTPUT_GRID_CHANNELS="${OUTPUT_GRID_CHANNELS:-}"
+# Uneven-group alternative to COUNT/CHANNELS above -- a comma-separated per-entry channel count
+# (e.g. "8,8,8,8,32" for four 8-channel entries plus one 32-channel entry), mirroring config.rs's
+# own `ChannelPlan` `sizes` form. Takes over entirely from INPUT_GRID_COUNT/INPUT_GRID_CHANNELS
+# when set -- entry count is just however many values are listed. Left unset (default), grid
+# generation is exactly what it always was: COUNT equally-CHANNELS-wide entries.
+INPUT_GRID_SIZES="${INPUT_GRID_SIZES:-}"
+OUTPUT_GRID_SIZES="${OUTPUT_GRID_SIZES:-}"
 # "simple" (default, today's gain->fader->mute/solo chain) or "full_channel" (adds every
 # processing stage in dsp.rs -- filter, EQ, both dynamics stages, phase, delay -- to every
 # generated track/master, as structural placeholders; see config.rs's ChannelTemplate docs). One
@@ -153,28 +165,62 @@ input_grid_channels="${INPUT_GRID_CHANNELS:-$CHANNELS}"
 output_grid_channels="${OUTPUT_GRID_CHANNELS:-$CHANNELS}"
 
 input_grid_json=""
-i=0
-while [ "$i" -lt "$INPUT_GRID_COUNT" ]; do
-    # No "source" -- starts empty, waiting for IS-05 receiver activation (nmos/server.rs).
-    entry=$(printf '{"id":"nmos-in-%d","label":"NMOS Input %d","channels":%d}' "$i" "$((i + 1))" "$input_grid_channels")
-    if [ -z "$input_grid_json" ]; then input_grid_json="$entry"; else input_grid_json="$input_grid_json,$entry"; fi
-    i=$((i + 1))
-done
+if [ -n "$INPUT_GRID_SIZES" ]; then
+    i=0
+    old_ifs="$IFS"
+    IFS=','
+    set -- $INPUT_GRID_SIZES
+    IFS="$old_ifs"
+    for ch in "$@"; do
+        # No "source" -- starts empty, waiting for IS-05 receiver activation (nmos/server.rs).
+        entry=$(printf '{"id":"nmos-in-%d","label":"NMOS Input %d","channels":%d}' "$i" "$((i + 1))" "$ch")
+        if [ -z "$input_grid_json" ]; then input_grid_json="$entry"; else input_grid_json="$input_grid_json,$entry"; fi
+        i=$((i + 1))
+    done
+else
+    i=0
+    while [ "$i" -lt "$INPUT_GRID_COUNT" ]; do
+        # No "source" -- starts empty, waiting for IS-05 receiver activation (nmos/server.rs).
+        entry=$(printf '{"id":"nmos-in-%d","label":"NMOS Input %d","channels":%d}' "$i" "$((i + 1))" "$input_grid_channels")
+        if [ -z "$input_grid_json" ]; then input_grid_json="$entry"; else input_grid_json="$input_grid_json,$entry"; fi
+        i=$((i + 1))
+    done
+fi
 
 output_grid_json=""
-i=0
-while [ "$i" -lt "$OUTPUT_GRID_COUNT" ]; do
-    target_var="OUTPUT_${i}_TARGET"
-    eval "target_value=\${$target_var:-}"
-    target_json=$(target_json_fragment "$target_value")
-    if [ -n "$target_json" ]; then
-        entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d","channels":%d,%s}' "$i" "$((i + 1))" "$output_grid_channels" "$target_json")
-    else
-        entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d","channels":%d}' "$i" "$((i + 1))" "$output_grid_channels")
-    fi
-    if [ -z "$output_grid_json" ]; then output_grid_json="$entry"; else output_grid_json="$output_grid_json,$entry"; fi
-    i=$((i + 1))
-done
+if [ -n "$OUTPUT_GRID_SIZES" ]; then
+    i=0
+    old_ifs="$IFS"
+    IFS=','
+    set -- $OUTPUT_GRID_SIZES
+    IFS="$old_ifs"
+    for ch in "$@"; do
+        target_var="OUTPUT_${i}_TARGET"
+        eval "target_value=\${$target_var:-}"
+        target_json=$(target_json_fragment "$target_value")
+        if [ -n "$target_json" ]; then
+            entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d","channels":%d,%s}' "$i" "$((i + 1))" "$ch" "$target_json")
+        else
+            entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d","channels":%d}' "$i" "$((i + 1))" "$ch")
+        fi
+        if [ -z "$output_grid_json" ]; then output_grid_json="$entry"; else output_grid_json="$output_grid_json,$entry"; fi
+        i=$((i + 1))
+    done
+else
+    i=0
+    while [ "$i" -lt "$OUTPUT_GRID_COUNT" ]; do
+        target_var="OUTPUT_${i}_TARGET"
+        eval "target_value=\${$target_var:-}"
+        target_json=$(target_json_fragment "$target_value")
+        if [ -n "$target_json" ]; then
+            entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d","channels":%d,%s}' "$i" "$((i + 1))" "$output_grid_channels" "$target_json")
+        else
+            entry=$(printf '{"id":"nmos-out-%d","label":"NMOS Output %d","channels":%d}' "$i" "$((i + 1))" "$output_grid_channels")
+        fi
+        if [ -z "$output_grid_json" ]; then output_grid_json="$entry"; else output_grid_json="$output_grid_json,$entry"; fi
+        i=$((i + 1))
+    done
+fi
 
 cat > "$CONFIG_PATH" <<EOF
 {
@@ -200,5 +246,7 @@ cat > "$CONFIG_PATH" <<EOF
 }
 EOF
 
-echo "generated ${CONFIG_PATH} (${TRACK_COUNT} tracks, ${BUS_COUNT} buses, masters '${MASTER_COUNT:-auto-paired}', ${INPUT_GRID_COUNT} input-grid x ${input_grid_channels}ch, ${OUTPUT_GRID_COUNT} output-grid x ${output_grid_channels}ch, template '${CHANNEL_TEMPLATE}', instance '${INSTANCE_NAME}')" >&2
+input_grid_desc="${INPUT_GRID_SIZES:-${INPUT_GRID_COUNT} x ${input_grid_channels}ch}"
+output_grid_desc="${OUTPUT_GRID_SIZES:-${OUTPUT_GRID_COUNT} x ${output_grid_channels}ch}"
+echo "generated ${CONFIG_PATH} (${TRACK_COUNT} tracks, ${BUS_COUNT} buses, masters '${MASTER_COUNT:-auto-paired}', input-grid ${input_grid_desc}, output-grid ${output_grid_desc}, template '${CHANNEL_TEMPLATE}', instance '${INSTANCE_NAME}')" >&2
 exec /app/audiomixer-engine "$CONFIG_PATH"

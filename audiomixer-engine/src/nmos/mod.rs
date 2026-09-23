@@ -1,4 +1,5 @@
 pub mod discovery;
+pub mod is08;
 pub mod registration;
 pub mod resources;
 pub mod server;
@@ -48,6 +49,12 @@ pub struct NmosState {
     node_version: (u64, u64),
 
     pub output_ids: HashMap<String, OutputIds>,
+
+    /// IS-08 (Audio Channel Mapping) HTTP-facing bookkeeping (`is08.rs`) -- the real crosspoint
+    /// map lives on `mixer.app_input_grid` itself (mixer-owned, read by engine.rs every period);
+    /// this only holds the activation log `GET`/`DELETE .../map/activations/:id` needs, which is
+    /// pure NMOS-API surface, not mixer domain.
+    pub is08: is08::Is08State,
 }
 
 impl NmosState {
@@ -76,6 +83,7 @@ impl NmosState {
             mxl_so_path,
             mixer,
             output_ids,
+            is08: is08::Is08State::default(),
         }
     }
 
