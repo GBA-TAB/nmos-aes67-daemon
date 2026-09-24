@@ -3,6 +3,7 @@ mod alsa_playback;
 mod clock;
 mod config;
 mod daemon_client;
+mod mxl_domain;
 mod mxl_flow;
 mod nmos;
 
@@ -62,7 +63,14 @@ async fn main() -> anyhow::Result<()> {
     // project relies on.
     tracing::info!(tai_now_ns = clock::tai_now_ns(), "CLOCK_TAI is readable");
 
-    let state = Arc::new(nmos::NmosState::new(cfg.clone(), mxl_so));
+    // BCP-007-03: the MXL Domain's identity (what IS-05 `mxl_domain_id` names) lives in its
+    // `domain_def.json`; created here if the domain has none yet.
+    let domain_dir = std::path::Path::new(&cfg.mxl_domain);
+    let default_label = domain_dir.file_name().and_then(|n| n.to_str()).unwrap_or("mxl-domain").to_string();
+    let domain = mxl_domain::load_or_create(domain_dir, &default_label)?;
+    tracing::info!(domain = %cfg.mxl_domain, id = %domain.id, label = %domain.label, "MXL domain");
+
+    let state = Arc::new(nmos::NmosState::new(cfg.clone(), mxl_so, domain));
 
     // Phase 2 (NMOS/2110-first model, see the mxl-bridge Phase 2 plan): poll the daemon's own
     // Source/Sink set and mirror it into persistent NMOS resources — one Source/Flow/Sender per
@@ -99,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
     // registers Node and Device first and only *then* walks state.sinks/sources, which by then are
     // already populated from this call — that's what actually registers them, in the right order,
     // exactly once.
-    nmos::sync::apply_diff(&state, &registration_client, None, &cfg.ip_addr, initial_state).await;
+    nmos::sync::apply_diff(&state, &registration_client, None, initial_state).await;
 
     {
         let state = state.clone();

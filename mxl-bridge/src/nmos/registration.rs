@@ -41,10 +41,10 @@ async fn unregister_resource(client: &reqwest::Client, base: &str, rtype: &str, 
 
 /// Registers the Source/Flow/Sender mirroring one daemon Sink (Phase 2 plan §2/§3). Called by
 /// nmos/sync.rs on every Added/Changed daemon Sink diff.
-pub(crate) async fn register_sink(client: &reqwest::Client, base: &str, state: &NmosState, ip: &str, entry: &SinkEntrySnapshot) -> anyhow::Result<()> {
+pub(crate) async fn register_sink(client: &reqwest::Client, base: &str, state: &NmosState, entry: &SinkEntrySnapshot) -> anyhow::Result<()> {
     register_resource(client, base, "source", resources::source_json(state, entry)).await?;
     register_resource(client, base, "flow", resources::flow_json(state, entry)).await?;
-    register_resource(client, base, "sender", resources::sender_json(state, ip, entry)).await?;
+    register_resource(client, base, "sender", resources::sender_json(state, entry)).await?;
     Ok(())
 }
 
@@ -81,7 +81,7 @@ async fn register_all(client: &reqwest::Client, base: &str, state: &NmosState, i
     register_node_and_device(client, base, state, ip).await?;
     let sinks: Vec<_> = state.sinks.lock().await.values().map(SinkEntrySnapshot::from).collect();
     for entry in &sinks {
-        register_sink(client, base, state, ip, entry).await?;
+        register_sink(client, base, state, entry).await?;
     }
     let sources: Vec<_> = state.sources.lock().await.values().map(SourceEntrySnapshot::from).collect();
     for entry in &sources {

@@ -10,7 +10,8 @@ use tower_http::cors::CorsLayer;
 use super::is08;
 use super::registration;
 use super::resources;
-use super::state::{NmosState, SinkEntrySnapshot, SinkLeaseAction, SourceEntrySnapshot};
+use super::mxl_transport;
+use super::state::{NmosState, SinkEntrySnapshot, SinkLeaseAction, SourceEntrySnapshot, CONTROLLER_LEASE};
 
 type S = Arc<NmosState>;
 
@@ -187,16 +188,14 @@ async fn sender_ids(State(state): State<S>) -> Json<serde_json::Value> {
 
 async fn senders_list(State(state): State<S>) -> Json<serde_json::Value> {
     let sinks = state.sinks.lock().await;
-    let ip = client_ip(&state);
-    let list: Vec<_> = sinks.values().map(|e| resources::sender_json(&state, &ip, &SinkEntrySnapshot::from(e))).collect();
+    let list: Vec<_> = sinks.values().map(|e| resources::sender_json(&state, &SinkEntrySnapshot::from(e))).collect();
     Json(serde_json::json!(list))
 }
 
 async fn sender_get(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
     let sinks = state.sinks.lock().await;
-    let ip = client_ip(&state);
     match sinks.values().find(|e| e.sender_id.to_string() == id) {
-        Some(e) => Json(resources::sender_json(&state, &ip, &SinkEntrySnapshot::from(e))).into_response(),
+        Some(e) => Json(resources::sender_json(&state, &SinkEntrySnapshot::from(e))).into_response(),
         None => not_found(),
     }
 }
@@ -222,74 +221,80 @@ async fn receiver_get(State(state): State<S>, Path(id): Path<String>) -> axum::r
 }
 
 // ---------------------------------------------------------------------------
-// IS-05 Connection API — sender side
+// IS-05 Connection API — MXL per AMWA BCP-007-03 v1.0 (see nmos/mxl_transport.rs for the rules)
 // ---------------------------------------------------------------------------
 
-async fn sender_constraints(Path(_id): Path<String>) -> Json<serde_json::Value> {
-    Json(serde_json::json!([{}]))
+fn bad_request(msg: impl Into<String>) -> axum::response::Response {
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({"code": 400, "error": msg.into(), "debug": null}))).into_response()
+}
+
+// ---- sender side
+
+async fn sender_constraints(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
+    let sinks = state.sinks.lock().await;
+    match sinks.values().find(|e| e.sender_id.to_string() == id) {
+        Some(e) => Json(mxl_transport::constraints(
+            mxl_transport::Role::Sender,
+            &state.domain.id.to_string(),
+            Some(&e.flow_id.to_string()),
+        ))
+        .into_response(),
+        None => not_found(),
+    }
 }
 
 async fn sender_transporttype(Path(_id): Path<String>) -> Json<serde_json::Value> {
     Json(serde_json::json!(resources::TRANSPORT_TYPE))
 }
 
-async fn sender_transportfile(Path(_id): Path<String>) -> impl IntoResponse {
-    // Not actually used by mxl-bridge's own receiver activation (which self-resolves flow_id via
-    // sender_id + registry query, ignoring whatever's relayed here — see README's IS-05 design
-    // note) — this exists only because some controllers (e.g. the orchestrator) unconditionally GET
-    // it before PATCHing a receiver, and it must return 200 rather than error for that not to break.
+/// BCP-007-03: always 404 for an MXL Sender (its `manifest_href` is `null`). Controllers connect by
+/// `mxl_flow_id`; visualUniverse-nmosrouter already skips the transport file for MXL Senders.
+async fn sender_transportfile(Path(_id): Path<String>) -> axum::response::Response {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain")],
-        "mxl-bridge: not used, see manifest note in README",
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"code": 404, "error": "MXL Senders have no transport file (BCP-007-03)", "debug": null})),
     )
+        .into_response()
 }
 
 async fn sender_staged(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
     let sinks = state.sinks.lock().await;
     match sinks.values().find(|e| e.sender_id.to_string() == id) {
+        // The Sender's Domain and Flow are fixed (its daemon Sink's flow in this node's Domain), so
+        // both are always determined - never `null`.
         Some(e) => Json(serde_json::json!({
             "master_enable": e.active,
             "activation": { "mode": null, "requested_time": null, "activation_time": null },
             "receiver_id": e.receiver_id,
-            "transport_params": [{}]
+            "transport_params": mxl_transport::params(Some(&state.domain.id.to_string()), Some(&e.flow_id.to_string()))
         }))
         .into_response(),
         None => not_found(),
     }
 }
 
-/// `master_enable: true` acquires a lease for this Sender keyed by `receiver_id` (required — see
-/// nmos/state.rs's `SinkLeaseAction`); `master_enable: false` releases one (`receiver_id` given) or
-/// force-clears every lease (omitted). A PATCH with neither field present is a no-op on activation
-/// state, just echoing current status.
+/// `master_enable: true` acquires a lease for this Sender keyed by `receiver_id`, or by the
+/// controller itself when none is given (IS-05 allows enabling a Sender without naming a Receiver;
+/// visualUniverse-nmosrouter does exactly that before patching one). `master_enable: false`
+/// releases that one lease (`receiver_id` given) or every lease (omitted). `transport_params` are
+/// checked against BCP-007-03 (null / "auto" / this Sender's own Domain and Flow only).
 async fn sender_patch(
     State(state): State<S>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
-    let exists = state.sinks.lock().await.values().any(|e| e.sender_id.to_string() == id);
-    if !exists {
-        return not_found();
+    let own_flow = match state.sinks.lock().await.values().find(|e| e.sender_id.to_string() == id) {
+        Some(e) => e.flow_id.to_string(),
+        None => return not_found(),
+    };
+    if let Err(e) = mxl_transport::parse_staged(mxl_transport::Role::Sender, &body, &state.domain.id.to_string(), Some(&own_flow)) {
+        return bad_request(e);
     }
 
     let master_enable = body.get("master_enable").and_then(|v| v.as_bool());
     let receiver_id = body.get("receiver_id").and_then(|v| v.as_str()).map(str::to_string);
-
     let action = match master_enable {
-        Some(true) => match receiver_id {
-            Some(rid) => Some(SinkLeaseAction::Acquire(rid)),
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "code": 400,
-                        "error": "master_enable:true requires a receiver_id (mxl-bridge tracks Sender activation per-subscriber)",
-                        "debug": null
-                    })),
-                )
-                    .into_response();
-            }
-        },
+        Some(true) => Some(SinkLeaseAction::Acquire(receiver_id.unwrap_or_else(|| CONTROLLER_LEASE.to_string()))),
         Some(false) => Some(SinkLeaseAction::Release(receiver_id)),
         None => None,
     };
@@ -300,10 +305,11 @@ async fn sender_patch(
                 tracing::info!(sink_id = entry.daemon_id, active = entry.active, receiver_id = ?entry.receiver_id, "sender staged/patched");
             }
             Err(e) => {
+                // BCP-007-03: an immediate activation that cannot be applied answers 500.
                 tracing::error!(error = %e, "sender activation failed");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"code": 500, "error": e.to_string(), "debug": null})),
+                    Json(serde_json::json!({"code": 500, "error": format!("{e:#}"), "debug": null})),
                 )
                     .into_response();
             }
@@ -312,12 +318,13 @@ async fn sender_patch(
     sender_staged(State(state), Path(id)).await
 }
 
-// ---------------------------------------------------------------------------
-// IS-05 Connection API — receiver side
-// ---------------------------------------------------------------------------
+// ---- receiver side
 
-async fn receiver_constraints(Path(_id): Path<String>) -> Json<serde_json::Value> {
-    Json(serde_json::json!([{}]))
+async fn receiver_constraints(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
+    if !state.sources.lock().await.values().any(|e| e.receiver_id.to_string() == id) {
+        return not_found();
+    }
+    Json(mxl_transport::constraints(mxl_transport::Role::Receiver, &state.domain.id.to_string(), None)).into_response()
 }
 
 async fn receiver_transporttype(Path(_id): Path<String>) -> Json<serde_json::Value> {
@@ -327,72 +334,78 @@ async fn receiver_transporttype(Path(_id): Path<String>) -> Json<serde_json::Val
 async fn receiver_staged(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
     let sources = state.sources.lock().await;
     match sources.values().find(|e| e.receiver_id.to_string() == id) {
-        Some(e) => Json(serde_json::json!({
-            "master_enable": e.active,
-            "activation": { "mode": null, "requested_time": null, "activation_time": null },
-            "sender_id": e.sender_id,
-            "transport_file": { "data": null, "type": null },
-            "transport_params": [{}]
-        }))
-        .into_response(),
+        Some(e) => {
+            // Undetermined until connected: both `null` (BCP-007-03 / IS-05 uninitialised values).
+            let domain = e.flow_id.as_ref().map(|_| state.domain.id.to_string());
+            Json(serde_json::json!({
+                "master_enable": e.active,
+                "activation": { "mode": null, "requested_time": null, "activation_time": null },
+                "sender_id": e.sender_id,
+                "transport_file": { "data": null, "type": null },
+                "transport_params": mxl_transport::params(domain.as_deref(), e.flow_id.as_deref())
+            }))
+            .into_response()
+        }
         None => not_found(),
     }
 }
 
-/// The interesting one: resolves sender_id -> flow_id (via a local lookup if it names one of this
-/// node's own mirrored Senders, otherwise the registry) and opens it as this Receiver's reader
-/// (nmos/state.rs::set_source_activation — real MXL data movement as of Milestone 4). Only
-/// `activate_immediate` is handled — matches what the orchestrator actually sends
-/// (ConnectionService.cs never uses scheduled activation) and this project's stated Phase 1 scope;
-/// any other `activation.mode` is accepted but treated the same way (applied immediately) rather
-/// than rejected, since a partial IS-05 implementation degrading gracefully seemed better than
-/// erroring on otherwise-reasonable requests.
+/// Connects this Receiver (backing a daemon Source, TX direction) to an MXL Flow and opens it as
+/// its reader. The Flow comes from `transport_params[0].mxl_flow_id` (BCP-007-03, what a spec
+/// Controller sends); when a request names only a `sender_id` (visualUniverse-nmosrouter today),
+/// the Flow is resolved from that Sender - locally if it is one of this node's own, otherwise via
+/// the registry. Only `activate_immediate` semantics are implemented; any other mode is applied
+/// immediately too (unchanged from before).
 async fn receiver_patch(
     State(state): State<S>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
-    let exists = state.sources.lock().await.values().any(|e| e.receiver_id.to_string() == id);
-    if !exists {
+    if !state.sources.lock().await.values().any(|e| e.receiver_id.to_string() == id) {
         return not_found();
     }
+    if let Err(e) = mxl_transport::check_no_transport_file(&body) {
+        return bad_request(e);
+    }
+    let staged = match mxl_transport::parse_staged(mxl_transport::Role::Receiver, &body, &state.domain.id.to_string(), None) {
+        Ok(s) => s,
+        Err(e) => return bad_request(e),
+    };
 
     let sender_id = body.get("sender_id").and_then(|v| v.as_str()).map(str::to_string);
+    let staged_flow = match &staged.flow {
+        Some(mxl_transport::Param::Id(f)) => Some(f.clone()),
+        _ => None,
+    };
     let master_enable = body.get("master_enable").and_then(|v| v.as_bool());
-    let active = master_enable.unwrap_or(sender_id.is_some());
+    let active = master_enable.unwrap_or(sender_id.is_some() || staged_flow.is_some());
 
     let mut flow_id = None;
     if active {
-        let Some(sid) = &sender_id else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"code": 400, "error": "activating a receiver requires sender_id", "debug": null})),
-            )
-                .into_response();
-        };
-        let resolved = if let Some(fid) = state.own_sink_flow_id(sid).await {
-            Ok(fid.to_string())
-        } else {
-            registration::resolve_sender_flow_id(&state, sid).await
-        };
-        match resolved {
-            Ok(fid) => flow_id = Some(fid),
-            Err(e) => {
-                tracing::error!(error = %e, sender_id = sid, "failed to resolve sender's flow_id");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"code": 400, "error": format!("could not resolve sender_id: {e}"), "debug": null})),
-                )
-                    .into_response();
+        flow_id = match (staged_flow, &sender_id) {
+            (Some(f), _) => Some(f),
+            (None, Some(sid)) => {
+                let resolved = match state.own_sink_flow_id(sid).await {
+                    Some(fid) => Ok(fid.to_string()),
+                    None => registration::resolve_sender_flow_id(&state, sid).await,
+                };
+                match resolved {
+                    Ok(fid) => Some(fid),
+                    Err(e) => {
+                        tracing::error!(error = %e, sender_id = sid, "failed to resolve sender's flow_id");
+                        return bad_request(format!("could not resolve sender_id: {e}"));
+                    }
+                }
             }
-        }
+            (None, None) => return bad_request("activating an MXL Receiver requires transport_params mxl_flow_id (or a sender_id)"),
+        };
     }
 
     if let Err(e) = state.set_source_activation(&id, active, sender_id, flow_id).await {
         tracing::error!(error = %e, "receiver activation failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"code": 500, "error": e.to_string(), "debug": null})),
+            Json(serde_json::json!({"code": 500, "error": format!("{e:#}"), "debug": null})),
         )
             .into_response();
     }

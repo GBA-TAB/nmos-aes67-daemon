@@ -124,8 +124,9 @@ pub fn flow_json(state: &NmosState, entry: &SinkEntrySnapshot) -> serde_json::Va
     })
 }
 
-pub fn sender_json(state: &NmosState, ip: &str, entry: &SinkEntrySnapshot) -> serde_json::Value {
-    let base = base_url(&state.cfg, ip);
+/// BCP-007-03: `manifest_href` is always `null` (the `/transportfile` endpoint 404s) and
+/// `interface_bindings` is empty - an MXL Flow lives in shared memory, not on a network interface.
+pub fn sender_json(state: &NmosState, entry: &SinkEntrySnapshot) -> serde_json::Value {
     serde_json::json!({
         "id": entry.sender_id.to_string(),
         "version": version_string(entry.version),
@@ -135,8 +136,8 @@ pub fn sender_json(state: &NmosState, ip: &str, entry: &SinkEntrySnapshot) -> se
         "flow_id": entry.flow_id.to_string(),
         "transport": TRANSPORT_TYPE,
         "device_id": state.device_id.to_string(),
-        "manifest_href": format!("{base}/x-nmos/connection/v1.1/single/senders/{}/transportfile", entry.sender_id),
-        "interface_bindings": [state.cfg.interface_name],
+        "manifest_href": null,
+        "interface_bindings": [],
         "subscription": {
             "receiver_id": entry.receiver_id,
             "active": entry.active
@@ -144,6 +145,8 @@ pub fn sender_json(state: &NmosState, ip: &str, entry: &SinkEntrySnapshot) -> se
     })
 }
 
+/// BCP-007-03: empty `interface_bindings`; the Receiver declares what Flows it can consume as
+/// BCP-004-01 Receiver Capabilities (`constraint_sets`), here the exact shape of its daemon Source.
 pub fn receiver_json(state: &NmosState, entry: &SourceEntrySnapshot) -> serde_json::Value {
     serde_json::json!({
         "id": entry.receiver_id.to_string(),
@@ -153,10 +156,15 @@ pub fn receiver_json(state: &NmosState, entry: &SourceEntrySnapshot) -> serde_js
         "tags": {},
         "device_id": state.device_id.to_string(),
         "transport": TRANSPORT_TYPE,
-        "interface_bindings": [state.cfg.interface_name],
+        "interface_bindings": [],
         "format": "urn:x-nmos:format:audio",
         "caps": {
-            "media_types": ["audio/float32"]
+            "media_types": ["audio/float32"],
+            "constraint_sets": [{
+                "urn:x-nmos:cap:format:channel_count": { "enum": [entry.channels] },
+                "urn:x-nmos:cap:format:sample_rate": { "enum": [{ "numerator": state.cfg.sample_rate, "denominator": 1 }] },
+                "urn:x-nmos:cap:format:sample_depth": { "enum": [32] }
+            }]
         },
         "subscription": {
             "sender_id": entry.sender_id,
@@ -165,8 +173,15 @@ pub fn receiver_json(state: &NmosState, entry: &SourceEntrySnapshot) -> serde_js
     })
 }
 
+/// Numbered Source Channel symbols (`NSC000`..`NSC128`, IS-04 source_audio schema) where they fit.
 fn channels_json(count: u32) -> serde_json::Value {
     (0..count)
-        .map(|i| serde_json::json!({ "label": format!("Channel {}", i + 1) }))
+        .map(|i| {
+            let mut c = serde_json::json!({ "label": format!("Channel {}", i + 1) });
+            if i <= 128 {
+                c["symbol"] = serde_json::json!(format!("NSC{i:03}"));
+            }
+            c
+        })
         .collect()
 }

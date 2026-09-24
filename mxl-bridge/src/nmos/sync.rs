@@ -11,12 +11,11 @@ use super::state::NmosState;
 /// task; exits (with a warning) only if the sending side (daemon_client::run) has stopped, which
 /// shouldn't happen since that loop never returns either.
 pub async fn run(state: Arc<NmosState>, mut rx: tokio::sync::mpsc::UnboundedReceiver<DaemonDiff>) {
-    let ip = state.cfg.ip_addr.clone();
     let client = reqwest::Client::new();
     let base = registration::registry_base(&state);
 
     while let Some(diff) = rx.recv().await {
-        apply_diff(&state, &client, base.as_deref(), &ip, diff).await;
+        apply_diff(&state, &client, base.as_deref(), diff).await;
     }
     tracing::warn!("daemon diff channel closed, mirror sync task stopped");
 }
@@ -25,12 +24,12 @@ pub async fn run(state: Arc<NmosState>, mut rx: tokio::sync::mpsc::UnboundedRece
 /// call it directly for the very first, synchronous poll at startup — before the RX/TX threads
 /// open their wide ALSA devices, which need `state.sinks`/`sources`/`alsa_channels` already
 /// populated (Milestone 4, Phase 2 plan §4).
-pub async fn apply_diff(state: &Arc<NmosState>, client: &reqwest::Client, base: Option<&str>, ip: &str, diff: DaemonDiff) {
+pub async fn apply_diff(state: &Arc<NmosState>, client: &reqwest::Client, base: Option<&str>, diff: DaemonDiff) {
     state.set_alsa_channels(diff.state.alsa_channels);
     let sink_changed = !diff.sink_changes.is_empty();
     let source_changed = !diff.source_changes.is_empty();
     for change in diff.sink_changes {
-        apply_sink_change(state, client, base, ip, change).await;
+        apply_sink_change(state, client, base, change).await;
     }
     for change in diff.source_changes {
         apply_source_change(state, client, base, change).await;
@@ -44,13 +43,13 @@ pub async fn apply_diff(state: &Arc<NmosState>, client: &reqwest::Client, base: 
     }
 }
 
-async fn apply_sink_change(state: &Arc<NmosState>, client: &reqwest::Client, base: Option<&str>, ip: &str, change: StreamChange<DaemonSink>) {
+async fn apply_sink_change(state: &Arc<NmosState>, client: &reqwest::Client, base: Option<&str>, change: StreamChange<DaemonSink>) {
     match change {
         StreamChange::Added(sink) | StreamChange::Changed(sink) => {
             let entry = state.apply_sink_added_or_changed(&sink).await;
             tracing::info!(daemon_id = sink.id, label = %entry.label, channels = entry.channels, "mirroring daemon Sink");
             if let Some(base) = base {
-                if let Err(e) = registration::register_sink(client, base, state, ip, &entry).await {
+                if let Err(e) = registration::register_sink(client, base, state, &entry).await {
                     tracing::warn!(error = %e, daemon_id = sink.id, "failed to register mirrored Sink resources");
                 }
             }
@@ -110,7 +109,7 @@ mod tests {
     /// needed.
     #[tokio::test]
     async fn run_applies_added_and_removed_diffs_from_channel() {
-        let state = Arc::new(NmosState::new(test_config(), std::path::PathBuf::from("/nonexistent")));
+        let state = Arc::new(NmosState::new(test_config(), std::path::PathBuf::from("/nonexistent"), crate::mxl_domain::test_domain()));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(run(state.clone(), rx));
 

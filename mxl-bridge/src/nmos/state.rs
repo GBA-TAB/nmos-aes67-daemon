@@ -16,6 +16,9 @@ pub fn version_string(v: (u64, u64)) -> String {
     format!("{}:{}", v.0, v.1)
 }
 
+/// Lease held for a `master_enable: true` that names no `receiver_id` (IS-05 allows it).
+pub const CONTROLLER_LEASE: &str = "controller";
+
 /// One `master_enable` PATCH's intent against a mirrored Sender's lease set — see `SinkEntry`'s
 /// docs and the Phase 2 plan §1 ("Destruction must follow the same shared-resource pattern
 /// creation does") for why a plain boolean can't represent this once multiple independent
@@ -125,6 +128,8 @@ pub struct SourceEntry {
     pub version: (u64, u64),
     pub active: bool,
     pub sender_id: Option<String>,
+    /// MXL Flow this Receiver reads while active (reported as IS-05 `mxl_flow_id`).
+    pub flow_id: Option<String>,
     pub reader: Option<mxl_flow::MxlAudioFlowSource>,
     /// Set by `alsa_playback.rs` on a read failure, cleared on the next successful read - same
     /// "folds into exposed `active`, never touches the raw PATCH-driven bit" rule as
@@ -143,6 +148,7 @@ impl SourceEntry {
             version: now_version(),
             active: false,
             sender_id: None,
+            flow_id: None,
             reader: None,
             fault: None,
         }
@@ -159,6 +165,8 @@ impl SourceEntry {
 pub struct NmosState {
     pub cfg: Config,
     pub mxl_so_path: std::path::PathBuf,
+    /// Identity of `cfg.mxl_domain` from its `domain_def.json` (BCP-007-03).
+    pub domain: crate::mxl_domain::DomainDef,
 
     pub node_id: uuid::Uuid,
     pub device_id: uuid::Uuid,
@@ -183,7 +191,7 @@ pub struct NmosState {
 }
 
 impl NmosState {
-    pub fn new(cfg: Config, mxl_so_path: std::path::PathBuf) -> Self {
+    pub fn new(cfg: Config, mxl_so_path: std::path::PathBuf, domain: crate::mxl_domain::DomainDef) -> Self {
         let alsa_channels = cfg.alsa_channels_fallback;
         let (fault_notify_tx, fault_notify_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -195,6 +203,7 @@ impl NmosState {
             alsa_channels: AtomicU8::new(alsa_channels),
             cfg,
             mxl_so_path,
+            domain,
             sinks: Mutex::new(HashMap::new()),
             sources: Mutex::new(HashMap::new()),
             is08: super::is08::Is08State::default(),
@@ -338,7 +347,9 @@ impl NmosState {
             entry.flow = None;
         }
 
-        entry.receiver_id = entry.leases.last().cloned();
+        // The controller-only lease (no receiver_id, e.g. visualUniverse-nmosrouter enabling the
+        // Sender before patching a Receiver) is not a Receiver id and is never reported as one.
+        entry.receiver_id = entry.leases.iter().rev().find(|l| *l != CONTROLLER_LEASE).cloned();
         entry.active = now_active;
         Ok(SinkEntrySnapshot::from(&*entry))
     }
@@ -361,6 +372,7 @@ impl NmosState {
             .find(|e| e.receiver_id.to_string() == receiver_id_str)
             .ok_or_else(|| anyhow::anyhow!("no such receiver {receiver_id_str}"))?;
 
+        let flow_id_for_report = flow_id.clone();
         if active {
             let flow_id = flow_id.ok_or_else(|| anyhow::anyhow!("activating a Receiver requires a resolved flow_id"))?;
             let reader = mxl_flow::MxlAudioFlowSource::open(&self.cfg, &self.mxl_so_path, &flow_id, entry.channels as usize)
@@ -372,6 +384,7 @@ impl NmosState {
 
         entry.active = active;
         entry.sender_id = sender_id;
+        entry.flow_id = if active { flow_id_for_report } else { None };
         Ok(SourceEntrySnapshot::from(&*entry))
     }
 
@@ -456,7 +469,7 @@ mod tests {
     use crate::daemon_client::{test_sink as sink, test_source as source};
 
     fn test_state() -> NmosState {
-        NmosState::new(test_config(), std::path::PathBuf::from("/nonexistent"))
+        NmosState::new(test_config(), std::path::PathBuf::from("/nonexistent"), crate::mxl_domain::test_domain())
     }
 
     #[tokio::test]

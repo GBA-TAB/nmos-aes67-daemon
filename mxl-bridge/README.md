@@ -24,13 +24,34 @@ Full design rationale lives in the conversation that produced this skeleton; the
 - **Phase 1 scope: same-host RX and TX** (AES67/ALSA capture → MXL flow, and MXL flow → ALSA
   playback — both now implemented and verified). RDMA/Fabrics cross-host wiring is a later phase,
   once the NMOS layer sits on top of this.
-- **IS-05 activation needs zero orchestrator changes.** The orchestrator's `ConnectionService`
-  (`~/DEV/visualUniverse-nmosrouter*`) relays whatever a sender's `manifest_href` returns into the
-  receiver's `/staged` PATCH but never validates it — so a receiver here can just ignore that relayed
-  content and self-resolve the paired sender via `sender_id` against the IS-04 registry, mirroring the
-  daemon's own `fetch_remote_sender_sdp()` pattern. A private-use `transporttype`
-  (`urn:x-mxl:transport:flow`) is used since there's no AMWA-registered URN for this. **Implemented and
-  verified — see Status.**
+- **NMOS follows AMWA BCP-007-03 v1.0 (NMOS With MXL)** — see the section below. A Receiver connects
+  by `transport_params[0].mxl_flow_id` (what a spec Controller sends) or, for
+  visualUniverse-nmosrouter as it is today, by `sender_id` alone (resolved locally or via the
+  registry).
+
+## NMOS With MXL (AMWA BCP-007-03 v1.0)
+
+Aligned 2026-09-25 with the specification (AMWA-TV/bcp-007-03 @ 16d66a4), not with any one
+implementation. The official schemas are vendored under `contract/` (plus IS-04 v1.3.3), and
+`src/nmos/contract_tests.rs` drives this node's real HTTP router against them — the same files are
+meant to be checked by every MXL node (the macOS driver included), so they all agree via the spec.
+
+- **Domain identity**: `<mxl_domain>/domain_def.json` (`id`, `label`, `description`, `tags`); created
+  with a random UUID if the domain has none, never rewritten if present (`src/mxl_domain.rs`).
+- **Senders**: `transport` `urn:x-nmos:transport:mxl`, `manifest_href: null`, `/transportfile` → 404,
+  `interface_bindings: []`. `master_enable: true` may name a `receiver_id` (per-subscriber lease) or
+  not (controller lease).
+- **Receivers**: `interface_bindings: []`, BCP-004-01 caps (`channel_count`, `sample_rate`,
+  `sample_depth` of the daemon Source they feed). A request carrying a transport file is refused.
+- **IS-05** (v1.1 and v1.2): `active`/`staged`/`constraints` carry exactly one set with
+  `mxl_domain_id` and `mxl_flow_id`; `null` = not determined, `"auto"` resolves to this node's own
+  values (never listed in constraints; never accepted for a Receiver's flow); anything that cannot
+  apply here → 400, an activation that fails → 500 with the cause.
+
+Verified live 2026-09-25 on the real RAVENNA card: router-style connect (sender enabled without a
+`receiver_id`, receiver by `sender_id`), spec-style connect (receiver by `mxl_flow_id`, domain
+`"auto"`), and a 16-channel flow refused by an 8-channel receiver with its reason; the fed daemon
+Sources report `transmitting`.
 
 ## Status
 
@@ -87,9 +108,7 @@ path above.
 Known simplifications, deliberately deferred rather than unnoticed: no scheduled activation (only
 `activate_immediate` is meaningfully handled, matching what the orchestrator's `ConnectionService` actually
 sends); `staged` and `active` are the same state (no separate staged-not-yet-active concept); no IS-04
-Query API websocket subscriptions; `transportfile`/`constraints` are minimal placeholders (the design
-deliberately doesn't need real SDP-shaped transport_file content — see the IS-05 design note above); no
-config yet for a real RAVENNA device (only tested against ALSA Loopback).
+Query API websocket subscriptions.
 
 One route-syntax bug found while testing this: axum 0.7's path-parameter syntax is `:id`, not `{id}` — the
 latter is silently treated as a literal path segment (matches nothing real, falls through to axum's default

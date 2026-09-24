@@ -809,7 +809,7 @@ mod tests {
     use crate::daemon_client::{test_sink, test_source};
 
     async fn test_state() -> NmosState {
-        NmosState::new(test_config(), std::path::PathBuf::from("/nonexistent"))
+        NmosState::new(test_config(), std::path::PathBuf::from("/nonexistent"), crate::mxl_domain::test_domain())
     }
 
     fn action(json: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {

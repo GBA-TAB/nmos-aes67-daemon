@@ -1,4 +1,7 @@
 pub mod is08;
+pub mod mxl_transport;
+#[cfg(test)]
+mod contract_tests;
 pub mod registration;
 pub mod resources;
 pub mod server;
