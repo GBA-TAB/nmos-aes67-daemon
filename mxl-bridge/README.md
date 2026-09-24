@@ -51,7 +51,9 @@ meant to be checked by every MXL node (the macOS driver included), so they all a
 Verified live 2026-09-25 on the real RAVENNA card: router-style connect (sender enabled without a
 `receiver_id`, receiver by `sender_id`), spec-style connect (receiver by `mxl_flow_id`, domain
 `"auto"`), and a 16-channel flow refused by an 8-channel receiver with its reason; the fed daemon
-Sources report `transmitting`.
+Sources report `transmitting`. Full round trip confirmed audible the same night: macOS CoreAudio
+(AES67_macos_Driver) → AES67 → RAVENNA → ALSA → mxl-bridge → MXL flow → mxl-bridge → ALSA → RAVENNA →
+AES67 (239.55.5.5) → back on the Mac.
 
 ## Status
 
