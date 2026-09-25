@@ -276,19 +276,35 @@ async fn receiver_get(State(state): State<S>, Path(id): Path<String>) -> axum::r
 // IS-05 Connection API — sender side (output grid — see PICKOFFS.md's own intro)
 // ---------------------------------------------------------------------------
 
-async fn sender_constraints(Path(_id): Path<String>) -> Json<serde_json::Value> {
-    Json(serde_json::json!([{}]))
+/// AMWA BCP-007-03: one constraint set with both transport parameters; an output-grid Sender writes
+/// exactly its own Flow in this node's Domain.
+async fn sender_constraints(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
+    match state
+        .mixer
+        .output_grid
+        .snapshot()
+        .into_iter()
+        .find(|e| state.output_ids.get(&e.id).is_some_and(|ids| ids.sender_id.to_string() == id))
+    {
+        Some(e) => Json(serde_json::json!([{
+            "mxl_domain_id": { "enum": [state.domain_id] },
+            "mxl_flow_id": { "enum": [e.flow_id.to_string()] }
+        }]))
+        .into_response(),
+        None => not_found(),
+    }
 }
 
 async fn sender_transporttype(Path(_id): Path<String>) -> Json<serde_json::Value> {
     Json(serde_json::json!(resources::TRANSPORT_TYPE))
 }
 
+/// AMWA BCP-007-03: an MXL Sender has no transport file (its manifest_href is null).
 async fn sender_transportfile(Path(_id): Path<String>) -> impl IntoResponse {
-    // Same note as mxl-bridge's own handler: nothing here actually consumes this (a receiver
-    // activating against one of this app's Senders self-resolves flow_id via sender_id + registry
-    // query), it exists only so controllers that unconditionally GET it before PATCHing don't break.
-    ([(axum::http::header::CONTENT_TYPE, "text/plain")], "audiomixer-engine: not used")
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"code": 404, "error": "MXL Senders have no transport file (BCP-007-03)", "debug": null})),
+    )
 }
 
 async fn sender_staged(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
@@ -303,7 +319,7 @@ async fn sender_staged(State(state): State<S>, Path(id): Path<String>) -> axum::
             "master_enable": true,
             "activation": { "mode": null, "requested_time": null, "activation_time": null },
             "receiver_id": *e.receiver_id.lock().unwrap(),
-            "transport_params": [{}]
+            "transport_params": [{ "mxl_domain_id": state.domain_id, "mxl_flow_id": e.flow_id.to_string() }]
         }))
         .into_response(),
         None => not_found(),
@@ -332,8 +348,11 @@ async fn sender_patch(State(state): State<S>, Path(id): Path<String>, Json(body)
 // IS-05 Connection API — receiver side (input grid — see PICKOFFS.md's own intro)
 // ---------------------------------------------------------------------------
 
-async fn receiver_constraints(Path(_id): Path<String>) -> Json<serde_json::Value> {
-    Json(serde_json::json!([{}]))
+async fn receiver_constraints(State(state): State<S>, Path(id): Path<String>) -> axum::response::Response {
+    if !state.mixer.input_grid.snapshot().iter().any(|e| e.receiver_id.to_string() == id) {
+        return not_found();
+    }
+    Json(serde_json::json!([{ "mxl_domain_id": { "enum": [state.domain_id] }, "mxl_flow_id": {} }])).into_response()
 }
 
 async fn receiver_transporttype(Path(_id): Path<String>) -> Json<serde_json::Value> {
@@ -347,7 +366,11 @@ async fn receiver_staged(State(state): State<S>, Path(id): Path<String>) -> axum
             "activation": { "mode": null, "requested_time": null, "activation_time": null },
             "sender_id": *entry.subscribed_sender_id.lock().unwrap(),
             "transport_file": { "data": null, "type": null },
-            "transport_params": [{}]
+            // Both null until connected (BCP-007-03 / IS-05 uninitialised values).
+            "transport_params": [{
+                "mxl_domain_id": entry.flow_id.lock().unwrap().as_ref().map(|_| state.domain_id.clone()),
+                "mxl_flow_id": entry.flow_id.lock().unwrap().as_ref().map(|f| f.to_string())
+            }]
         }))
         .into_response(),
         None => not_found(),

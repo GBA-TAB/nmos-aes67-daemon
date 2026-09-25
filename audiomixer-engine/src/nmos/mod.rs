@@ -41,6 +41,8 @@ pub struct OutputIds {
 /// is keyed by the output grid's own string namespace, not a numeric bus id.
 pub struct NmosState {
     pub cfg: Config,
+    /// This node's MXL Domain id (`<mxl_domain>/domain_def.json`, AMWA BCP-007-03).
+    pub domain_id: String,
     pub mxl_so_path: std::path::PathBuf,
     pub mixer: Arc<MixerState>,
 
@@ -58,7 +60,7 @@ pub struct NmosState {
 }
 
 impl NmosState {
-    pub fn new(cfg: Config, mxl_so_path: std::path::PathBuf, mixer: Arc<MixerState>) -> Self {
+    pub fn new(cfg: Config, mxl_so_path: std::path::PathBuf, mixer: Arc<MixerState>, domain_id: String) -> Self {
         let instance = cfg.instance_name.clone();
         let output_ids = mixer
             .output_grid
@@ -79,6 +81,7 @@ impl NmosState {
             node_id: crate::ids::node_id(&instance),
             device_id: crate::ids::device_id(&instance),
             node_version: now_version(),
+            domain_id,
             cfg,
             mxl_so_path,
             mixer,

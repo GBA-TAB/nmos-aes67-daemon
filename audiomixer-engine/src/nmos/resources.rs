@@ -181,8 +181,8 @@ pub fn flow_json(
 /// state for `master_enable` to gate here, so `receiver_id` is the only part of `subscription`
 /// that's actually meaningful (purely informational, tracks what a controller last PATCHed it to).
 pub fn sender_json(
-    cfg: &Config,
-    ip: &str,
+    _cfg: &Config,
+    _ip: &str,
     device_id: uuid::Uuid,
     entry: &OutputGridEntry,
     sender_id: uuid::Uuid,
@@ -190,7 +190,6 @@ pub fn sender_json(
     receiver_id: Option<String>,
     version: &str,
 ) -> serde_json::Value {
-    let base = base_url(cfg, ip);
     serde_json::json!({
         "id": sender_id.to_string(),
         "version": version,
@@ -200,8 +199,9 @@ pub fn sender_json(
         "flow_id": flow_id.to_string(),
         "transport": TRANSPORT_TYPE,
         "device_id": device_id.to_string(),
-        "manifest_href": format!("{base}/x-nmos/connection/v1.1/single/senders/{sender_id}/transportfile"),
-        "interface_bindings": [cfg.interface_name],
+        // AMWA BCP-007-03: null manifest (/transportfile 404s), no network interface bindings.
+        "manifest_href": null,
+        "interface_bindings": [],
         // Not hardcoded `true` any more: a write failure (engine.rs's output-write step) sets
         // entry.fault, so this honestly reflects whether it's genuinely writing, not just running.
         "subscription": { "receiver_id": receiver_id, "active": entry.fault.lock().unwrap().is_none() }
@@ -209,7 +209,7 @@ pub fn sender_json(
 }
 
 pub fn receiver_json(
-    cfg: &Config,
+    _cfg: &Config,
     device_id: uuid::Uuid,
     entry: &InputGridEntry,
     receiver_id: uuid::Uuid,
@@ -225,7 +225,7 @@ pub fn receiver_json(
         "tags": {},
         "device_id": device_id.to_string(),
         "transport": TRANSPORT_TYPE,
-        "interface_bindings": [cfg.interface_name],
+        "interface_bindings": [],
         "format": "urn:x-nmos:format:audio",
         // Real AMWA BCP-004-01 Receiver Capabilities -- verified directly against the spec's own
         // published example (specs.amwa.tv/bcp-004-01/releases/v1.0.0/examples/receiver-audio.html),

@@ -83,17 +83,27 @@ impl FlowWriter {
         Ok(Self { instance, writer, channels, sample_rate, next_index: None })
     }
 
-    /// Writes one period of planar float32 samples, continuing this flow's own monotonic index
-    /// from wherever the previous call left off (seeded from MXL's own current-time-based index on
-    /// the first call).
+    /// Writes one period of planar float32 samples, stamped so the block ENDS now (TAI, via MXL's
+    /// current index): consecutive blocks continue seamlessly from the previous one, but when that
+    /// accumulated index drifts more than 5 ms from the real clock it snaps back to it. Before
+    /// (until 2026-09-25) the index was taken from the clock only on the first block and then
+    /// just accumulated: every period the engine skipped or ran late added up, and live the output
+    /// flows sat ~4.8 s behind TAI - invisible to head-following readers, but a clock-based reader
+    /// (anything reading "now minus a margin") found nothing. Same fix as mxl-bridge's writer.
     pub fn write_next(&mut self, planar: &[Vec<f32>]) -> anyhow::Result<()> {
         let count = planar.first().map(|c| c.len()).unwrap_or(0);
         if count == 0 {
             return Ok(());
         }
+        let target = self.instance.get_current_index(&self.sample_rate).saturating_sub(count as u64);
+        let tolerance = (self.sample_rate.numerator / 200).max(1) as u64; // 5 ms
         let index = match self.next_index {
-            Some(i) => i,
-            None => self.instance.get_current_index(&self.sample_rate),
+            Some(i) if i.abs_diff(target) <= tolerance => i,
+            Some(i) => {
+                tracing::warn!(accumulated_index = i, target, drift_samples = i.abs_diff(target), "MXL output index drifted from the real clock, snapping to it");
+                target
+            }
+            None => target,
         };
 
         let mut access =

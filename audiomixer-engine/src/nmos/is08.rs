@@ -377,7 +377,7 @@ mod tests {
         });
         mixer.input_grid.insert(test_input_entry("a", 2));
         mixer.input_grid.insert(test_input_entry("b", 1));
-        NmosState::new(test_config(), std::path::PathBuf::new(), mixer)
+        NmosState::new(test_config(), std::path::PathBuf::new(), mixer, "5f0a4c1e-9d3b-4c47-8f5e-2a7c61b0d3a9".into())
     }
 
     fn action(json: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {

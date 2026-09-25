@@ -7,6 +7,7 @@ mod flow;
 mod ids;
 mod layout;
 mod mixer;
+mod mxl_domain;
 mod nmos;
 mod patch;
 mod persistence;
@@ -461,7 +462,11 @@ async fn main() -> anyhow::Result<()> {
     // WebSocket protocol. Merged into the same HTTP server/port as the WebSocket endpoint below
     // (mxl-bridge's own precedent for merging its IS-08 layer into one Node API port, rather than
     // opening a second listener).
-    let nmos_state = Arc::new(nmos::NmosState::new(cfg.clone(), mxl_so.clone(), mixer.clone()));
+    // AMWA BCP-007-03: the MXL Domain's identity (IS-05 `mxl_domain_id`) from its domain_def.json.
+    let domain_dir = std::path::Path::new(&cfg.mxl_domain);
+    let domain_label = domain_dir.file_name().and_then(|n| n.to_str()).unwrap_or("mxl-domain").to_string();
+    let domain_id = mxl_domain::load_or_create(domain_dir, &domain_label)?.id.to_string();
+    let nmos_state = Arc::new(nmos::NmosState::new(cfg.clone(), mxl_so.clone(), mixer.clone(), domain_id));
     nmos::spawn_registration(nmos_state.clone());
     // Milestone 3 of the pickoff-point patch bay plan: auto-discovers other MXL apps' Senders into
     // the input grid on top of Config.input_grid's static list (nmos/discovery.rs).
