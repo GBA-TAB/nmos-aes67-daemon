@@ -18,6 +18,13 @@
 //!       (CLOCK_TAI ns - the clock MXL indices count), u32 RTP timestamp, u16 sequence, u16
 //!       payload length (little-endian), then the payload.
 //!
+//!   audiotest relay <iface> <from-group> <to-group> <count> <seconds>
+//!       re-sends, unchanged, the RTP this host transmits to <from-group> + i (i < count) to
+//!       <to-group> + i, with TTL 0 and multicast loopback: the packets never leave the host but
+//!       reach its own RAVENNA driver, which does not receive its own transmissions otherwise.
+//!       Loads the rx side with the tx streams' audio (RTP timestamps kept) for soak tests.
+//!       <seconds> 0 = until killed. Same privileges as capture.
+//!
 //! Logs go to stderr; stdout carries only the data.
 
 use std::io::Write;
@@ -63,7 +70,10 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         }
         Some("dump") if args.len() == 5 => dump(&args[1], &args[2], args[3].parse()?, args[4].parse()?),
         Some("capture") if args.len() == 5 => capture(&args[1], args[2].parse()?, args[3].parse()?, args[4].parse()?),
-        _ => anyhow::bail!("usage: audiotest gen <config> <flow> <channels> <seconds> <seed> | audiotest dump <config> <flow> <channels> <seconds>"),
+        Some("relay") if args.len() == 6 => relay(&args[1], args[2].parse()?, args[3].parse()?, args[4].parse()?, args[5].parse()?),
+        _ => anyhow::bail!(
+            "usage: audiotest gen <config> <flow> <channels> <seconds> <seed> [block] | dump <config> <flow> <channels> <seconds> | capture <iface> <group> <port> <seconds> | relay <iface> <from-group> <to-group> <count> <seconds>"
+        ),
     }
 }
 
@@ -144,7 +154,8 @@ fn tai_ns() -> u64 {
     t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
 }
 
-fn capture(iface: &str, group: std::net::Ipv4Addr, port: u16, seconds: f64) -> anyhow::Result<()> {
+/// An AF_PACKET socket bound to `iface` with a 32 MB receive buffer and a 200 ms timeout.
+fn packet_socket(iface: &str) -> anyhow::Result<(i32, u32)> {
     const ETH_P_ALL: u16 = 0x0003;
     let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, (ETH_P_ALL).to_be() as i32) };
     anyhow::ensure!(fd >= 0, "AF_PACKET socket: {} (needs CAP_NET_RAW)", std::io::Error::last_os_error());
@@ -167,6 +178,37 @@ fn capture(iface: &str, group: std::net::Ipv4Addr, port: u16, seconds: f64) -> a
     }
     let tv = libc::timeval { tv_sec: 0, tv_usec: 200_000 };
     unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, &tv as *const _ as *const libc::c_void, std::mem::size_of::<libc::timeval>() as u32) };
+    Ok((fd, ifindex))
+}
+
+/// Ethernet (optionally one 802.1Q tag) / IPv4 / UDP: (destination address, destination port, UDP
+/// payload range in the frame).
+fn udp_of(f: &[u8]) -> Option<([u8; 4], u16, std::ops::Range<usize>)> {
+    let mut off = 14;
+    if f.len() < off + 20 {
+        return None;
+    }
+    let mut ethertype = u16::from_be_bytes([f[12], f[13]]);
+    if ethertype == 0x8100 {
+        ethertype = u16::from_be_bytes([f[16], f[17]]);
+        off = 18;
+    }
+    if ethertype != 0x0800 || f.len() < off + 20 || f[off + 9] != 17 {
+        return None;
+    }
+    let udp = off + ((f[off] & 0x0f) as usize) * 4;
+    if f.len() < udp + 8 {
+        return None;
+    }
+    let end = udp + u16::from_be_bytes([f[udp + 4], f[udp + 5]]) as usize;
+    if end > f.len() || end < udp + 8 {
+        return None;
+    }
+    Some(([f[off + 16], f[off + 17], f[off + 18], f[off + 19]], u16::from_be_bytes([f[udp + 2], f[udp + 3]]), udp + 8..end))
+}
+
+fn capture(iface: &str, group: std::net::Ipv4Addr, port: u16, seconds: f64) -> anyhow::Result<()> {
+    let (fd, ifindex) = packet_socket(iface)?;
 
     // Join the group like a real receiver: with IGMP snooping the switch only forwards a group to
     // ports that asked for it (a stream this host transmits is seen regardless).
@@ -259,6 +301,50 @@ fn capture(iface: &str, group: std::net::Ipv4Addr, port: u16, seconds: f64) -> a
         }
     }
     eprintln!("capture: {packets} RTP packets for {group}:{port} on {iface}; capture_drops={}", st.tp_drops);
+    Ok(())
+}
+
+fn relay(iface: &str, from: std::net::Ipv4Addr, to: std::net::Ipv4Addr, count: u32, seconds: f64) -> anyhow::Result<()> {
+    let (fd, ifindex) = packet_socket(iface)?;
+    let tx = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    tx.set_multicast_ttl_v4(0)?;
+    tx.set_multicast_loop_v4(true)?;
+    let mreq = libc::ip_mreqn { imr_multiaddr: libc::in_addr { s_addr: 0 }, imr_address: libc::in_addr { s_addr: 0 }, imr_ifindex: ifindex as i32 };
+    let rc = unsafe {
+        use std::os::fd::AsRawFd;
+        libc::setsockopt(tx.as_raw_fd(), libc::IPPROTO_IP, libc::IP_MULTICAST_IF, &mreq as *const _ as *const libc::c_void, std::mem::size_of::<libc::ip_mreqn>() as u32)
+    };
+    anyhow::ensure!(rc == 0, "IP_MULTICAST_IF {iface}: {}", std::io::Error::last_os_error());
+    let (base, dest) = (u32::from(from), u32::from(to));
+    let deadline = (seconds > 0.0).then(|| std::time::Instant::now() + Duration::from_secs_f64(seconds));
+    let mut counts = vec![0u64; count as usize];
+    let mut errors = 0u64;
+    let mut last_report = std::time::Instant::now();
+    let mut buf = vec![0u8; 9000];
+    eprintln!("relay: {from}+0..{count} -> {to}+0..{count} on {iface} (TTL 0, loopback)");
+    while deadline.map_or(true, |d| std::time::Instant::now() < d) {
+        let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_ll>() as u32;
+        let n = unsafe { libc::recvfrom(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0, &mut sll as *mut _ as *mut libc::sockaddr, &mut len) };
+        if n > 0 && sll.sll_pkttype == libc::PACKET_OUTGOING as u8 {
+            if let Some((dst, port, payload)) = udp_of(&buf[..n as usize]) {
+                let i = u32::from_be_bytes(dst).wrapping_sub(base);
+                if i < count {
+                    let target = std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(dest + i), port);
+                    match tx.send_to(&buf[payload], target) {
+                        Ok(_) => counts[i as usize] += 1,
+                        Err(_) => errors += 1,
+                    }
+                }
+            }
+        }
+        if last_report.elapsed() >= Duration::from_secs(60) {
+            eprintln!("relay: packets per stream {counts:?}, send errors {errors}");
+            last_report = std::time::Instant::now();
+        }
+    }
+    unsafe { libc::close(fd) };
+    eprintln!("relay: done, packets per stream {counts:?}, send errors {errors}");
     Ok(())
 }
 

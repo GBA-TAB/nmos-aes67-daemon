@@ -30,8 +30,15 @@ fn open_capture(cfg: &Config, channels: u32) -> anyhow::Result<PCM> {
             );
         }
         hwp.set_period_size_near(cfg.period_frames as i64, ValueOr::Nearest)?;
-        hwp.set_buffer_size_near(cfg.period_frames as i64 * 4)?;
+        hwp.set_buffer_size_near(cfg.period_frames as i64 * cfg.rx_buffer_periods.max(2) as i64)?;
         pcm.hw_params(&hwp)?;
+        let (period, buffer) = (hwp.get_period_size()?, hwp.get_buffer_size()?);
+        tracing::info!(period, buffer, "capture: ALSA period and buffer (frames); the buffer is the driver's receive jitter buffer");
+        if let Some(delay) = cfg.capacity.as_ref().map(|c| c.rx.delay.unwrap_or(crate::provision::DEFAULT_RX_DELAY)) {
+            if delay as i64 + period >= buffer {
+                tracing::warn!(delay, buffer, "capture buffer not longer than the Sinks' playout delay + one period: the driver wraps the delay modulo the buffer and late packets play old audio - raise rx_buffer_periods");
+            }
+        }
     }
     pcm.prepare()?;
     Ok(pcm)

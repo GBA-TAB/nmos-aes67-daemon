@@ -25,6 +25,9 @@ use crate::daemon_client::{DaemonSink, DaemonSource};
 /// The daemon's own ceiling on stream ids (SessionManager::stream_id_max + 1).
 pub const MAX_STREAMS: usize = 64;
 
+/// Default daemon playout delay for rx Sinks, in samples (12 ms at 48 kHz).
+pub const DEFAULT_RX_DELAY: u32 = 576;
+
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(untagged)]
 pub enum ChannelSpec {
@@ -199,7 +202,7 @@ pub fn plan(cap: &Capacity, sources: &[DaemonSource], sinks: &[DaemonSink]) -> a
     let rx_maps = channel_maps(&stream_sizes(&cap.rx)?, cap.alsa_channels)?;
     let base = cap.tx.multicast_base.as_deref().ok_or_else(|| anyhow::anyhow!("tx.multicast_base is required"))?;
     let group = cap.rx.parking_group.as_deref().ok_or_else(|| anyhow::anyhow!("rx.parking_group is required"))?;
-    let delay = cap.rx.delay.unwrap_or(576);
+    let delay = cap.rx.delay.unwrap_or(DEFAULT_RX_DELAY);
     let mut actions = Vec::new();
 
     for (i, map) in tx_maps.into_iter().enumerate() {

@@ -13,6 +13,17 @@ fn default_tx_buffer_periods() -> u32 {
     4
 }
 
+// The RAVENNA driver's receive jitter buffer *is* the ALSA capture buffer: each Sink writes a packet
+// at (RTP time + playout delay) modulo the capture buffer size, and every tick copies the slot at
+// "now". A buffer no longer than the playout delay aliases it away (576 mod 192 = 0: the daemon's
+// 12 ms delay became none), so a packet arriving a little late lands one buffer lap off and
+// periods of old audio are read (rx soak, 2026-09-26: 30-60 % of frames one 192-frame lap old).
+// 32 x 1 ms leaves room for the 12 ms delay plus jitter. It costs no latency: capture is read
+// every period regardless of the buffer size.
+fn default_rx_buffer_periods() -> u32 {
+    32
+}
+
 fn default_tx_mxl_delay_ms() -> f64 {
     3.0
 }
@@ -38,6 +49,10 @@ pub struct Config {
     /// is added to the tx latency as is.
     #[serde(default = "default_tx_buffer_periods")]
     pub tx_buffer_periods: u32,
+    /// Capture buffer depth in periods, which is also the driver's receive jitter buffer: must be
+    /// comfortably longer than the daemon Sinks' playout delay (see the note at the defaults).
+    #[serde(default = "default_rx_buffer_periods")]
+    pub rx_buffer_periods: u32,
     /// Starting read delay behind "now" (TAI) for each Source. It grows by itself (1 ms per read
     /// that lands before the data exists, up to 50 ms) until it fits that Source's writer, so fast
     /// writers keep a low latency and bursty ones (10 ms blocks) get what they need.

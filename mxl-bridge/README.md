@@ -165,12 +165,20 @@ mirrors whatever streams the daemon has. The lab layout, 128 channels each way (
 | `period_frames` | - | capture (2110 -> MXL) ALSA period and MXL commit size. **48** (1 ms) in the lab |
 | `tx_period_frames` | 48 | playback (MXL -> 2110) ALSA period |
 | `tx_buffer_periods` | 4 | playback buffer depth; kept full, so added to tx latency as is (4 ms) |
+| `rx_buffer_periods` | 32 | capture buffer depth - **also the driver's receive jitter buffer**, must be longer than the Sinks' playout delay (below) |
 | `tx_mxl_delay_ms` | 3 | starting read delay behind now (TAI) for each MXL Source; self-tuning, see below |
 | `rt_priority` | 70 | SCHED_FIFO priority of the capture/playback threads; 0 = normal scheduling |
 
 - **Self-tuning tx read delay.** Each Source is read `delay` behind now; a read that lands before the
   writer has committed adds 1 ms (up to 50 ms). A 1 ms writer settles at the base, a 10 ms-block writer
   at about 10 ms more. A writer that falls far behind is read at its head minus the delay instead.
+- **The capture buffer is the driver's jitter buffer.** The RAVENNA driver sizes its receive buffer
+  to the ALSA capture buffer and writes each packet at (RTP time + playout delay) modulo that size.
+  With the old fixed 4 x 48 = 192 frames the 576-sample delay wrapped to nothing, and packets
+  arriving a little late played audio one 192-frame lap old (30-60 % of frames in the soak's
+  round trip; a Mac sender happened to arrive early enough). `rx_buffer_periods` 32 (1536 frames)
+  fixes it at no latency cost - capture is still read every period. The bridge logs the granted
+  size and warns if the capacity `rx.delay` doesn't fit.
 - **Not every playback period x buffer combination is bit-exact through the RAVENNA driver**: 96 x 3
   played stale audio (repeated old periods). 48 x 4 is verified; re-run the tx audiotest after changing
   either.
@@ -211,6 +219,19 @@ python3 contract/audiotest.py rx --stream 0 --seconds 4
 python3 contract/nmos_control.py --tx 4 --rx 4 --rx-sender <NMOS sender id> [--skip-restart]
 ```
 
+```bash
+# soak: all 16 tx + 16 rx under load until a time, bit-exact probes every 150 s, samples every 60 s
+python3 contract/soak.py --until 08:30 [--out ~/soak-<date>]
+```
+
+`soak.py` feeds tx from two pattern writers (10 ms and 1 ms blocks) and rx from `audiotest relay`,
+which re-sends the host's own tx RTP with TTL 0 and multicast loopback: the RAVENNA driver does not
+receive its own transmissions, but it does receive these, so rx n carries tx n's audio without any
+other device and without extra network traffic. The rx probe then checks the full round trip
+(pattern -> MXL -> bridge tx -> driver -> relay -> driver -> bridge rx -> MXL) bit for bit. It
+re-establishes writers, relay and routes after restarts and restores everything it changed on exit.
+Output: `soak.log`, `soak.jsonl`, `summary.json`.
+
 `nmos_control.py` checks: tx-connect (Test Tones -> 1 kHz on the wire), tx-reroute (tone gone),
 tx-survives-restart (bridge restart via the orchestrator), tx-disconnect (silence, stream keeps
 running), rx-connect (Sink gets the sender's SDP and receives), rx-audio (bit-exact wire vs MXL; a
@@ -226,10 +247,9 @@ MXL index of the same sample (tx), or against when that index became readable in
 ### Open (not yet verified)
 
 - rx content over an NMOS connection: the control matrix's only transmitting 2110 audio sender in the
-  lab was silent, so rx bit-exactness is verified only with a direct (non-NMOS) RAVENNA stream from a
-  Mac.
+  lab was silent; rx bit-exactness is verified with a Mac RAVENNA stream and the soak's relay.
 - IS-08 channel mapping on the bridge's packed 8-channel flows.
-- Sustained load: all 32 streams active at once for hours, with CPU/xrun statistics.
+- Sustained load: `soak.py` (first overnight run 2026-09-26).
 - Cross-host MXL (Fabrics/RDMA).
 
 ## Building
