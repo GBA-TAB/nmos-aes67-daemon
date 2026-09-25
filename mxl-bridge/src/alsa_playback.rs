@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
@@ -12,6 +13,17 @@ use crate::nmos::NmosState;
 /// full scale, ALSA S32_LE wants the full 32-bit integer range, left-justified (same convention
 /// regardless of the true AES67 network bit depth this ends up transmitted at).
 const S32_FULL_SCALE: f32 = 2147483648.0; // 2^31
+
+/// After a Source's read fails (its flow is gone or stalled - e.g. the sending app restarting),
+/// it is skipped (silence in its channels) this long before the next attempt. Blocking on it every
+/// period instead made each period late, so playback underran and restarted ~50 times a second -
+/// and a stream closed during that churn hit a use-after-free in the RAVENNA driver (host crash).
+const FAILED_SOURCE_BACKOFF: Duration = Duration::from_millis(500);
+/// Periods of silence written after an underrun recovery, so one late period does not underrun
+/// again right away.
+const RECOVERY_PREFILL_PERIODS: usize = 2;
+/// Underrun/recovery warnings are summarised at most this often.
+const RECOVERY_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 fn open_playback(cfg: &Config, channels: u32) -> anyhow::Result<PCM> {
     let device = cfg.tx_alsa_playback_device.as_deref().unwrap_or(&cfg.alsa_source_device);
@@ -74,16 +86,31 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
         "starting wide ALSA playback <- per-Source MXL flow bridge"
     );
 
+    let silence = vec![0i32; period * channels as usize];
+    let mut retry_at: HashMap<u8, Instant> = HashMap::new();
+    let mut packed_retry_at: HashMap<String, Instant> = HashMap::new();
+    let mut recoveries = 0u32;
+    let mut last_recovery_log = Instant::now();
+
     loop {
         interleaved.fill(0);
 
         let mut sources = state.sources.blocking_lock();
         for entry in sources.values_mut() {
             let Some(reader) = entry.reader.as_mut() else { continue };
+            if retry_at.get(&entry.daemon_id).is_some_and(|t| Instant::now() < *t) {
+                continue; // backing off a failed Source: silence, and no blocking read this period
+            }
             let planar = match reader.read_next(period, read_timeout) {
-                Ok(p) => p,
+                Ok(p) => {
+                    retry_at.remove(&entry.daemon_id);
+                    p
+                }
                 Err(e) => {
-                    tracing::warn!(daemon_id = entry.daemon_id, error = %e, "read failed, resyncing to flow head");
+                    if !retry_at.contains_key(&entry.daemon_id) {
+                        tracing::warn!(daemon_id = entry.daemon_id, error = %e, "read failed, silencing this Source and retrying every {FAILED_SOURCE_BACKOFF:?}");
+                    }
+                    retry_at.insert(entry.daemon_id, Instant::now() + FAILED_SOURCE_BACKOFF);
                     if let Err(e) = reader.resync_to_head() {
                         tracing::error!(daemon_id = entry.daemon_id, error = %e, "failed to resync to flow head");
                     }
@@ -116,10 +143,19 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
         // deliberate routing action wins.
         let routing = state.is08.routing_snapshot();
         for (name, table) in &routing.scatter {
+            if packed_retry_at.get(name).is_some_and(|t| Instant::now() < *t) {
+                continue; // same back-off as a failed Source above
+            }
             let planar = match state.is08.read_packed_tx(name, period, read_timeout) {
-                Some(Ok(p)) => p,
+                Some(Ok(p)) => {
+                    packed_retry_at.remove(name);
+                    p
+                }
                 Some(Err(e)) => {
-                    tracing::warn!(flow_name = name, error = %e, "read failed, resyncing to flow head");
+                    if !packed_retry_at.contains_key(name) {
+                        tracing::warn!(flow_name = name, error = %e, "read failed, silencing this flow and retrying every {FAILED_SOURCE_BACKOFF:?}");
+                    }
+                    packed_retry_at.insert(name.clone(), Instant::now() + FAILED_SOURCE_BACKOFF);
                     state.is08.resync_packed_tx(name);
                     continue;
                 }
@@ -147,10 +183,20 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
             match io.writei(remaining) {
                 Ok(written) => remaining = &remaining[written * channels as usize..],
                 Err(e) => {
-                    tracing::warn!(error = %e, "ALSA write error, attempting recovery");
+                    recoveries += 1;
+                    if recoveries == 1 || last_recovery_log.elapsed() >= RECOVERY_LOG_INTERVAL {
+                        tracing::warn!(error = %e, recoveries, "ALSA write error, recovering (count since last report)");
+                        recoveries = 0;
+                        last_recovery_log = Instant::now();
+                    }
                     if let Err(e) = pcm.try_recover(e, true) {
                         tracing::error!(error = %e, "ALSA recover failed");
                         break;
+                    }
+                    // Rebuild headroom before the real data, so the next late period does not
+                    // underrun immediately (start threshold is one period).
+                    for _ in 0..RECOVERY_PREFILL_PERIODS {
+                        let _ = io.writei(&silence);
                     }
                 }
             }
