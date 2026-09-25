@@ -188,9 +188,9 @@ impl Is08State {
     /// isn't (e.g. torn down since the routing snapshot the caller is iterating was taken; harmless,
     /// self-heals next period). Called from alsa_capture.rs's plain OS thread, hence `blocking_lock`
     /// (see nmos/state.rs's `SinkEntry` docs for why that's the correct tool here, not a hack).
-    pub fn write_packed_rx(&self, name: &str, planar: &[Vec<f32>]) -> Option<anyhow::Result<()>> {
+    pub fn write_packed_rx(&self, name: &str, planar: &[Vec<f32>], pending_frames: u64) -> Option<anyhow::Result<()>> {
         let mut flows = self.packed_rx_flows.blocking_lock();
-        flows.get_mut(name).map(|f| f.write_next(planar))
+        flows.get_mut(name).map(|f| f.write_next(planar, pending_frames))
     }
 
     /// Reads one period from the named packed-tx flow, if it's currently open — same "None is

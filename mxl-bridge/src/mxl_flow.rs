@@ -176,12 +176,18 @@ impl MxlAudioFlow {
     /// latency): the local ALSA device's own hardware clock isn't guaranteed to run at exactly the
     /// same rate as whatever real/PTP clock `get_current_index` is really derived from, and pure
     /// accumulation never re-verifies that assumption.
-    pub fn write_next(&mut self, planar: &[Vec<f32>]) -> anyhow::Result<()> {
+    ///
+    /// `pending_frames`: frames still waiting in the ALSA capture buffer right after this block
+    /// was read - i.e. how much newer than this block's last sample "now" is. The block is stamped
+    /// so it ENDS there (`capture_start_index`): it was captured in the past, not starting now.
+    /// Stamping its first sample with the current index (as before 2026-09-25) labelled every block
+    /// up to one period in the future (measured: flow latency -0.1..-7.4 ms against TAI).
+    pub fn write_next(&mut self, planar: &[Vec<f32>], pending_frames: u64) -> anyhow::Result<()> {
         let count = planar.first().map(|c| c.len()).unwrap_or(0);
         if count == 0 {
             return Ok(());
         }
-        let real_index = self.instance.get_current_index(&self.sample_rate);
+        let real_index = capture_start_index(self.instance.get_current_index(&self.sample_rate), pending_frames, count);
         let index = match self.next_index {
             Some(i) if i.abs_diff(real_index) <= drift_tolerance_samples(&self.sample_rate) => i,
             Some(i) => {
@@ -219,6 +225,12 @@ impl MxlAudioFlow {
         self.next_index = Some(index + count as u64);
         Ok(())
     }
+}
+
+/// Index of the FIRST sample of a just-read capture block of `count` frames, given the current
+/// index (`now`) and the frames still pending in the capture buffer (newer than the block).
+pub fn capture_start_index(now: u64, pending_frames: u64, count: usize) -> u64 {
+    now.saturating_sub(pending_frames + count as u64)
 }
 
 /// Reinterprets an f32 slice as raw little-endian bytes (matches MXL's `audio/float32` on-disk
@@ -349,5 +361,21 @@ impl MxlAudioFlowSource {
             planar.push(samples);
         }
         Ok(planar)
+    }
+}
+
+#[cfg(test)]
+mod capture_index_tests {
+    use super::capture_start_index;
+
+    #[test]
+    fn a_block_ends_where_the_pending_frames_begin() {
+        // 480 frames just read, 96 more already waiting: the block covers now-576 .. now-97.
+        let start = capture_start_index(1_000_000, 96, 480);
+        assert_eq!(start, 1_000_000 - 576);
+        assert_eq!(start + 480 - 1, 1_000_000 - 96 - 1, "last sample is just before the pending ones");
+        // Nothing pending: the last sample is the one just before now - never in the future.
+        assert_eq!(capture_start_index(1_000_000, 0, 480) + 480, 1_000_000);
+        assert_eq!(capture_start_index(100, 96, 480), 0, "saturates at the epoch");
     }
 }

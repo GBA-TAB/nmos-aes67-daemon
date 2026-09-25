@@ -86,6 +86,10 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
         if frames_read == 0 {
             continue;
         }
+        // Frames captured after this block and not yet read: how far "now" is past the block's
+        // last sample (see MxlAudioFlow::write_next). Unknown (error) = 0, the old behaviour's
+        // most recent possible assumption.
+        let pending = pcm.avail_update().map(|a| a.max(0) as u64).unwrap_or(0);
         let frame_window = &interleaved[..frames_read * channels as usize];
 
         // Reads one raw ALSA channel's worth of samples out of this period's capture window,
@@ -115,7 +119,7 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
             for (ch_idx, &alsa_ch) in entry.map.iter().enumerate() {
                 read_channel(alsa_ch as usize, &mut planar_scratch[ch_idx]);
             }
-            match flow.write_next(&planar_scratch[..n]) {
+            match flow.write_next(&planar_scratch[..n], pending) {
                 Ok(()) => state.clear_sink_fault(entry),
                 Err(e) => {
                     tracing::error!(daemon_id = entry.daemon_id, error = %e, "failed to write samples into MXL flow");
@@ -144,7 +148,7 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
                     }
                 }
             }
-            if let Some(Err(e)) = state.is08.write_packed_rx(name, &planar_scratch[..n]) {
+            if let Some(Err(e)) = state.is08.write_packed_rx(name, &planar_scratch[..n], pending) {
                 tracing::error!(flow_name = name, error = %e, "failed to write samples into packed-rx MXL flow");
             }
         }
