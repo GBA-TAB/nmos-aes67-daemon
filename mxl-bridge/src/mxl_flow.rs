@@ -203,6 +203,21 @@ impl MxlAudioFlow {
         };
 
         tracing::debug!(index, count, "write_next");
+        self.write_at(index, planar)
+    }
+
+    /// The flow's current (TAI-derived) sample index.
+    pub fn current_index(&self) -> u64 {
+        self.instance.get_current_index(&self.sample_rate)
+    }
+
+    /// Writes `planar` so its first sample lands exactly at `index` (the test generator needs to
+    /// know the index of every sample; `write_next` chooses its own).
+    pub fn write_at(&mut self, index: u64, planar: &[Vec<f32>]) -> anyhow::Result<()> {
+        let count = planar.first().map(|c| c.len()).unwrap_or(0);
+        if count == 0 {
+            return Ok(());
+        }
         let mut access = self
             .writer
             .open_samples(index + count as u64 - 1, count)
@@ -333,7 +348,9 @@ impl MxlAudioFlowSource {
 
     /// Blocking read of `count` samples ending at `index` (same end-of-batch indexing convention as
     /// write_next). Returns owned planar float32 data, one Vec<f32> per channel.
-    fn read_samples_at(
+    /// Reads the `count` samples ENDING at `end_index` (MXL's reader index names the last sample
+    /// of the range: the result covers `end_index - count + 1 ..= end_index`).
+    pub fn read_samples_at(
         &self,
         index: u64,
         count: usize,

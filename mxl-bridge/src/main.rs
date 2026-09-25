@@ -1,4 +1,5 @@
 mod alsa_capture;
+mod audiotest;
 mod provision;
 mod rt;
 mod alsa_playback;
@@ -19,7 +20,7 @@ use config::Config;
 /// fingerprinted hash isn't otherwise exposed to us (mxl-sys's build script doesn't re-export it via
 /// cargo metadata), so we find it at runtime by searching relative to our own executable path
 /// (robust regardless of CWD or debug/release profile) rather than hardcoding a path.
-fn find_mxl_so() -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn find_mxl_so() -> anyhow::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let build_dir = exe
         .parent()
@@ -44,6 +45,11 @@ fn find_mxl_so() -> anyhow::Result<std::path::PathBuf> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Test tooling (contract/audiotest.py), not the bridge: no tracing on stdout, no server.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("audiotest") {
+        return tokio::task::spawn_blocking(move || audiotest::run(&args[2..])).await?;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
