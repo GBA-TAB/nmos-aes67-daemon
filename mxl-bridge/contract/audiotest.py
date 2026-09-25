@@ -203,32 +203,54 @@ def test_rx(n, seconds, binary):
 
 
 def analyse_rx(n, group, pk, first_index, mframes, channels):
+    """Align by content: find the MXL audio in the captured RTP (clock epochs may differ), then
+    compare every sample and time MXL indices against TAI arrival times."""
     res = {"stream": f"rx {n}", "group": group, "packets": len(pk), "lost": seq_gaps(pk), "capture_drops": capture.drops, "mxl_frames": len(mframes)}
-    wire = {}
-    for ts, _, p, _ in pk:
+    wire, arrival, where = {}, {}, {}
+    for ts, _, p, tai in pk:
         for k, f in enumerate(l24(p, channels)):
-            wire[near64(first_index, ts + k)] = f
-    if not wire or not any(any(f) for f in wire.values()):
+            rtp = (ts + k) & 0xFFFFFFFF
+            wire[rtp] = f
+            arrival[rtp] = (tai, k)
+            if any(f):
+                where.setdefault(tuple(f), []).append(rtp)
+    if not where:
         res["verdict"] = "FAIL: sender is silent (play noise or music on it)"
         return res
-    # Offset L = MXL index - RTP time; find it on a stretch of non-silent MXL audio.
-    probe = next((k for k in range(len(mframes) - 64) if all(any(mframes[k + j]) for j in range(64))), None)
-    if probe is None:
+    # Probe spread over the dump: its start precedes the capture (container start-up), so the first
+    # non-silent MXL frames are usually not on the wire at all.
+    run = 64
+    probes = [k for k in range(0, len(mframes) - run, 499) if all(any(mframes[k + j]) for j in range(run))]
+    if not probes:
         res["verdict"] = "FAIL: MXL flow is silent - is the stream connected?"
         return res
-    target = mframes[probe:probe + 64]
-    idx = first_index + probe
-    lat = next((L for L in range(0, 2 * RATE) if all(wire.get(idx - L + j) == target[j] for j in range(64))), None)
-    if lat is None:
+    probe = rtp_p = None
+    for k in probes:
+        rtp_p = next((r for r in where.get(tuple(mframes[k]), [])
+                      if all(wire.get((r + j) & 0xFFFFFFFF) == mframes[k + j] for j in range(run))), None)
+        if rtp_p is not None:
+            probe = k
+            break
+    if rtp_p is None:
         res["verdict"] = "FAIL: MXL content not found on the wire (not bit-exact, or different stream)"
         return res
+    offset = (rtp_p - (first_index + probe)) & 0xFFFFFFFF      # RTP time - MXL index
     compared = bad = 0
+    lat = []
     for k, f in enumerate(mframes):
-        w = wire.get(first_index + k - lat)
-        if w is not None:
-            compared += 1
-            bad += w != f
-    res.update(latency_samples=lat, latency_ms=round(lat / RATE * 1000, 3), compared=compared, mismatched=bad)
+        rtp = (first_index + k + offset) & 0xFFFFFFFF
+        w = wire.get(rtp)
+        if w is None:
+            continue
+        compared += 1
+        bad += w != f
+        tai, pos = arrival[rtp]
+        if pos == 47 and k % 97 == 0:          # last sample of its packet: arrived at `tai`
+            lat.append((first_index + k) / RATE - tai / 1e9)
+    lat.sort()
+    res.update(compared=compared, mismatched=bad, rtp_minus_mxl_samples=offset if offset < 1 << 31 else offset - (1 << 32))
+    if lat:
+        res.update(latency_ms_min=round(lat[0] * 1000, 3), latency_ms_median=round(lat[len(lat) // 2] * 1000, 3), latency_ms_max=round(lat[-1] * 1000, 3))
     res["verdict"] = verdict(bad == 0 and compared > RATE, res["lost"], res["capture_drops"])
     return res
 
