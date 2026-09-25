@@ -1,14 +1,15 @@
 //! `mxl-bridge audiotest ...` - the MXL side of the end-to-end audio test (contract/audiotest.py
 //! drives it and does the wire side and the comparison).
 //!
-//!   audiotest gen  <config.json> <flow-uuid> <channels> <seconds> <seed>
+//!   audiotest gen  <config.json> <flow-uuid> <channels> <seconds> <seed> [block-frames]
 //!       creates <flow-uuid> and writes a deterministic noise pattern into it: every sample is
 //!       `pattern(seed, channel, mxl_index)`, so anything seen downstream can be checked on its own
 //!       and its MXL time is known exactly. Prints one JSON line when writing starts.
 //!   audiotest dump <config.json> <flow-uuid> <channels> <seconds>
 //!       reads an existing flow and writes to stdout one JSON header line
 //!       {"first_index", "channels", "frames"} followed by frames x channels little-endian i32
-//!       (sample * 2^23, exact for 24-bit audio carried as float32).
+//!       (sample * 2^23, exact for 24-bit audio carried as float32), then a newline and a JSON
+//!       trailer {"heads": [[tai_ns, head_index], ...]}: when each sample became readable.
 //!
 //!   audiotest capture <iface> <group> <port> <seconds>
 //!       records the RTP packets sent to <group>:<port> as seen on <iface> - both what this host
@@ -56,14 +57,17 @@ fn mxl_so(cfg: &Config) -> anyhow::Result<std::path::PathBuf> {
 
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
-        Some("gen") if args.len() == 6 => generate(&args[1], &args[2], args[3].parse()?, args[4].parse()?, args[5].parse()?),
+        Some("gen") if args.len() == 6 || args.len() == 7 => {
+            let block = args.get(6).map(|b| b.parse()).transpose()?.unwrap_or(BLOCK);
+            generate(&args[1], &args[2], args[3].parse()?, args[4].parse()?, args[5].parse()?, block)
+        }
         Some("dump") if args.len() == 5 => dump(&args[1], &args[2], args[3].parse()?, args[4].parse()?),
         Some("capture") if args.len() == 5 => capture(&args[1], args[2].parse()?, args[3].parse()?, args[4].parse()?),
         _ => anyhow::bail!("usage: audiotest gen <config> <flow> <channels> <seconds> <seed> | audiotest dump <config> <flow> <channels> <seconds>"),
     }
 }
 
-fn generate(config: &str, flow: &str, channels: u32, seconds: f64, seed: u64) -> anyhow::Result<()> {
+fn generate(config: &str, flow: &str, channels: u32, seconds: f64, seed: u64, block: usize) -> anyhow::Result<()> {
     let cfg = Config::load(config)?;
     let flow_id: uuid::Uuid = flow.parse()?;
     let mut w = MxlAudioFlow::create(
@@ -76,18 +80,18 @@ fn generate(config: &str, flow: &str, channels: u32, seconds: f64, seed: u64) ->
         channels,
     )?;
     // Start one block behind "now", like a capture would, then keep pace with the clock.
-    let mut next = w.current_index().saturating_sub(BLOCK as u64);
+    let mut next = w.current_index().saturating_sub(block as u64);
     let end = next + (seconds * cfg.sample_rate as f64) as u64;
     println!("{}", serde_json::json!({ "event": "writing", "flow": flow, "first_index": next, "seed": seed, "channels": channels }));
     std::io::stdout().flush()?;
     while next < end {
-        while next + BLOCK as u64 <= w.current_index() && next < end {
+        while next + block as u64 <= w.current_index() && next < end {
             let planar: Vec<Vec<f32>> =
-                (0..channels).map(|ch| (0..BLOCK as u64).map(|k| to_f32(pattern(seed, ch, next + k))).collect()).collect();
+                (0..channels).map(|ch| (0..block as u64).map(|k| to_f32(pattern(seed, ch, next + k))).collect()).collect();
             w.write_at(next, &planar)?;
-            next += BLOCK as u64;
+            next += block as u64;
         }
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_micros(500));
     }
     Ok(())
 }
@@ -101,10 +105,21 @@ fn dump(config: &str, flow: &str, channels: usize, seconds: f64) -> anyhow::Resu
     let first_index = end + 1 - BLOCK as u64;
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     writeln!(out, "{}", serde_json::json!({ "first_index": first_index, "channels": channels, "frames": frames }))?;
+    // (TAI ns, head) whenever the head moves: when each sample became readable.
+    let mut heads: Vec<(u64, u64)> = Vec::new();
+    let mut last_head = 0;
     let mut done = 0;
     while done < frames {
-        while r.head_index()? < end {
-            std::thread::sleep(Duration::from_millis(2));
+        loop {
+            let h = r.head_index()?;
+            if h != last_head {
+                heads.push((tai_ns(), h));
+                last_head = h;
+            }
+            if h >= end {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(200));
         }
         let planar = r.read_samples_at(end, BLOCK, Duration::from_millis(200))?;
         for k in 0..BLOCK {
@@ -116,6 +131,9 @@ fn dump(config: &str, flow: &str, channels: usize, seconds: f64) -> anyhow::Resu
         end += BLOCK as u64;
         done += BLOCK;
     }
+    // Trailer after the samples: the head trace.
+    writeln!(out)?;
+    writeln!(out, "{}", serde_json::json!({ "heads": heads }))?;
     out.flush()?;
     Ok(())
 }

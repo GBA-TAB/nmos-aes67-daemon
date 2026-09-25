@@ -14,7 +14,7 @@ fn default_tx_buffer_periods() -> u32 {
 }
 
 fn default_tx_mxl_delay_ms() -> f64 {
-    12.0
+    3.0
 }
 
 fn default_rt_priority() -> u8 {
@@ -38,8 +38,9 @@ pub struct Config {
     /// is added to the tx latency as is.
     #[serde(default = "default_tx_buffer_periods")]
     pub tx_buffer_periods: u32,
-    /// How far behind "now" (TAI) each Source is read: must exceed the MXL writers' block size
-    /// (10 ms in this stack) plus jitter, or reads land before the data exists.
+    /// Starting read delay behind "now" (TAI) for each Source. It grows by itself (1 ms per read
+    /// that lands before the data exists, up to 50 ms) until it fits that Source's writer, so fast
+    /// writers keep a low latency and bursty ones (10 ms blocks) get what they need.
     #[serde(default = "default_tx_mxl_delay_ms")]
     pub tx_mxl_delay_ms: f64,
     /// SCHED_FIFO priority of the capture and playback threads (`rt.rs`); 0 = normal scheduling.

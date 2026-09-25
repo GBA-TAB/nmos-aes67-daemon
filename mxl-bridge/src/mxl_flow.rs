@@ -342,6 +342,11 @@ impl MxlAudioFlowSource {
         Ok(planar)
     }
 
+    /// Forgets the read position: the next `read_aligned` starts at its target again.
+    pub fn realign(&mut self) {
+        self.next_index = None;
+    }
+
     pub fn resync_to_head(&mut self) -> anyhow::Result<()> {
         self.next_index = Some(self.head_index()?);
         Ok(())

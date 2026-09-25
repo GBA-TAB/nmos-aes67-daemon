@@ -23,7 +23,7 @@ usage:
 env: BRIDGE_POD (mxl-bridge-1-0), BRIDGE_NODE (http://172.30.3.214:3213), DAEMON (http://localhost:8080),
      IFACE (enp4s0), BRIDGE_BIN (host-built mxl-bridge to copy into the pod; default: the pod's own)
 """
-import argparse, json, os, struct, subprocess, sys, tempfile, time, urllib.request, uuid
+import argparse, bisect, json, os, struct, subprocess, sys, tempfile, time, urllib.request, uuid
 
 POD = os.environ.get("BRIDGE_POD", "mxl-bridge-1-0")
 NS = os.environ.get("NAMESPACE", "mxl-orchestrator")
@@ -33,6 +33,9 @@ IFACE = os.environ.get("IFACE", "enp4s0")
 HOST_BIN = os.environ.get("BRIDGE_BIN", os.path.expanduser("~/DEV/nmos/aes67-linux-daemon/mxl-bridge/target/release/mxl-bridge"))
 CONFIG = "/config/config.json"
 RATE = 48000
+# Block size the tx test's pattern writer uses (frames): 480 = a 10 ms writer like the apps here,
+# 48 = a 1 ms writer. The bridge self-tunes its read delay to it.
+BLOCK = int(os.environ.get("GEN_BLOCK", "480"))
 
 M64 = (1 << 64) - 1
 
@@ -116,7 +119,7 @@ def test_tx(n, seconds, binary, receivers, seed):
     group = f"239.55.5.{5 + n}"
     rx_id = receiver_for_tx(n, receivers)
     flow = str(uuid.uuid4())
-    gen = subprocess.Popen(["kubectl", "-n", NS, "exec", POD, "--", binary, "audiotest", "gen", CONFIG, flow, "8", str(seconds + 6), str(seed)],
+    gen = subprocess.Popen(["kubectl", "-n", NS, "exec", POD, "--", binary, "audiotest", "gen", CONFIG, flow, "8", str(seconds + 6), str(seed), str(BLOCK)],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     start = json.loads(gen.stdout.readline())
     staged = f"{NODE}/x-nmos/connection/v1.2/single/receivers/{rx_id}/staged"
@@ -197,15 +200,20 @@ def test_rx(n, seconds, binary):
     raw = dump.communicate()[0]
     head, _, body = raw.partition(b"\n")
     hdr = json.loads(head)
+    nbytes = hdr["frames"] * channels * 4
+    heads = json.loads(body[nbytes:].strip() or b'{"heads": []}')["heads"]
+    body = body[:nbytes]
     mxl = struct.unpack(f"<{len(body) // 4}i", body[: len(body) // 4 * 4])
     mframes = [list(mxl[k:k + channels]) for k in range(0, len(mxl), channels)]
-    return analyse_rx(n, group, pk, hdr["first_index"], mframes, channels)
+    return analyse_rx(n, group, pk, hdr["first_index"], mframes, channels, heads)
 
 
-def analyse_rx(n, group, pk, first_index, mframes, channels):
+def analyse_rx(n, group, pk, first_index, mframes, channels, heads=()):
     """Align by content: find the MXL audio in the captured RTP (clock epochs may differ), then
     compare every sample and time MXL indices against TAI arrival times."""
     res = {"stream": f"rx {n}", "group": group, "packets": len(pk), "lost": seq_gaps(pk), "capture_drops": capture.drops, "mxl_frames": len(mframes)}
+    head_tai = [h[0] for h in heads]
+    head_idx = [h[1] for h in heads]
     wire, arrival, where = {}, {}, {}
     for ts, _, p, tai in pk:
         for k, f in enumerate(l24(p, channels)):
@@ -245,8 +253,12 @@ def analyse_rx(n, group, pk, first_index, mframes, channels):
         compared += 1
         bad += w != f
         tai, pos = arrival[rtp]
-        if pos == 47 and k % 97 == 0:          # last sample of its packet: arrived at `tai`
-            lat.append((first_index + k) / RATE - tai / 1e9)
+        if pos == 47 and k % 97 == 0 and heads:  # last sample of its packet: arrived at `tai`
+            # ...and became readable in MXL when the head first reached its index.
+            idx = first_index + k
+            j = bisect.bisect_left(head_idx, idx)
+            if j < len(head_idx):
+                lat.append(head_tai[j] / 1e9 - tai / 1e9)
     lat.sort()
     res.update(compared=compared, mismatched=bad, rtp_minus_mxl_samples=offset if offset < 1 << 31 else offset - (1 << 32))
     if lat:

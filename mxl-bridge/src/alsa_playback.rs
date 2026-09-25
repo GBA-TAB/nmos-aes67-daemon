@@ -78,7 +78,12 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
     // Reads are clock-aligned `tx_mxl_delay_ms` behind now, where the data already exists: a short
     // timeout only covers a writer running late.
     let read_timeout = Duration::from_secs_f64(period as f64 / rate as f64);
-    let delay = (state.cfg.tx_mxl_delay_ms * rate as f64 / 1000.0) as u64;
+    let base_delay = (state.cfg.tx_mxl_delay_ms * rate as f64 / 1000.0) as u64;
+    let delay_step = rate as u64 / 1000; // 1 ms
+    let max_delay = rate as u64 / 20; // 50 ms
+    // Per-Source read delay, self-tuned: +1 ms (and a re-align) whenever a read lands before its
+    // writer has written; reset when the Source is disconnected.
+    let mut delays: HashMap<u8, u64> = HashMap::new();
     // Re-align only beyond 50 ms (a stall, a clock jump): wake-up jitter and writers' block sizes
     // must never trigger it - each snap skips or repeats samples. ALSA and TAI both follow PTP, so
     // their real drift stays far below this.
@@ -105,7 +110,11 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
 
         let mut sources = state.sources.blocking_lock();
         for entry in sources.values_mut() {
-            let Some(reader) = entry.reader.as_mut() else { continue };
+            let Some(reader) = entry.reader.as_mut() else {
+                delays.remove(&entry.daemon_id);
+                continue;
+            };
+            let delay = *delays.entry(entry.daemon_id).or_insert(base_delay);
             if retry_at.get(&entry.daemon_id).is_some_and(|t| Instant::now() < *t) {
                 continue; // backing off a failed Source: silence, and no blocking read this period
             }
@@ -116,6 +125,13 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
                     p
                 }
                 Err(e) => {
+                    // Read ahead of the writer: give this Source 1 ms more and start over there.
+                    if delay < max_delay {
+                        let d = (delay + delay_step).min(max_delay);
+                        delays.insert(entry.daemon_id, d);
+                        reader.realign();
+                        tracing::info!(daemon_id = entry.daemon_id, delay_ms = d as f64 * 1000.0 / rate as f64, "tx read delay raised to fit this Source's writer");
+                    }
                     // One late block is silence for one period; only a Source that keeps failing
                     // is backed off.
                     let n = failures.entry(entry.daemon_id).or_insert(0);

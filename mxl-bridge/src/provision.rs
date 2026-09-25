@@ -55,6 +55,10 @@ pub struct StreamSet {
     /// rx only: where unconnected streams are parked (e.g. "239.255.255.1").
     #[serde(default)]
     pub parking_group: Option<String>,
+    /// rx only: the daemon's playout delay per Sink, in samples (its jitter buffer: added to the
+    /// rx latency as is). Applied to live Sinks too, keeping their connection. Default 576 (12 ms).
+    #[serde(default)]
+    pub delay: Option<u32>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -141,11 +145,12 @@ pub fn parking_sdp(id: u8, channels: usize, group: &str) -> String {
 
 pub const PARKED_PREFIX: &str = "mxl-bridge parked RX";
 
+#[allow(dead_code)] // the plan no longer distinguishes parked Sinks; kept for tests and tooling
 pub fn is_parked(sink: &DaemonSink) -> bool {
     sink.sdp.contains(PARKED_PREFIX)
 }
 
-pub fn parked_sink(id: u8, map: Vec<u8>, group: &str) -> DaemonSink {
+pub fn parked_sink(id: u8, map: Vec<u8>, group: &str, delay: u32) -> DaemonSink {
     DaemonSink {
         id,
         name: format!("Bridge RX {}", id as u32 + 1),
@@ -153,7 +158,7 @@ pub fn parked_sink(id: u8, map: Vec<u8>, group: &str) -> DaemonSink {
         use_sdp: true,
         source: String::new(),
         sdp: parking_sdp(id, map.len(), group),
-        delay: 576,
+        delay,
         ignore_refclk_gmid: true,
         map,
     }
@@ -182,7 +187,7 @@ impl std::fmt::Display for Action {
             Action::PutSource(s) => write!(f, "tx {}: set '{}' -> {} {} {}ch", s.id, s.name, s.address, span(&s.map), s.map.len()),
             Action::DeleteSource(id) => write!(f, "tx {id}: remove (beyond declared capacity)"),
             Action::PutParkedSink(s) => write!(f, "rx {}: create parked '{}' {} {}ch", s.id, s.name, span(&s.map), s.map.len()),
-            Action::RemapSink(s) => write!(f, "rx {}: remap '{}' to {} (connection kept)", s.id, s.name, span(&s.map)),
+            Action::RemapSink(s) => write!(f, "rx {}: set '{}' to {}, delay {} (connection kept)", s.id, s.name, span(&s.map), s.delay),
             Action::DeleteSink(id) => write!(f, "rx {id}: remove (beyond declared capacity)"),
         }
     }
@@ -194,6 +199,7 @@ pub fn plan(cap: &Capacity, sources: &[DaemonSource], sinks: &[DaemonSink]) -> a
     let rx_maps = channel_maps(&stream_sizes(&cap.rx)?, cap.alsa_channels)?;
     let base = cap.tx.multicast_base.as_deref().ok_or_else(|| anyhow::anyhow!("tx.multicast_base is required"))?;
     let group = cap.rx.parking_group.as_deref().ok_or_else(|| anyhow::anyhow!("rx.parking_group is required"))?;
+    let delay = cap.rx.delay.unwrap_or(576);
     let mut actions = Vec::new();
 
     for (i, map) in tx_maps.into_iter().enumerate() {
@@ -211,12 +217,12 @@ pub fn plan(cap: &Capacity, sources: &[DaemonSource], sinks: &[DaemonSink]) -> a
     for (i, map) in rx_maps.into_iter().enumerate() {
         let id = i as u8;
         match sinks.iter().find(|s| s.id == id) {
-            None => actions.push(Action::PutParkedSink(parked_sink(id, map, group))),
-            Some(cur) if cur.map == map => {}
-            Some(cur) if sdp_channels(&cur.sdp) == Some(map.len()) && !is_parked(cur) => {
-                actions.push(Action::RemapSink(DaemonSink { map, ..cur.clone() }))
+            None => actions.push(Action::PutParkedSink(parked_sink(id, map, group, delay))),
+            Some(cur) if cur.map == map && cur.delay == delay => {}
+            Some(cur) if sdp_channels(&cur.sdp) == Some(map.len()) => {
+                actions.push(Action::RemapSink(DaemonSink { map, delay, ..cur.clone() }))
             }
-            Some(_) => actions.push(Action::PutParkedSink(parked_sink(id, map, group))),
+            Some(_) => actions.push(Action::PutParkedSink(parked_sink(id, map, group, delay))),
         }
     }
     for s in sinks.iter().filter(|s| s.id as usize >= cap_count(&cap.rx)) {
@@ -286,8 +292,8 @@ mod tests {
     fn cap16x8() -> Capacity {
         Capacity {
             alsa_channels: 128,
-            tx: StreamSet { streams: Some(16), channels: ChannelSpec::Each(8), multicast_base: Some("239.55.5.5".into()), parking_group: None },
-            rx: StreamSet { streams: Some(16), channels: ChannelSpec::Each(8), multicast_base: None, parking_group: Some("239.255.255.1".into()) },
+            tx: StreamSet { streams: Some(16), channels: ChannelSpec::Each(8), multicast_base: Some("239.55.5.5".into()), parking_group: None, delay: None },
+            rx: StreamSet { streams: Some(16), channels: ChannelSpec::Each(8), multicast_base: None, parking_group: Some("239.255.255.1".into()), delay: None },
             mode: Mode::Apply,
             recheck_secs: 30,
         }
@@ -318,9 +324,9 @@ mod tests {
     #[test]
     fn sizes_reject_what_does_not_fit() {
         assert!(channel_maps(&[8; 17], 128).is_err());
-        let bad = StreamSet { streams: Some(3), channels: ChannelSpec::List(vec![8, 8]), multicast_base: None, parking_group: None };
+        let bad = StreamSet { streams: Some(3), channels: ChannelSpec::List(vec![8, 8]), multicast_base: None, parking_group: None, delay: None };
         assert!(stream_sizes(&bad).is_err());
-        let list = StreamSet { streams: None, channels: ChannelSpec::List(vec![16, 8, 8]), multicast_base: None, parking_group: None };
+        let list = StreamSet { streams: None, channels: ChannelSpec::List(vec![16, 8, 8]), multicast_base: None, parking_group: None, delay: None };
         assert_eq!(channel_maps(&stream_sizes(&list).unwrap(), 64).unwrap()[1], (16..24).collect::<Vec<u8>>());
     }
 
@@ -358,8 +364,18 @@ mod tests {
     }
 
     #[test]
+    fn a_new_delay_is_applied_to_live_sinks_keeping_their_sdp() {
+        let mut cap = cap16x8();
+        cap.rx.delay = Some(192);
+        let cur = sink(0, (0..8).collect(), 8);
+        let a = plan(&cap, &[], &[cur.clone()]).unwrap();
+        let s = a.iter().find_map(|a| if let Action::RemapSink(s) = a { Some(s) } else { None }).unwrap();
+        assert_eq!((s.delay, &s.sdp), (192, &cur.sdp));
+    }
+
+    #[test]
     fn parking_sdp_is_recognisable_and_declares_its_channels() {
-        let s = parked_sink(4, (32..40).collect(), "239.255.255.1");
+        let s = parked_sink(4, (32..40).collect(), "239.255.255.1", 576);
         assert!(is_parked(&s));
         assert_eq!(sdp_channels(&s.sdp), Some(8));
         assert!(s.sdp.contains("c=IN IP4 239.255.255.1/15"));
