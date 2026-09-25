@@ -771,6 +771,30 @@ where:
 > **rate**
 > JSON number specifying the sample rate of the stream.
 
+## Fork changes for mxl-bridge (session notes, not upstream) ##
+
+Changes made so `mxl-bridge` (`../mxl-bridge/README.md`) can run a fixed layout of 128 channels
+each way (16 tx x 8 ch, 16 rx x 8 ch) on this daemon. Verified live on the lab host, 2026-09-26.
+
+> **alsa\_channels**
+> JSON number, the width of the RAVENNA ALSA device and so the channel pool shared by all Sources
+> and Sinks. Now clamped to **128** (was 64). At startup the daemon also sets the driver's own
+> input/output count to this value (`driver_manager.cpp`, `MT_ALSA_Msg_SetNumberOfInputs/Outputs`):
+> the driver defaults to 64 and a stream mapped at channel 64 or above failed to start. Needs the
+> GBA-TAB `ravenna-alsa-lkm` driver (256-channel ceiling, `3rdparty/ravenna-alsa-lkm`).
+
+> **nmos\_sink\_parking\_address**
+> JSON string, default `"239.255.255.1"`. An IS-05 disconnect (`master_enable: false`) on a
+> Receiver no longer leaves its Sink without an SDP (the daemon can't keep a Sink without one): the
+> Sink is re-pointed at this multicast group, which nothing sends to (`nmos_manager.cpp`,
+> `park_sdp()`). The Sink, its ALSA channels and its NMOS Receiver stay; the next connection just
+> replaces the SDP. `mxl-bridge`'s capacity `rx.parking_group` should be the same address.
+
+- **IGMP: one socket per multicast group** (`igmp.hpp`). Linux allows 20 memberships per socket
+  (`net.ipv4.igmp_max_memberships`), so the 21st Sink or Source on one shared socket failed with
+  `ENOBUFS` and its group was never joined (the switch's IGMP snooping then dropped its traffic). Each
+  group now has its own reference-counted socket, so the limit no longer applies.
+
 ## Known issues (session notes, not upstream) ##
 
 - **RESOLVED (2026-09-12): kernel<->daemon netlink command/response channel had no per-request

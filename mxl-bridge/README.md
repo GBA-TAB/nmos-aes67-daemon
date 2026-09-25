@@ -123,6 +123,115 @@ failed. `{id}` is axum 0.8's syntax; easy to mix up if skimming newer docs again
 of CWD or debug/release profile, no `LD_LIBRARY_PATH` needed). Passing the bare string `"libmxl.so"`
 instead (relying on ambient library search paths, as MXL's own examples do) was not tested.
 
+## Capacity, latency, robustness and tests (2026-09-26)
+
+Verified live on the lab host (RAVENNA driver, `aes67-daemon`, bridge as the orchestrator's
+`mxl-bridge-1`): **tx and rx bit-exact, NMOS control matrix 7/7, 128 channels each way provisioned,
+survives daemon and bridge restarts.**
+
+### Capacity: a fixed stream layout, set at startup
+
+`capacity` in the config makes the bridge own the daemon's streams: at startup (and every
+`recheck_secs`) it plans the tx Sources and rx Sinks the daemon must have and creates, fixes or removes
+streams to match (`provision.rs`, `plan()` is pure and unit-tested). Without `capacity` the bridge only
+mirrors whatever streams the daemon has. The lab layout, 128 channels each way (16 tx x 8 ch, 16 rx x 8 ch):
+
+```json
+"capacity": {
+  "alsa_channels": 128,
+  "mode": "apply",
+  "recheck_secs": 30,
+  "tx": { "streams": 16, "channels": 8, "multicast_base": "239.55.5.5" },
+  "rx": { "streams": 16, "channels": 8, "parking_group": "239.255.255.1", "delay": 576 }
+}
+```
+
+- `alsa_channels` is **checked, not set**: the daemon must already run at that width (its own
+  `alsa_channels`, now up to 128, see `../daemon/README.md`) or wider. A narrower daemon is logged
+  as an error and nothing is applied; at most 64 streams in total (the daemon's stream-id limit).
+- `channels` is either one number for every stream (with `streams`) or a list, one entry per stream.
+- tx stream *n* sends to `multicast_base + n` (239.55.5.5, .6, ... .20).
+- rx streams need an SDP to exist in the daemon: unconnected ones are **parked** on `parking_group`
+  (a group nothing sends to). An IS-05 disconnect on the daemon's Receiver parks the Sink again
+  (daemon `nmos_sink_parking_address`) instead of deleting it.
+- rx `delay` is the daemon's playout delay per Sink in samples (its jitter buffer, added to the rx
+  latency as is); default 576 (12 ms). Applied to live Sinks too, without dropping their connection.
+- `mode: "log"` only prints the plan - use it first on a daemon with streams you care about.
+
+### Latency settings
+
+| field | default | meaning |
+|---|---|---|
+| `period_frames` | - | capture (2110 -> MXL) ALSA period and MXL commit size. **48** (1 ms) in the lab |
+| `tx_period_frames` | 48 | playback (MXL -> 2110) ALSA period |
+| `tx_buffer_periods` | 4 | playback buffer depth; kept full, so added to tx latency as is (4 ms) |
+| `tx_mxl_delay_ms` | 3 | starting read delay behind now (TAI) for each MXL Source; self-tuning, see below |
+| `rt_priority` | 70 | SCHED_FIFO priority of the capture/playback threads; 0 = normal scheduling |
+
+- **Self-tuning tx read delay.** Each Source is read `delay` behind now; a read that lands before the
+  writer has committed adds 1 ms (up to 50 ms). A 1 ms writer settles at the base, a 10 ms-block writer
+  at about 10 ms more. A writer that falls far behind is read at its head minus the delay instead.
+- **Not every playback period x buffer combination is bit-exact through the RAVENNA driver**: 96 x 3
+  played stale audio (repeated old periods). 48 x 4 is verified; re-run the tx audiotest after changing
+  either.
+- **Measured** (audiotest, sample-exact alignment): tx MXL-commit -> wire about **12 ms** with a 1 ms
+  writer, about 13 ms from the audiomixer (2 ms periods); rx wire -> readable in MXL about **1 ms** on
+  top of the daemon's playout `delay`.
+- **RT threads** need CAP_SYS_NICE: the image sets it on the binary as a *permitted* file capability
+  (`setcap cap_sys_nice+p`, after the `chown` - chown clears capabilities) and `rt.rs` raises it with
+  `capset` before `sched_setscheduler`; the orchestrator's pod template adds `SYS_NICE`. Without it the
+  bridge logs a warning and runs with normal scheduling.
+
+### Robustness
+
+- **Daemon restart**: a daemon stream missing from a poll is only un-mirrored after 10 s
+  (`daemon_client.rs`, `REMOVAL_GRACE`), so a daemon restart doesn't tear down NMOS resources and MXL
+  flows. The capture/playback threads reopen their ALSA device on failure (`run_reopening`, 1 -> 10 s
+  backoff) - the device goes away while the daemon restarts.
+- **Failed sources** back off instead of spinning (about 50 ms of consecutive failures).
+- **Bridge restart**: IS-05 activations persist in `state_path` and are re-applied at startup.
+
+### Test tools
+
+The bridge binary carries its own test helpers (`src/audiotest.rs`):
+`mxl-bridge audiotest gen` (write a deterministic per-channel pattern into a new MXL flow),
+`audiotest dump` (read an MXL flow range to a file), `audiotest capture` (AF_PACKET capture of an
+RTP multicast on the media NIC, with IGMP join, big receive buffer, drop count and CLOCK_TAI arrival
+times). Two scripts drive them from the host (they `kubectl exec` into the bridge pod):
+
+```bash
+# tx: pattern -> MXL -> bridge -> wire, checked bit for bit on every channel of every stream
+python3 contract/audiotest.py tx --streams 4-15 --seconds 4
+GEN_BLOCK=48 python3 contract/audiotest.py tx --streams 4     # as a 1 ms writer (default 480 = 10 ms)
+
+# rx: an external 2110 sender (noise/music, not a pure tone) on stream N, wire vs MXL flow
+python3 contract/audiotest.py rx --stream 0 --seconds 4
+
+# NMOS control matrix through reMOS /api/routes (the operator's path)
+python3 contract/nmos_control.py --tx 4 --rx 4 --rx-sender <NMOS sender id> [--skip-restart]
+```
+
+`nmos_control.py` checks: tx-connect (Test Tones -> 1 kHz on the wire), tx-reroute (tone gone),
+tx-survives-restart (bridge restart via the orchestrator), tx-disconnect (silence, stream keeps
+running), rx-connect (Sink gets the sender's SDP and receives), rx-audio (bit-exact wire vs MXL; a
+silent sender passes as "connection verified"), rx-disconnect (Sink parked, not receiving). It restores
+what it changed. Env: `REMOS`, `ORCH`, `DAEMON_NODE`, plus audiotest's `BRIDGE_POD`, `BRIDGE_NODE`,
+`DAEMON`, `IFACE`, `BRIDGE_BIN`.
+
+Samples are aligned by content (the pattern for tx, the dumped flow for rx) at one constant RTP/MXL
+offset, since the lab grandmaster's epoch is not TAI (RTP time and the MXL index differ by a constant).
+Latency is then timed on the host's own clock: packet arrival (CLOCK_TAI, from the capture) against the
+MXL index of the same sample (tx), or against when that index became readable in the flow (rx).
+
+### Open (not yet verified)
+
+- rx content over an NMOS connection: the control matrix's only transmitting 2110 audio sender in the
+  lab was silent, so rx bit-exactness is verified only with a direct (non-NMOS) RAVENNA stream from a
+  Mac.
+- IS-08 channel mapping on the bridge's packed 8-channel flows.
+- Sustained load: all 32 streams active at once for hours, with CPU/xrun statistics.
+- Cross-host MXL (Fabrics/RDMA).
+
 ## Building
 
 ```bash
