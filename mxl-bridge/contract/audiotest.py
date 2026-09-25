@@ -194,6 +194,20 @@ def test_rx(n, seconds, binary):
     if not sender:
         raise SystemExit(f"no bridge MXL Sender labelled {label!r}")
     flow = sender["flow_id"]
+    # An MXL Sender writes its flow only while activated (IS-05) - as a consumer's controller would.
+    sender_url = f"{NODE}/x-nmos/connection/v1.2/single/senders/{sender['id']}"
+    was_active = http("GET", sender_url + "/active")["master_enable"]
+    if not was_active:
+        http("PATCH", sender_url + "/staged", {"master_enable": True, "activation": {"mode": "activate_immediate"}})
+        time.sleep(1.5)
+    try:
+        return _test_rx(n, seconds, binary, group, channels, flow)
+    finally:
+        if not was_active:
+            http("PATCH", sender_url + "/staged", {"master_enable": False, "activation": {"mode": "activate_immediate"}})
+
+
+def _test_rx(n, seconds, binary, group, channels, flow):
     dump = subprocess.Popen(["kubectl", "-n", NS, "exec", POD, "--", binary, "audiotest", "dump", CONFIG, flow, str(channels), str(seconds + 1)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     pk = capture(group, seconds + 1)
