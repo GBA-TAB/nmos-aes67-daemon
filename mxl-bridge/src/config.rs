@@ -1,5 +1,22 @@
 use serde::Deserialize;
 
+// 48 x 4 (1 ms periods, 4 ms buffer): measured bit-exact, 0 underruns, MXL -> wire ~21 ms on all
+// 16 tx streams (contract/audiotest.py, 2026-09-25). Not every size works: the RAVENNA driver copies
+// playback through its own ring with per-period bookkeeping, and some combinations play stale
+// audio periodically (96 x 3 and 96 x 2 did; 96 x 4, 192 x 2, 192 x 3, 240 x 2, 480 x 2 did not).
+// Re-run the audio test after changing either value.
+fn default_tx_period_frames() -> u32 {
+    48
+}
+
+fn default_tx_buffer_periods() -> u32 {
+    4
+}
+
+fn default_tx_mxl_delay_ms() -> f64 {
+    12.0
+}
+
 fn default_rt_priority() -> u8 {
     70
 }
@@ -12,6 +29,19 @@ pub struct Config {
     pub sample_rate: u32,
     /// ALSA period size in frames. Also the MXL sample-batch size per commit.
     pub period_frames: u32,
+    /// Playback (MXL -> 2110) period in frames: 48 = 1 ms at 48 kHz. Smaller than the capture
+    /// period because the playback buffer is pure latency. See the note at the defaults: not every
+    /// period x buffer combination is bit-exact through the RAVENNA driver.
+    #[serde(default = "default_tx_period_frames")]
+    pub tx_period_frames: u32,
+    /// Playback buffer depth in periods (4 x 1 ms = 4 ms): kept full by the blocking writes, so it
+    /// is added to the tx latency as is.
+    #[serde(default = "default_tx_buffer_periods")]
+    pub tx_buffer_periods: u32,
+    /// How far behind "now" (TAI) each Source is read: must exceed the MXL writers' block size
+    /// (10 ms in this stack) plus jitter, or reads land before the data exists.
+    #[serde(default = "default_tx_mxl_delay_ms")]
+    pub tx_mxl_delay_ms: f64,
     /// SCHED_FIFO priority of the capture and playback threads (`rt.rs`); 0 = normal scheduling.
     #[serde(default = "default_rt_priority")]
     pub rt_priority: u8,

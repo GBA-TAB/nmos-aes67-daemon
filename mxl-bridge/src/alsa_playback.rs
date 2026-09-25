@@ -42,8 +42,8 @@ fn open_playback(cfg: &Config, channels: u32) -> anyhow::Result<PCM> {
                 "ALSA negotiated a different sample rate than configured"
             );
         }
-        hwp.set_period_size_near(cfg.period_frames as i64, ValueOr::Nearest)?;
-        hwp.set_buffer_size_near(cfg.period_frames as i64 * 4)?;
+        hwp.set_period_size_near(cfg.tx_period_frames as i64, ValueOr::Nearest)?;
+        hwp.set_buffer_size_near(cfg.tx_period_frames as i64 * cfg.tx_buffer_periods.max(2) as i64)?;
         pcm.hw_params(&hwp)?;
     }
     pcm.prepare()?;
@@ -72,12 +72,17 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
     let pcm = open_playback(&state.cfg, channels)?;
     let io = pcm.io_i32()?;
 
-    let period = state.cfg.period_frames as usize;
+    let period = state.cfg.tx_period_frames as usize;
     let mut interleaved = vec![0i32; period * channels as usize];
-    // Bounded to roughly one period's real-time budget (with slack for jitter) rather than a flat
-    // timeout — a shared wide device can't afford one slow Source stalling everyone else's cadence
-    // for long (see the "Known limitation" note above).
-    let read_timeout = Duration::from_secs_f64(2.0 * period as f64 / state.cfg.sample_rate as f64);
+    let rate = state.cfg.sample_rate;
+    // Reads are clock-aligned `tx_mxl_delay_ms` behind now, where the data already exists: a short
+    // timeout only covers a writer running late.
+    let read_timeout = Duration::from_secs_f64(period as f64 / rate as f64);
+    let delay = (state.cfg.tx_mxl_delay_ms * rate as f64 / 1000.0) as u64;
+    // Re-align only beyond 50 ms (a stall, a clock jump): wake-up jitter and writers' block sizes
+    // must never trigger it - each snap skips or repeats samples. ALSA and TAI both follow PTP, so
+    // their real drift stays far below this.
+    let tolerance = rate as u64 / 20;
 
     tracing::info!(
         channels,
@@ -88,6 +93,9 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
 
     let silence = vec![0i32; period * channels as usize];
     let mut retry_at: HashMap<u8, Instant> = HashMap::new();
+    let mut failures: HashMap<u8, u32> = HashMap::new();
+    // Consecutive failed reads (about 50 ms) before a Source counts as gone and is backed off.
+    let backoff_after = (50 * rate as usize / 1000 / period).max(1) as u32;
     let mut packed_retry_at: HashMap<String, Instant> = HashMap::new();
     let mut recoveries = 0u32;
     let mut last_recovery_log = Instant::now();
@@ -101,12 +109,20 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
             if retry_at.get(&entry.daemon_id).is_some_and(|t| Instant::now() < *t) {
                 continue; // backing off a failed Source: silence, and no blocking read this period
             }
-            let planar = match reader.read_next(period, read_timeout) {
+            let planar = match reader.read_aligned(period, crate::mxl_flow::tai_index(rate), delay, tolerance, read_timeout) {
                 Ok(p) => {
                     retry_at.remove(&entry.daemon_id);
+                    failures.remove(&entry.daemon_id);
                     p
                 }
                 Err(e) => {
+                    // One late block is silence for one period; only a Source that keeps failing
+                    // is backed off.
+                    let n = failures.entry(entry.daemon_id).or_insert(0);
+                    *n += 1;
+                    if *n < backoff_after {
+                        continue;
+                    }
                     if !retry_at.contains_key(&entry.daemon_id) {
                         tracing::warn!(daemon_id = entry.daemon_id, error = %e, "read failed, silencing this Source and retrying every {FAILED_SOURCE_BACKOFF:?}");
                     }

@@ -242,6 +242,14 @@ impl MxlAudioFlow {
     }
 }
 
+/// The current MXL index at `rate`: samples since the TAI epoch (MXL's own definition, the same
+/// clock `get_current_index` reads).
+pub fn tai_index(rate: u32) -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_TAI, &mut t) };
+    (t.tv_sec as u128 * rate as u128 + t.tv_nsec as u128 * rate as u128 / 1_000_000_000) as u64
+}
+
 /// Index of the FIRST sample of a just-read capture block of `count` frames, given the current
 /// index (`now`) and the frames still pending in the capture buffer (newer than the block).
 pub fn capture_start_index(now: u64, pending_frames: u64, count: usize) -> u64 {
@@ -314,6 +322,26 @@ impl MxlAudioFlowSource {
     /// Resets this reader's own tracked index to the flow's current head — call after `read_next`
     /// returns an error (most likely cause: the tracked index drifted out of the writer's valid
     /// ring-buffer window, e.g. a stall let the writer lap the reader).
+    /// Reads the `count` samples right after the previous read while that stays within `tolerance`
+    /// of the target - `delay` behind the older of `now` (TAI index) and this flow's head - and
+    /// jumps to the target otherwise (first read, a stall, real clock drift). Fast writers are read
+    /// `delay` behind real time; writers that lag get their own lag plus `delay`, instead of reads
+    /// landing before their data exists. The tolerance must exceed the caller's wake-up jitter and
+    /// the writer's block size, or it snaps (skipping or repeating samples) on noise.
+    pub fn read_aligned(&mut self, count: usize, now: u64, delay: u64, tolerance: u64, timeout: std::time::Duration) -> anyhow::Result<Vec<Vec<f32>>> {
+        // A writer keeping up (head within `delay` of now) is read exactly `delay` behind now:
+        // deterministic. Only one lagging further is read `delay` behind its own head.
+        let head = self.head_index()?;
+        let target_end = if head + delay >= now { now.saturating_sub(delay) } else { head.saturating_sub(delay) };
+        let end = match self.next_index {
+            Some(i) if i.abs_diff(target_end) <= tolerance => i,
+            _ => target_end,
+        };
+        let planar = self.read_samples_at(end, count, timeout)?;
+        self.next_index = Some(end + count as u64);
+        Ok(planar)
+    }
+
     pub fn resync_to_head(&mut self) -> anyhow::Result<()> {
         self.next_index = Some(self.head_index()?);
         Ok(())
