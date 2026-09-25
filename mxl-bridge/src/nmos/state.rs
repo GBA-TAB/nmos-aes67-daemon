@@ -16,6 +16,15 @@ pub fn version_string(v: (u64, u64)) -> String {
     format!("{}:{}", v.0, v.1)
 }
 
+/// IS-04: any change to a resource's content needs a newer `version`, or the registry rejects the
+/// update ("conflicts with the existing registration with version ..."; seen live 2026-09-25 when
+/// a fault flipped a Receiver's `subscription.active`). Strictly increasing even within one
+/// timestamp.
+pub(crate) fn bump_version(v: &mut (u64, u64)) {
+    let now = now_version();
+    *v = if now > *v { now } else if v.1 < 999_999_999 { (v.0, v.1 + 1) } else { (v.0 + 1, 0) };
+}
+
 /// Lease held for a `master_enable: true` that names no `receiver_id` (IS-05 allows it).
 pub const CONTROLLER_LEASE: &str = "controller";
 
@@ -223,6 +232,7 @@ impl NmosState {
     /// site - takes the entry directly rather than re-locking.
     pub fn mark_sink_fault(&self, entry: &mut SinkEntry, reason: String) {
         if entry.fault.is_none() {
+            bump_version(&mut entry.version);
             let _ = self.fault_notify_tx.send(());
         }
         entry.fault = Some(reason);
@@ -233,6 +243,7 @@ impl NmosState {
     /// (every period succeeds) costs nothing beyond the `is_some()` check.
     pub fn clear_sink_fault(&self, entry: &mut SinkEntry) {
         if entry.fault.take().is_some() {
+            bump_version(&mut entry.version);
             let _ = self.fault_notify_tx.send(());
         }
     }
@@ -241,6 +252,7 @@ impl NmosState {
     /// `alsa_playback.rs`'s own thread while holding `sources.blocking_lock()`.
     pub fn mark_source_fault(&self, entry: &mut SourceEntry, reason: String) {
         if entry.fault.is_none() {
+            bump_version(&mut entry.version);
             let _ = self.fault_notify_tx.send(());
         }
         entry.fault = Some(reason);
@@ -248,6 +260,7 @@ impl NmosState {
 
     pub fn clear_source_fault(&self, entry: &mut SourceEntry) {
         if entry.fault.take().is_some() {
+            bump_version(&mut entry.version);
             let _ = self.fault_notify_tx.send(());
         }
     }
@@ -350,6 +363,7 @@ impl NmosState {
         // The controller-only lease (no receiver_id, e.g. visualUniverse-nmosrouter enabling the
         // Sender before patching a Receiver) is not a Receiver id and is never reported as one.
         entry.receiver_id = entry.leases.iter().rev().find(|l| *l != CONTROLLER_LEASE).cloned();
+        bump_version(&mut entry.version); // the Sender's IS-04 subscription may have changed
         entry.active = now_active;
         Ok(SinkEntrySnapshot::from(&*entry))
     }
@@ -385,6 +399,7 @@ impl NmosState {
         entry.active = active;
         entry.sender_id = sender_id;
         entry.flow_id = if active { flow_id_for_report } else { None };
+        bump_version(&mut entry.version); // the Receiver's IS-04 subscription changed
         Ok(SourceEntrySnapshot::from(&*entry))
     }
 
@@ -594,5 +609,19 @@ mod tests {
         let resolved = state.own_sink_flow_id(&entry.sender_id.to_string()).await;
         assert_eq!(resolved, Some(entry.flow_id));
         assert_eq!(state.own_sink_flow_id("not-a-real-id").await, None);
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn bump_is_strictly_increasing() {
+        let mut v = (u64::MAX / 2, 5); // far in the future: now_version() cannot overtake it
+        let before = v;
+        super::bump_version(&mut v);
+        assert!(v > before);
+        let mut w = (0, 0);
+        super::bump_version(&mut w);
+        assert!(w > (0, 0));
     }
 }
