@@ -50,6 +50,10 @@ COPY --from=builder /build/aes67-linux-daemon/mxl-bridge/target/release/mxl-brid
 # Same uid as the other MXL images (first `useradd` = 1000), so flows in the shared domain stay
 # readable/writable across apps; `audio` (gid 29, as on the host) for the RAVENNA /dev/snd nodes.
 RUN useradd -m -G audio mxl && chown -R mxl:mxl /app
+# Real-time audio threads (src/rt.rs) - after the chown, which would erase file capabilities: SYS_NICE permitted (not effective - the binary must still
+# start where SYS_NICE is not allowed); rt.rs raises it just before switching to SCHED_FIFO.
+RUN apt-get update && apt-get install -y --no-install-recommends libcap2-bin \
+    && setcap cap_sys_nice+p /app/mxl-bridge && rm -rf /var/lib/apt/lists/*
 USER mxl
 
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/app/mxl-bridge"]

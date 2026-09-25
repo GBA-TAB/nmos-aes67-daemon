@@ -92,6 +92,10 @@ COPY aes67-linux-daemon/audiomixer-engine/docker-entrypoint.sh /app/docker-entry
 RUN chmod +x /app/docker-entrypoint.sh
 
 RUN useradd -m mxl && chown -R mxl:mxl /app
+# Real-time audio threads (src/rt.rs) - after the chown, which would erase file capabilities: SYS_NICE permitted (not effective - the binary must still
+# start where SYS_NICE is not allowed); rt.rs raises it just before switching to SCHED_FIFO.
+RUN apt-get update && apt-get install -y --no-install-recommends libcap2-bin \
+    && setcap cap_sys_nice+p /app/audiomixer-engine && rm -rf /var/lib/apt/lists/*
 USER mxl
 
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/app/docker-entrypoint.sh"]
