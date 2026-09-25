@@ -222,8 +222,8 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
                         last_recovery_log = Instant::now();
                     }
                     if let Err(e) = pcm.try_recover(e, true) {
-                        tracing::error!(error = %e, "ALSA recover failed");
-                        break;
+                        // A dead device (driver reset): let run_reopening open it again.
+                        return Err(anyhow::anyhow!("ALSA recover failed: {e}"));
                     }
                     // Rebuild headroom before the real data, so the next late period does not
                     // underrun immediately (start threshold is one period).

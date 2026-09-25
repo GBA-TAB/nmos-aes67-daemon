@@ -168,6 +168,19 @@ fn capture(iface: &str, group: std::net::Ipv4Addr, port: u16, seconds: f64) -> a
     let tv = libc::timeval { tv_sec: 0, tv_usec: 200_000 };
     unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, &tv as *const _ as *const libc::c_void, std::mem::size_of::<libc::timeval>() as u32) };
 
+    // Join the group like a real receiver: with IGMP snooping the switch only forwards a group to
+    // ports that asked for it (a stream this host transmits is seen regardless).
+    let join_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    let mreq = libc::ip_mreqn {
+        imr_multiaddr: libc::in_addr { s_addr: u32::from_ne_bytes(group.octets()) },
+        imr_address: libc::in_addr { s_addr: 0 },
+        imr_ifindex: ifindex as i32,
+    };
+    if join_fd < 0
+        || unsafe { libc::setsockopt(join_fd, libc::IPPROTO_IP, libc::IP_ADD_MEMBERSHIP, &mreq as *const _ as *const libc::c_void, std::mem::size_of::<libc::ip_mreqn>() as u32) } != 0
+    {
+        eprintln!("capture: joining {group} failed: {} (continuing)", std::io::Error::last_os_error());
+    }
     let want = group.octets();
     let deadline = std::time::Instant::now() + Duration::from_secs_f64(seconds);
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
@@ -207,6 +220,17 @@ fn capture(iface: &str, group: std::net::Ipv4Addr, port: u16, seconds: f64) -> a
         if payload > udp_end || udp_end > f.len() {
             continue;
         }
+        if packets == 0 {
+            eprintln!(
+                "capture: eth {:02x}{:02x} vlan {} dst-mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} | ip ihl {} flags {:02x} | udp {}->{} csum {:04x} | source {}.{}.{}.{} ttl {} dscp {} | rtp v{} padding {} extension {} csrc {} marker {} pt {} ssrc {:08x}",
+                f[12], f[13], if off == 18 { format!("{}", u16::from_be_bytes([f[14], f[15]]) & 0x0fff) } else { "-".into() },
+                f[0], f[1], f[2], f[3], f[4], f[5], f[off] & 0x0f, f[off + 6],
+                u16::from_be_bytes([f[udp], f[udp + 1]]), u16::from_be_bytes([f[udp + 2], f[udp + 3]]), u16::from_be_bytes([f[udp + 6], f[udp + 7]]),
+                f[off + 12], f[off + 13], f[off + 14], f[off + 15], f[off + 8], f[off + 1] >> 2,
+                f[rtp] >> 6, (f[rtp] >> 5) & 1, (f[rtp] >> 4) & 1, f[rtp] & 0x0f, f[rtp + 1] >> 7, f[rtp + 1] & 0x7f,
+                u32::from_be_bytes([f[rtp + 8], f[rtp + 9], f[rtp + 10], f[rtp + 11]])
+            );
+        }
         let seq = u16::from_be_bytes([f[rtp + 2], f[rtp + 3]]);
         let ts = u32::from_be_bytes([f[rtp + 4], f[rtp + 5], f[rtp + 6], f[rtp + 7]]);
         let body = &f[payload..udp_end];
@@ -228,7 +252,12 @@ fn capture(iface: &str, group: std::net::Ipv4Addr, port: u16, seconds: f64) -> a
     let mut len = std::mem::size_of::<TpacketStats>() as u32;
     const PACKET_STATISTICS: i32 = 6;
     unsafe { libc::getsockopt(fd, libc::SOL_PACKET, PACKET_STATISTICS, &mut st as *mut _ as *mut libc::c_void, &mut len) };
-    unsafe { libc::close(fd) };
+    unsafe {
+        libc::close(fd);
+        if join_fd >= 0 {
+            libc::close(join_fd);
+        }
+    }
     eprintln!("capture: {packets} RTP packets for {group}:{port} on {iface}; capture_drops={}", st.tp_drops);
     Ok(())
 }

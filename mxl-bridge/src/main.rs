@@ -160,18 +160,14 @@ async fn main() -> anyhow::Result<()> {
         let state = state.clone();
         std::thread::spawn(move || {
             rt::promote_current_thread("rx", state.cfg.rt_priority);
-            if let Err(e) = alsa_capture::run(state) {
-                tracing::error!(error = %e, "RX thread exited with error");
-            }
+            run_reopening("RX", || alsa_capture::run(state.clone()));
         });
     }
     {
         let state = state.clone();
         std::thread::spawn(move || {
             rt::promote_current_thread("tx", state.cfg.rt_priority);
-            if let Err(e) = alsa_playback::run(state) {
-                tracing::error!(error = %e, "TX thread exited with error");
-            }
+            run_reopening("TX", || alsa_playback::run(state.clone()));
         });
     }
 
@@ -192,4 +188,25 @@ async fn daemon_alsa_channels(http: &reqwest::Client, base: &str) -> anyhow::Res
     }
     let c: Cfg = http.get(format!("{base}/api/config")).send().await?.error_for_status()?.json().await?;
     Ok(c.alsa_channels)
+}
+
+/// Runs an ALSA thread body forever, reopening the device after it fails. A daemon restart resets
+/// the RAVENNA driver, which leaves open PCMs dead ("I/O error" on every read/write/recover):
+/// before this, capture exited for good and playback retried the dead device forever, so the
+/// bridge carried no audio until it was restarted. Back-off 1 s doubling to 10 s, reset once a
+/// run lasted a minute.
+fn run_reopening(name: &str, mut body: impl FnMut() -> anyhow::Result<()>) {
+    let mut backoff = std::time::Duration::from_secs(1);
+    loop {
+        let started = std::time::Instant::now();
+        match body() {
+            Ok(()) => tracing::warn!(thread = name, "ALSA thread returned, reopening"),
+            Err(e) => tracing::error!(thread = name, error = %format!("{e:#}"), retry_in = ?backoff, "ALSA thread failed, reopening the device"),
+        }
+        if started.elapsed() > std::time::Duration::from_secs(60) {
+            backoff = std::time::Duration::from_secs(1);
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
+    }
 }

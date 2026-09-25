@@ -135,9 +135,14 @@ impl DaemonClient {
         mut state: DaemonState,
         tx: tokio::sync::mpsc::UnboundedSender<DaemonDiff>,
     ) -> ! {
+        let mut source_absent: HashMap<u8, std::time::Instant> = HashMap::new();
+        let mut sink_absent: HashMap<u8, std::time::Instant> = HashMap::new();
         loop {
             match self.poll_once(&state).await {
-                Ok((new_state, source_changes, sink_changes)) => {
+                Ok((mut new_state, mut source_changes, mut sink_changes)) => {
+                    let now = std::time::Instant::now();
+                    hold_removals(&mut new_state.sources, &state.sources, &mut source_changes, &mut source_absent, now, REMOVAL_GRACE);
+                    hold_removals(&mut new_state.sinks, &state.sinks, &mut sink_changes, &mut sink_absent, now, REMOVAL_GRACE);
                     state = new_state;
                     if !source_changes.is_empty() || !sink_changes.is_empty() {
                         let diff = DaemonDiff { state: state.clone(), source_changes, sink_changes };
@@ -198,6 +203,40 @@ pub(crate) fn test_sink(id: u8, name: &str, map: Vec<u8>) -> DaemonSink {
     }
 }
 
+/// How long a Source/Sink must stay gone from the daemon before it is un-mirrored. A daemon
+/// restart reports no streams for a moment; un-mirroring then dropped every MXL flow and
+/// IS-05 activation (and persisted that), so the bridge came back with nothing connected.
+pub const REMOVAL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Holds back `Removed` changes until the id has been absent for `grace`: the held entry stays in
+/// `new` (so the next poll diffs against it again), and an id that reappears simply stops being
+/// absent.
+fn hold_removals<T: Clone>(
+    new: &mut HashMap<u8, T>,
+    old: &HashMap<u8, T>,
+    changes: &mut Vec<StreamChange<T>>,
+    absent: &mut HashMap<u8, std::time::Instant>,
+    now: std::time::Instant,
+    grace: std::time::Duration,
+) {
+    absent.retain(|id, _| !new.contains_key(id));
+    changes.retain(|c| match c {
+        StreamChange::Removed(id) => {
+            let since = *absent.entry(*id).or_insert(now);
+            if now.duration_since(since) < grace {
+                if let Some(v) = old.get(id) {
+                    new.insert(*id, v.clone());
+                }
+                false
+            } else {
+                absent.remove(id);
+                true
+            }
+        }
+        _ => true,
+    });
+}
+
 fn diff<T: Clone + PartialEq>(old: &HashMap<u8, T>, new: &HashMap<u8, T>) -> Vec<StreamChange<T>> {
     let mut changes = Vec::new();
     for (id, new_val) in new {
@@ -218,6 +257,43 @@ fn diff<T: Clone + PartialEq>(old: &HashMap<u8, T>, new: &HashMap<u8, T>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_briefly_missing_is_not_removed() {
+        let grace = std::time::Duration::from_secs(10);
+        let t0 = std::time::Instant::now();
+        let old: HashMap<u8, u32> = HashMap::from([(1, 10)]);
+        let mut absent = HashMap::new();
+        // Poll 1: gone -> held back, kept in the state.
+        let mut new: HashMap<u8, u32> = HashMap::new();
+        let mut ch = diff(&old, &new);
+        hold_removals(&mut new, &old, &mut ch, &mut absent, t0, grace);
+        assert!(ch.is_empty() && new.contains_key(&1));
+        // Poll 2, 5 s later: back -> nothing happened.
+        let mut back: HashMap<u8, u32> = HashMap::from([(1, 10)]);
+        let mut ch = diff(&new, &back);
+        hold_removals(&mut back, &new, &mut ch, &mut absent, t0 + std::time::Duration::from_secs(5), grace);
+        assert!(ch.is_empty() && absent.is_empty());
+    }
+
+    #[test]
+    fn a_stream_gone_past_the_grace_period_is_removed() {
+        let grace = std::time::Duration::from_secs(10);
+        let t0 = std::time::Instant::now();
+        let mut state: HashMap<u8, u32> = HashMap::from([(1, 10)]);
+        let mut absent = HashMap::new();
+        for (i, secs) in [0u64, 5, 11].iter().enumerate() {
+            let mut new: HashMap<u8, u32> = HashMap::new();
+            let mut ch = diff(&state, &new);
+            hold_removals(&mut new, &state, &mut ch, &mut absent, t0 + std::time::Duration::from_secs(*secs), grace);
+            if i < 2 {
+                assert!(ch.is_empty(), "held at {secs}s");
+            } else {
+                assert!(matches!(ch[..], [StreamChange::Removed(1)]), "removed at {secs}s");
+            }
+            state = new;
+        }
+    }
 
     #[tokio::test]
     async fn poll_detects_added_changed_removed() {

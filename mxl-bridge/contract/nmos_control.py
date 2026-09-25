@@ -180,8 +180,16 @@ def main():
         sys.exit(1 if failed else 0)
     try:
         connect(a.rx_sender, drx)
-        s, grp, receiving = wait(lambda: (lambda r: r if r[2] else None)(sink(a.rx)), timeout=10) or sink(a.rx)
+        # Joining the group and locking onto the stream can take several seconds.
+        s, grp, receiving = wait(lambda: (lambda r: r if r[2] else None)(sink(a.rx)), timeout=20) or sink(a.rx)
         check("rx-connect", receiving and grp != "239.255.255.1", f"Sink {a.rx} on {grp}, receiving={receiving}")
+        if receiving:
+            # The audio itself: wire vs the bridge's MXL flow for this stream, bit for bit.
+            r = A.test_rx(a.rx, 3, A.pod_bin())
+            ok = r["verdict"].startswith("PASS")
+            silent = "silent" in r["verdict"]
+            check("rx-audio", ok or silent, (f"bit-exact, {r.get('compared')} frames, wire -> MXL {r.get('latency_ms_median')} ms" if ok
+                                               else "sender is silent - connection verified, content not comparable" if silent else r["verdict"]))
 
         disconnect(drx)
         s2, grp2, receiving2 = wait(lambda: (lambda r: r if not r[2] else None)(sink(a.rx)), timeout=10) or sink(a.rx)
