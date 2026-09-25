@@ -63,15 +63,10 @@ pub struct Config {
     /// `/data/activations.json` on the instance's state volume.
     #[serde(default)]
     pub state_path: Option<String>,
-    /// Inclusive [min, max] daemon Sink id range mxl-bridge is allowed to provision into on-demand
-    /// (Milestone 5) — kept disjoint from ids an operator assigns by hand through the daemon's own
-    /// config/UI.
+    /// Fixed tx/rx stream layout enforced on the daemon at startup (`provision.rs`); absent = the
+    /// bridge only mirrors whatever streams the daemon has.
     #[serde(default)]
-    pub provisioned_sink_id_range: Option<(u8, u8)>,
-    /// How many always-inactive "not yet backing a Sink" spare Receivers to keep advertised at once
-    /// for on-demand provisioning (Milestone 5). 0 disables on-demand provisioning entirely.
-    #[serde(default)]
-    pub spare_receiver_slots: u8,
+    pub capacity: Option<crate::provision::Capacity>,
 }
 
 fn default_daemon_poll_interval_ms() -> u64 {

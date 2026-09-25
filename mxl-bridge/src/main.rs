@@ -1,4 +1,5 @@
 mod alsa_capture;
+mod provision;
 mod rt;
 mod alsa_playback;
 mod clock;
@@ -92,6 +93,38 @@ async fn main() -> anyhow::Result<()> {
     // ongoing polling loop below. A failure here (daemon unreachable at startup) isn't fatal:
     // fall back to the configured ceiling and start with an empty mirror set, exactly as
     // `alsa_channels_fallback`'s own doc comment (config.rs) says it's for.
+    // Declared capacity first (provision.rs), so the mirror below is built from the final layout.
+    if let Some(cap) = cfg.capacity.clone() {
+        let http = reqwest::Client::new();
+        let base = cfg.daemon_api_url.clone();
+        let run_once = {
+            let http = http.clone();
+            let base = base.clone();
+            let cap = cap.clone();
+            move || {
+                let (http, base, cap) = (http.clone(), base.clone(), cap.clone());
+                async move {
+                    let width = daemon_alsa_channels(&http, &base).await?;
+                    provision::reconcile(&http, &base, &cap, width).await
+                }
+            }
+        };
+        match run_once().await {
+            Ok(n) => tracing::info!(actions = n, mode = ?cap.mode, "capacity: startup reconcile done"),
+            Err(e) => tracing::error!(error = %format!("{e:#}"), "capacity: startup reconcile failed - mirroring the daemon as it is"),
+        }
+        if cap.recheck_secs > 0 {
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(cap.recheck_secs)).await;
+                    if let Err(e) = run_once().await {
+                        tracing::warn!(error = %format!("{e:#}"), "capacity: periodic reconcile failed");
+                    }
+                }
+            });
+        }
+    }
+
     let registration_client = reqwest::Client::new();
     let initial_state = match daemon_client.poll_once(&daemon_client::DaemonState::default()).await {
         Ok((new_state, source_changes, sink_changes)) => daemon_client::DaemonDiff { state: new_state, source_changes, sink_changes },
@@ -143,4 +176,14 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(nmos::sync::run(state.clone(), diff_rx));
 
     nmos::run(state).await
+}
+
+/// The daemon's `alsa_channels` (GET /api/config).
+async fn daemon_alsa_channels(http: &reqwest::Client, base: &str) -> anyhow::Result<u32> {
+    #[derive(serde::Deserialize)]
+    struct Cfg {
+        alsa_channels: u32,
+    }
+    let c: Cfg = http.get(format!("{base}/api/config")).send().await?.error_for_status()?.json().await?;
+    Ok(c.alsa_channels)
 }

@@ -51,6 +51,8 @@ class DriverManager : public DriverHandler {
   std::error_code set_max_tic_frame_size(uint64_t frame_size);
   std::error_code set_playout_delay(int32_t delay);
   std::error_code get_number_of_inputs(int32_t& inputs);
+  std::error_code set_number_of_inputs(uint32_t inputs);
+  std::error_code set_number_of_outputs(uint32_t outputs);
   std::error_code get_number_of_outputs(int32_t& outputs);
 
   int32_t get_current_output_volume() const { return output_volume_; };

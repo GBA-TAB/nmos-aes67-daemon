@@ -91,7 +91,12 @@ bool DriverManager::init(const Config& config) {
           set_ptp_config(ptp_config) ||
           set_tic_frame_size_at_1fs(config.get_tic_frame_size_at_1fs()) ||
           set_playout_delay(config.get_playout_delay()) ||
-          set_max_tic_frame_size(config.get_max_tic_frame_size());
+          set_max_tic_frame_size(config.get_max_tic_frame_size()) ||
+          // The driver's own I/O count (DEFAULT 64) caps which ALSA channels a stream may map;
+          // without this, alsa_channels above 64 was advertised but streams using channels 64+
+          // were refused ("(driver) command failed").
+          set_number_of_inputs(config.get_alsa_channels()) ||
+          set_number_of_outputs(config.get_alsa_channels());
   }
 
   return !res;
@@ -201,6 +206,18 @@ std::error_code DriverManager::remove_rtp_stream(uint64_t stream_handle) {
 
 std::error_code DriverManager::ping() {
   this->send_command(MT_ALSA_Msg_Ping);
+  return retcode_;
+}
+
+std::error_code DriverManager::set_number_of_inputs(uint32_t inputs) {
+  this->send_command(MT_ALSA_Msg_SetNumberOfInputs, sizeof(uint32_t),
+                     reinterpret_cast<const uint8_t*>(&inputs));
+  return retcode_;
+}
+
+std::error_code DriverManager::set_number_of_outputs(uint32_t outputs) {
+  this->send_command(MT_ALSA_Msg_SetNumberOfOutputs, sizeof(uint32_t),
+                     reinterpret_cast<const uint8_t*>(&outputs));
   return retcode_;
 }
 

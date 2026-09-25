@@ -128,6 +128,8 @@ std::string config_to_json(const Config& config) {
      << ",\n  \"nmos_enabled\": " << std::boolalpha << config.get_nmos_enabled()
      << ",\n  \"nmos_registry_address\": \""
      << escape_json(config.get_nmos_registry_address()) << "\""
+     << ",\n  \"nmos_sink_parking_address\": \""
+     << escape_json(config.get_nmos_sink_parking_address()) << "\""
      << ",\n  \"nmos_registry_port\": " << config.get_nmos_registry_port()
      << ",\n  \"nmos_node_port\": " << config.get_nmos_node_port()
      << ",\n  \"nmos_label\": \"" << escape_json(config.get_nmos_label()) << "\""
@@ -424,6 +426,9 @@ Config json_to_config_(std::istream& js, Config& config) {
         config.set_auto_sinks_update(val.get_value<bool>());
       } else if (key == "nmos_enabled") {
         config.set_nmos_enabled(val.get_value<bool>());
+      } else if (key == "nmos_sink_parking_address") {
+        config.set_nmos_sink_parking_address(
+            remove_undesired_chars(val.get_value<std::string>()));
       } else if (key == "nmos_registry_address") {
         config.set_nmos_registry_address(
             remove_undesired_chars(val.get_value<std::string>()));

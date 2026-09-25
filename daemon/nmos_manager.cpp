@@ -1602,6 +1602,21 @@ void NmosManager::apply_sender_activation(uint8_t daemon_id) {
   }
 }
 
+// The SDP with every connection address replaced by `parking` and source filters dropped:
+// same media format and channel count, but a group nothing sends to.
+static std::string park_sdp(const std::string& sdp, const std::string& parking) {
+  std::istringstream in(sdp);
+  std::ostringstream out;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.rfind("a=source-filter", 0) == 0) continue;
+    if (line.rfind("c=IN IP4 ", 0) == 0) line = "c=IN IP4 " + parking + "/15";
+    out << line << "\r\n";
+  }
+  return out.str();
+}
+
 void NmosManager::apply_receiver_activation(uint8_t daemon_id) {
   // Snapshot staged state
   bool        master_enable;
@@ -1678,12 +1693,21 @@ void NmosManager::apply_receiver_activation(uint8_t daemon_id) {
       session_manager_->add_sink(sink);
     }
   } else if (!master_enable) {
+    // Disconnect: re-point the Sink at the parking group, keeping its format and channel count,
+    // so it really leaves the old multicast group and stays a valid Sink to connect again. (The
+    // former use_sdp=false/source="" re-add failed parse_url, so the Sink kept receiving.)
     StreamSink sink;
-    if (!session_manager_->get_sink(daemon_id, sink)) {
-      sink.use_sdp = false;
-      sink.sdp     = "";
+    const auto& parking = config_->get_nmos_sink_parking_address();
+    if (!parking.empty() && !session_manager_->get_sink(daemon_id, sink) && !sink.sdp.empty()) {
+      sink.sdp     = park_sdp(sink.sdp, parking);
+      sink.use_sdp = true;
       sink.source  = "";
-      session_manager_->add_sink(sink);
+      if (auto ec = session_manager_->add_sink(sink))
+        BOOST_LOG_TRIVIAL(warning) << "NmosManager:: receiver " << +daemon_id
+                                   << " disconnect: parking the sink failed: " << ec.message();
+      else
+        BOOST_LOG_TRIVIAL(info) << "NmosManager:: receiver " << +daemon_id
+                                << " disconnected, sink parked on " << parking;
     }
   }
 

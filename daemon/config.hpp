@@ -84,6 +84,8 @@ class Config {
 
   bool get_nmos_enabled() const { return nmos_enabled_; }
   const std::string& get_nmos_registry_address() const { return nmos_registry_address_; }
+  /// Multicast group an NMOS-disconnected Sink is re-pointed at (empty = leave the Sink as is).
+  const std::string& get_nmos_sink_parking_address() const { return nmos_sink_parking_address_; }
   uint16_t get_nmos_registry_port() const { return nmos_registry_port_; }
   uint16_t get_nmos_node_port() const { return nmos_node_port_; }
   // The node's NMOS label always follows the system hostname, not the daemon.conf-configured
@@ -208,6 +210,7 @@ class Config {
 
   void set_nmos_enabled(bool v) { nmos_enabled_ = v; }
   void set_nmos_registry_address(std::string_view v) { nmos_registry_address_ = v; }
+  void set_nmos_sink_parking_address(std::string_view v) { nmos_sink_parking_address_ = v; }
   void set_nmos_registry_port(uint16_t v) { nmos_registry_port_ = v; }
   void set_nmos_node_port(uint16_t v) { nmos_node_port_ = v; }
   void set_nmos_label(std::string_view v) { nmos_label_ = v; }
@@ -301,6 +304,7 @@ class Config {
 
   bool nmos_enabled_{false};
   std::string nmos_registry_address_;
+  std::string nmos_sink_parking_address_{"239.255.255.1"};
   uint16_t nmos_registry_port_{8010};
   uint16_t nmos_node_port_{3212};
   std::string nmos_label_{"AES67 Daemon"};

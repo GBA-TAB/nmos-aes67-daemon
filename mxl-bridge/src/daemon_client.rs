@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Mirrors the C++ daemon's `StreamSource` (session_manager.hpp:38-51) / `source_to_json`
 /// (json.cpp:169-186) exactly — field names and types match the wire JSON one-to-one.
-#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct DaemonSource {
     pub id: u8,
     pub enabled: bool,
@@ -23,7 +23,7 @@ pub struct DaemonSource {
 
 /// Mirrors the C++ daemon's `StreamSink` (session_manager.hpp:53-63) / `sink_to_json`
 /// (json.cpp:188-201) exactly.
-#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct DaemonSink {
     pub id: u8,
     pub name: String,
