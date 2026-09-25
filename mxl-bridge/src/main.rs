@@ -1,4 +1,5 @@
 mod alsa_capture;
+mod rt;
 mod alsa_playback;
 mod clock;
 mod config;
@@ -119,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let state = state.clone();
         std::thread::spawn(move || {
+            rt::promote_current_thread("rx", state.cfg.rt_priority);
             if let Err(e) = alsa_capture::run(state) {
                 tracing::error!(error = %e, "RX thread exited with error");
             }
@@ -127,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let state = state.clone();
         std::thread::spawn(move || {
+            rt::promote_current_thread("tx", state.cfg.rt_priority);
             if let Err(e) = alsa_playback::run(state) {
                 tracing::error!(error = %e, "TX thread exited with error");
             }

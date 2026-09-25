@@ -1,5 +1,9 @@
 use serde::Deserialize;
 
+fn default_rt_priority() -> u8 {
+    70
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
     /// The wide RAVENNA ALSA capture device to open once at startup, at the daemon's own
@@ -8,6 +12,9 @@ pub struct Config {
     pub sample_rate: u32,
     /// ALSA period size in frames. Also the MXL sample-batch size per commit.
     pub period_frames: u32,
+    /// SCHED_FIFO priority of the capture and playback threads (`rt.rs`); 0 = normal scheduling.
+    #[serde(default = "default_rt_priority")]
+    pub rt_priority: u8,
 
     /// MXL domain directory (must live on tmpfs) where flow ring buffers are stored.
     pub mxl_domain: String,

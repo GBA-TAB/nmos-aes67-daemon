@@ -102,6 +102,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
+ "libc",
  "mxl",
  "quick-xml",
  "reqwest",

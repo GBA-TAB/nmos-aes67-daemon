@@ -1,11 +1,18 @@
 use serde::Deserialize;
 
+fn default_rt_priority() -> u8 {
+    65
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
     /// MXL domain directory (must live on tmpfs) — the same one mxl-bridge (or whatever else this
     /// app is meant to interoperate with) is configured against.
     pub mxl_domain: String,
     pub sample_rate: u32,
+    /// SCHED_FIFO priority of the engine's period thread (`rt.rs`); 0 = normal scheduling.
+    #[serde(default = "default_rt_priority")]
+    pub rt_priority: u8,
     /// ALSA-style period size in frames — also this app's own audio-engine block size and MXL
     /// sample-batch size per commit, same convention as mxl-bridge's `period_frames`.
     pub period_frames: u32,

@@ -1,4 +1,5 @@
 mod adm;
+mod rt;
 mod biquad;
 mod config;
 mod dsp;
@@ -49,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "audiomixer-engine.conf".to_string());
     let cfg = Config::load(&config_path)?;
+    let rt_priority = cfg.rt_priority;
     tracing::info!(
         tracks = cfg.tracks.len(),
         buses = cfg.buses.len(),
@@ -415,7 +417,10 @@ async fn main() -> anyhow::Result<()> {
 
     {
         let mixer = mixer.clone();
-        std::thread::spawn(move || engine::run(mixer));
+        std::thread::spawn(move || {
+            rt::promote_current_thread("engine", rt_priority);
+            engine::run(mixer)
+        });
     }
 
     // Periodic save (the redundancy story's steady-state half -- bounds how stale a resumed state
