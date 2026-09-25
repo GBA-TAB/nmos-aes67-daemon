@@ -340,6 +340,7 @@ async fn sender_patch(State(state): State<S>, Path(id): Path<String>, Json(body)
     };
     if let Some(v) = body.get("receiver_id") {
         *entry.receiver_id.lock().unwrap() = v.as_str().map(str::to_string);
+        state.notify_changed();
     }
     sender_staged(State(state), Path(id)).await
 }
@@ -400,6 +401,7 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
         *entry.reader.lock().unwrap() = None;
         *entry.flow_id.lock().unwrap() = None;
         *entry.subscribed_sender_id.lock().unwrap() = None;
+        state.notify_changed();
         return receiver_staged(State(state), Path(id)).await;
     }
 
@@ -439,6 +441,7 @@ async fn receiver_patch(State(state): State<S>, Path(id): Path<String>, Json(bod
             *entry.reader.lock().unwrap() = Some(reader);
             *entry.flow_id.lock().unwrap() = Some(flow_id);
             *entry.subscribed_sender_id.lock().unwrap() = sender_id;
+            state.notify_changed();
         }
         Err(e) => {
             // A real channel-count mismatch (the sender being subscribed to has more channels

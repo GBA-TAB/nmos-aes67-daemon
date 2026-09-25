@@ -99,8 +99,15 @@ impl FlowWriter {
         let tolerance = (self.sample_rate.numerator / 200).max(1) as u64; // 5 ms
         let index = match self.next_index {
             Some(i) if i.abs_diff(target) <= tolerance => i,
+            // Ahead of the clock (a catch-up burst after a stall): MXL refuses to write before the
+            // last committed index, so snapping back would fail every block until the clock caught
+            // up. Drop this block instead - the next ones land at the same index and realign.
+            Some(i) if i > target => {
+                tracing::debug!(accumulated_index = i, target, "MXL output ahead of the real clock, dropping a block");
+                return Ok(());
+            }
             Some(i) => {
-                tracing::warn!(accumulated_index = i, target, drift_samples = i.abs_diff(target), "MXL output index drifted from the real clock, snapping to it");
+                tracing::warn!(accumulated_index = i, target, drift_samples = target - i, "MXL output index fell behind the real clock, snapping to it");
                 target
             }
             None => target,

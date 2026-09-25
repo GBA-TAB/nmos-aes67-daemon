@@ -170,8 +170,9 @@ pub async fn run_fault_push(state: Arc<NmosState>, ip: String, mut rx: tokio::sy
 
     while rx.recv().await.is_some() {
         while rx.try_recv().is_ok() {}
+        state.bump_version();
         if let Err(e) = register_all(&client, &base, &state, &ip).await {
-            tracing::warn!(error = %e, "fault-triggered re-registration failed");
+            tracing::warn!(error = %e, "change-triggered re-registration failed");
         }
         // Coalesce any further transitions that arrive during the cooldown into the *next* pass
         // rather than firing one immediately after — bounds this loop to at most one full

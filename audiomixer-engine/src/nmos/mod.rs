@@ -48,7 +48,9 @@ pub struct NmosState {
 
     pub node_id: uuid::Uuid,
     pub device_id: uuid::Uuid,
-    node_version: (u64, u64),
+    /// Bumped on every content change (activation, fault) - IS-04 needs a higher version for any
+    /// change, the registry answers 400 "conflicts with existing registration" otherwise.
+    node_version: std::sync::Mutex<(u64, u64)>,
 
     pub output_ids: HashMap<String, OutputIds>,
 
@@ -80,7 +82,7 @@ impl NmosState {
         Self {
             node_id: crate::ids::node_id(&instance),
             device_id: crate::ids::device_id(&instance),
-            node_version: now_version(),
+            node_version: std::sync::Mutex::new(now_version()),
             domain_id,
             cfg,
             mxl_so_path,
@@ -90,11 +92,22 @@ impl NmosState {
         }
     }
 
-    /// IS-04 "version" field for the Node and Device resources, fixed at startup — none of this
-    /// app's resources change their descriptive content at runtime (only activation state does,
-    /// tracked separately on `Track`/`Bus`), matching mxl-bridge's own Phase 1 simplification.
+    /// IS-04 "version" of every resource this node registers - one shared value, bumped whenever
+    /// any of them changes (`bump_version`), same as mxl-bridge.
     pub fn version(&self) -> String {
-        version_string(self.node_version)
+        version_string(*self.node_version.lock().unwrap())
+    }
+
+    /// Advances `version()` strictly (a fast second call within the same nanosecond still moves it).
+    pub fn bump_version(&self) {
+        let mut v = self.node_version.lock().unwrap();
+        let now = now_version();
+        *v = if now > *v { now } else { (v.0, v.1 + 1) };
+    }
+
+    /// Re-registers (with a bumped version) after an IS-05 activation changed a `subscription`.
+    pub fn notify_changed(&self) {
+        let _ = self.mixer.fault_notify_tx.send(());
     }
 }
 
