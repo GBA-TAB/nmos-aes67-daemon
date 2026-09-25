@@ -51,6 +51,11 @@ pub struct Config {
     /// `mxl-bridge` app kind mounts it at `/opt/mxl-lib`, like decklink-mxl-gateway's).
     #[serde(default)]
     pub mxl_so_path: Option<String>,
+    /// File the IS-05 activations are persisted to, so connections survive a restart
+    /// (`nmos::persist`). Unset: not persisted. The orchestrator's app kind uses
+    /// `/data/activations.json` on the instance's state volume.
+    #[serde(default)]
+    pub state_path: Option<String>,
     /// Inclusive [min, max] daemon Sink id range mxl-bridge is allowed to provision into on-demand
     /// (Milestone 5) — kept disjoint from ids an operator assigns by hand through the daemon's own
     /// config/UI.

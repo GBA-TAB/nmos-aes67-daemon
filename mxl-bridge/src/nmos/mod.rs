@@ -1,5 +1,6 @@
 pub mod is08;
 pub mod mxl_transport;
+pub mod persist;
 #[cfg(test)]
 mod contract_tests;
 pub mod registration;

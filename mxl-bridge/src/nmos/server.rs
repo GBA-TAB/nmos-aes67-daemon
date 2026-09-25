@@ -305,6 +305,7 @@ async fn sender_patch(
         match state.set_sink_activation(&id, action).await {
             Ok(entry) => {
                 tracing::info!(sink_id = entry.daemon_id, active = entry.active, receiver_id = ?entry.receiver_id, "sender staged/patched");
+                super::persist::save(&state).await;
             }
             Err(e) => {
                 // BCP-007-03: an immediate activation that cannot be applied answers 500.
@@ -403,7 +404,11 @@ async fn receiver_patch(
         };
     }
 
-    if let Err(e) = state.set_source_activation(&id, active, sender_id, flow_id).await {
+    let result = state.set_source_activation(&id, active, sender_id, flow_id).await;
+    if result.is_ok() {
+        super::persist::save(&state).await;
+    }
+    if let Err(e) = result {
         tracing::error!(error = %e, "receiver activation failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

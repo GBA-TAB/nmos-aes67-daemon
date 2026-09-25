@@ -113,6 +113,8 @@ async fn main() -> anyhow::Result<()> {
     // already populated from this call — that's what actually registers them, in the right order,
     // exactly once.
     nmos::sync::apply_diff(&state, &registration_client, None, initial_state).await;
+    // Connections made before a restart come back (needs the mirrored Sinks/Sources above).
+    nmos::persist::restore(&state).await;
 
     {
         let state = state.clone();
