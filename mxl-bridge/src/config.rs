@@ -45,6 +45,12 @@ pub struct Config {
     /// (the live value from GET /api/config is authoritative once a poll succeeds).
     #[serde(default = "default_alsa_channels_fallback")]
     pub alsa_channels_fallback: u8,
+    /// Absolute path of the `libmxl.so` to load. Unset: the one cargo built next to this binary
+    /// (`target/*/build/mxl-sys-*/out/lib`). Set in containers built with `--features
+    /// mxl-not-built`, where the library is mounted from the host (mxl-orchestrator's
+    /// `mxl-bridge` app kind mounts it at `/opt/mxl-lib`, like decklink-mxl-gateway's).
+    #[serde(default)]
+    pub mxl_so_path: Option<String>,
     /// Inclusive [min, max] daemon Sink id range mxl-bridge is allowed to provision into on-demand
     /// (Milestone 5) — kept disjoint from ids an operator assigns by hand through the daemon's own
     /// config/UI.

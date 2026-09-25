@@ -43,7 +43,9 @@ fn find_mxl_so() -> anyhow::Result<std::path::PathBuf> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let config_path = std::env::args()
@@ -52,7 +54,10 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::load(&config_path)?;
     tracing::info!(?cfg, "loaded config");
 
-    let mxl_so = find_mxl_so()?;
+    let mxl_so = match &cfg.mxl_so_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => find_mxl_so()?,
+    };
     tracing::info!(?mxl_so, "resolved libmxl.so");
 
     // Startup diagnostic: confirms CLOCK_TAI actually reads (fails loudly instead of silently

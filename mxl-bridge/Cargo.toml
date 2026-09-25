@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+[features]
+# Build against MXL's headers only (no CMake/vcpkg SDK build); libmxl.so is then loaded at runtime
+# from `mxl_so_path`. Used by the container image.
+mxl-not-built = ["mxl/mxl-not-built"]
+
 [dependencies]
 mxl = { path = "../../mxl/rust/mxl" }
 

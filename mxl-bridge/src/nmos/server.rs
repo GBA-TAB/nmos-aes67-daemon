@@ -25,6 +25,8 @@ type S = Arc<NmosState>;
 /// onward, so v1.2 is now served alongside v1.1 with the exact same handlers.
 pub fn router(state: S) -> Router {
     Router::new()
+        // Liveness/readiness for mxl-orchestrator's pod probes (same endpoint as the other MXL apps).
+        .route("/healthz", get(|| async { Json(serde_json::json!({"ok": true})) }))
         .route("/x-nmos/", get(|| list(&["node/", "connection/", "channelmapping/"])))
         .route("/x-nmos", get(|| list(&["node/", "connection/", "channelmapping/"])))
         .route("/x-nmos/connection/", get(|| list(&["v1.1/", "v1.2/"])))
