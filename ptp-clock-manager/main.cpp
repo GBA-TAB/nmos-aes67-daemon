@@ -19,6 +19,7 @@
 #include <chrono>
 
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -167,6 +168,12 @@ int main(int argc, char** argv) {
     MediaClockServo mc_servo;
     std::unique_ptr<MediaClockPublisher> mc_pub;
     if (!media_clock_path.empty()) {
+        /* Real-time priority: every MXL reader holds over if the record's seqlock stays odd,
+         * so the update window must not be preempted. */
+        sched_param sp{};
+        sp.sched_priority = 60;
+        if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
+            std::perror("ptp-clock-manager: SCHED_FIFO for the media clock publisher (continuing)");
         mc_pub = std::make_unique<MediaClockPublisher>(media_clock_path);
         if (!mc_pub->open()) return 1;
         std::printf("ptp-clock-manager: publishing MXL media clock at %s\n", media_clock_path.c_str());
