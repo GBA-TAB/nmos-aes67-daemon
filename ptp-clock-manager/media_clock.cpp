@@ -54,6 +54,16 @@ MediaClockPublisher::~MediaClockPublisher() {
 
 bool MediaClockPublisher::open() {
     int fd = ::open(path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0 && errno == ENOENT) {
+        // the domain directory does not exist yet (host boot): create it, like any MXL writer
+        // would, so the record is there before the first MXL process looks for it
+        const auto slash = path_.rfind('/');
+        if (slash != std::string::npos && ::mkdir(path_.substr(0, slash).c_str(), 01777) == 0) {
+            ::chmod(path_.substr(0, slash).c_str(), 01777);
+            std::fprintf(stderr, "MediaClockPublisher: created %s\n", path_.substr(0, slash).c_str());
+        }
+        fd = ::open(path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    }
     if (fd < 0) {
         std::fprintf(stderr, "MediaClockPublisher: open %s: %s\n", path_.c_str(), std::strerror(errno));
         return false;
