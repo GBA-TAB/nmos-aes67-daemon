@@ -1,55 +1,65 @@
 use crate::config::Config;
 
-/// Fixed namespace for deriving stable (UUIDv5) resource ids from a human-readable label, mirroring
-/// the daemon's `make_resource_uuid` pattern (nmos_manager.cpp) — reproducible across restarts, no
-/// persisted state needed.
-const ID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
-    0x6d, 0x78, 0x6c, 0x2d, 0x62, 0x72, 0x69, 0x64, 0x67, 0x65, 0x2d, 0x6e, 0x73, 0x2d, 0x00, 0x00,
-]);
+// Names and ids follow `mxl-<host>-<app>-<resource>` (GBA-TAB/mxl docs/Naming.md): unique across
+// hosts running the same apps on one registry, stable across restarts. host = MXL_HOST_NICKNAME,
+// app = MXL_APP_NAME (the orchestrator's instance name; default "bridge"). Resources: `rx<nn>` for
+// daemon Sink nn's MXL source/flow/sender, `tx<nn>` for daemon Source nn's receiver,
+// `packedrx-<name>` / `packedtx-<name>` for IS-08 packed flows.
+use mxl::naming::{Kind, Naming};
 
-pub fn stable_id(name: &str) -> uuid::Uuid {
-    uuid::Uuid::new_v5(&ID_NAMESPACE, name.as_bytes())
+static NAMING: std::sync::OnceLock<Naming> = std::sync::OnceLock::new();
+
+/// This process's naming context (read from the environment once).
+pub fn naming() -> &'static Naming {
+    NAMING.get_or_init(|| Naming::from_env("bridge"))
+}
+
+pub fn sink_resource(daemon_id: u8) -> String {
+    format!("rx{daemon_id:02}")
+}
+pub fn source_resource(daemon_id: u8) -> String {
+    format!("tx{daemon_id:02}")
+}
+pub fn packed_rx_resource(name: &str) -> String {
+    format!("packedrx-{name}")
+}
+pub fn packed_tx_resource(name: &str) -> String {
+    format!("packedtx-{name}")
 }
 
 // Single source of truth for the ids that must agree between the MXL flow itself and the NMOS
-// resources describing it (nmos/resources.rs and nmos/state.rs both call these, instead of each
-// re-deriving the same string format independently and risking drift).
+// resources describing it (nmos/resources.rs and nmos/state.rs both call these).
 pub fn node_id() -> uuid::Uuid {
-    stable_id("mxl-bridge-node")
+    naming().app_id(Kind::Node)
 }
 pub fn device_id() -> uuid::Uuid {
-    stable_id("mxl-bridge-device")
+    naming().app_id(Kind::Device)
 }
-
-// Phase 2: one Source/Flow/Sender mirrors each daemon Sink, one Receiver mirrors each daemon
-// Source (see nmos/state.rs) — keyed by the daemon's own small-integer id rather than a
-// config-provided label, since these are discovered at runtime, not fixed at startup.
+// One Source/Flow/Sender mirrors each daemon Sink, one Receiver mirrors each daemon Source (see
+// nmos/state.rs) - keyed by the daemon's own small-integer id, discovered at runtime.
 pub fn sink_source_id(daemon_id: u8) -> uuid::Uuid {
-    stable_id(&format!("mxl-bridge-sink-source:{daemon_id}"))
+    naming().id(&sink_resource(daemon_id), Kind::Source)
 }
 pub fn sink_flow_id(daemon_id: u8) -> uuid::Uuid {
-    stable_id(&format!("mxl-bridge-sink-flow:{daemon_id}"))
+    naming().id(&sink_resource(daemon_id), Kind::Flow)
 }
 pub fn sink_sender_id(daemon_id: u8) -> uuid::Uuid {
-    stable_id(&format!("mxl-bridge-sink-sender:{daemon_id}"))
+    naming().id(&sink_resource(daemon_id), Kind::Sender)
 }
 pub fn source_receiver_id(daemon_id: u8) -> uuid::Uuid {
-    stable_id(&format!("mxl-bridge-source-receiver:{daemon_id}"))
+    naming().id(&source_resource(daemon_id), Kind::Receiver)
 }
-
-// Packed flows (Phase 2 plan §3/§4, nmos/is08.rs): identified by a controller-chosen `name`, not a
-// daemon id — no NMOS Sender/Receiver mirrors these, so a packed flow's own MXL flow_id isn't
-// otherwise discoverable through IS-04/05. It's deterministic instead, same convention as every
-// other id here: an app that wants to write into (or read from) mxl-bridge's packed-flow mechanism
-// computes it itself from the same `name` it used in its `/map/activations` request.
+// Packed flows (nmos/is08.rs): identified by a controller-chosen `name`. No NMOS Sender/Receiver
+// mirrors these, so an app that writes into (or reads from) them computes the id itself from the
+// same name - on the same host, with this bridge's app name (docs/Naming.md).
 pub fn packed_rx_flow_id(name: &str) -> uuid::Uuid {
-    stable_id(&format!("mxl-bridge-packed-rx-flow:{name}"))
+    naming().id(&packed_rx_resource(name), Kind::Flow)
 }
 pub fn packed_rx_source_id(name: &str) -> uuid::Uuid {
-    stable_id(&format!("mxl-bridge-packed-rx-source:{name}"))
+    naming().id(&packed_rx_resource(name), Kind::Source)
 }
 pub fn packed_tx_flow_id(name: &str) -> uuid::Uuid {
-    stable_id(&format!("mxl-bridge-packed-tx-flow:{name}"))
+    naming().id(&packed_tx_resource(name), Kind::Flow)
 }
 
 /// Builds the flow_def JSON passed to `mxlCreateFlowWriter`. This *is* an NMOS Flow resource JSON

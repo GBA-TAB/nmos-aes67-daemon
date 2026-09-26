@@ -24,7 +24,7 @@ pub fn node_json(cfg: &Config, node_id: uuid::Uuid, ip: &str, version: &str) -> 
     serde_json::json!({
         "id": node_id.to_string(),
         "version": version,
-        "label": cfg.nmos_label,
+        "label": crate::ids::naming().app_name(),
         "description": "audiomixer-engine: a third-party MXL mixer app, for testing mxl-bridge",
         "tags": {},
         "href": format!("{base}/"),
@@ -91,7 +91,7 @@ pub fn device_json(
     serde_json::json!({
         "id": device_id.to_string(),
         "version": version,
-        "label": format!("{} Device", cfg.nmos_label),
+        "label": crate::ids::naming().app_name(),
         "description": "",
         // Additive, non-standard tag naming which real MXL shared-memory domain (a directory -
         // load-bearing, not cosmetic: two apps on the same host with different domains cannot see
@@ -136,8 +136,8 @@ pub fn source_json(cfg: &Config, device_id: uuid::Uuid, entry: &OutputGridEntry,
     serde_json::json!({
         "id": source_id.to_string(),
         "version": version,
-        "label": entry.label,
-        "description": format!("audiomixer-engine output grid entry '{}'", entry.id),
+        "label": crate::ids::naming().name(&entry.resource),
+        "description": format!("{} (audiomixer-engine output grid entry '{}')", entry.label.lock().unwrap(), entry.id),
         "tags": {},
         "device_id": device_id.to_string(),
         "parents": [],
@@ -160,8 +160,8 @@ pub fn flow_json(
     serde_json::json!({
         "id": flow_id.to_string(),
         "version": version,
-        "label": entry.label,
-        "description": "",
+        "label": crate::ids::naming().name(&entry.resource),
+        "description": entry.label,
         "tags": {},
         "grain_rate": { "numerator": cfg.sample_rate, "denominator": 1 },
         "source_id": source_id.to_string(),
@@ -193,8 +193,8 @@ pub fn sender_json(
     serde_json::json!({
         "id": sender_id.to_string(),
         "version": version,
-        "label": entry.label,
-        "description": "",
+        "label": crate::ids::naming().name(&entry.resource),
+        "description": entry.label,
         "tags": {},
         "flow_id": flow_id.to_string(),
         "transport": TRANSPORT_TYPE,
@@ -220,8 +220,8 @@ pub fn receiver_json(
     serde_json::json!({
         "id": receiver_id.to_string(),
         "version": version,
-        "label": entry.label,
-        "description": format!("audiomixer-engine input grid entry '{}'", entry.id),
+        "label": crate::ids::naming().name(&entry.resource),
+        "description": format!("{} (audiomixer-engine input grid entry '{}')", entry.label.lock().unwrap(), entry.id),
         "tags": {},
         "device_id": device_id.to_string(),
         "transport": TRANSPORT_TYPE,

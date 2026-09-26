@@ -126,6 +126,8 @@ impl SourceRef {
 /// from track count (the old per-track Receiver + ephemeral `"recv:<track_id>"` entry synthesis is gone).
 pub struct InputGridEntry {
     pub id: String,
+    /// Naming resource (`gridin01-08`, ids.rs): the label and id base of its NMOS Receiver.
+    pub resource: String,
     /// `Mutex<String>`, not a plain `String` -- this entry's own block-level name is live-
     /// renamable (`amixer/{mixerId}/input/{entryId}/label`, `ws.rs`), closing the one real gap
     /// the grid CRUD design doc flagged: everything else about a grid entry (which channels it
@@ -277,6 +279,8 @@ impl InputGrid {
 /// Source+Flow+Sender (plan §14) — neither `Bus` nor `MasterTrack` has NMOS presence of its own.
 pub struct OutputGridEntry {
     pub id: String,
+    /// Naming resource (`gridout01-08`, ids.rs): the label and id base of its Source/Flow/Sender.
+    pub resource: String,
     /// `Mutex<String>` -- see `InputGridEntry.label`'s own doc comment, same live-rename gap and
     /// same fix, PUT at `amixer/{mixerId}/output/{entryId}/label`.
     pub label: Mutex<String>,
@@ -874,6 +878,7 @@ mod tests {
         for &(id, channels) in entries {
             let grid_channel_start = grid.reserve_channel_range(channels as u32);
             grid.insert(InputGridEntry {
+            resource: String::new(),
                 id: id.to_string(),
                 label: Mutex::new(id.to_string()),
                 channels,

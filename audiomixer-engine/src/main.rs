@@ -50,6 +50,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "audiomixer-engine.conf".to_string());
     let cfg = Config::load(&config_path)?;
+    // names/ids: mxl-<host>-<app>-<resource> (ids.rs, GBA-TAB/mxl docs/Naming.md)
+    ids::init(&cfg.instance_name, &cfg.bridge_app);
+    tracing::info!(app = %ids::naming().app_name(), bridge = %cfg.bridge_app, "MXL naming");
     let rt_priority = cfg.rt_priority;
     tracing::info!(
         tracks = cfg.tracks.len(),
@@ -244,8 +247,9 @@ async fn main() -> anyhow::Result<()> {
         // own doc comment for why these are deliberately two separate names).
         let channel_labels: Vec<String> =
             (0..channels).map(|i| format!("Grid In {:02}", grid_channel_start + i + 1)).collect();
+        let resource = ids::input_resource(grid_channel_start, channels);
         let channels = channels as usize;
-        let receiver_id = ids::instance_input_receiver_id(&cfg.instance_name, &entry.id);
+        let receiver_id = ids::input_receiver_id(&resource);
         let (reader, flow_id_str) = match &entry.source {
             Some(source) => {
                 let flow_id = source.resolve();
@@ -267,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
         input_grid.insert(patch::InputGridEntry {
+            resource: resource.clone(),
             id: entry.id.clone(),
             label: std::sync::Mutex::new(label),
             channels,
@@ -344,22 +349,24 @@ async fn main() -> anyhow::Result<()> {
         let label = entry.label.clone().unwrap_or_else(|| {
             format!("Grid Out {:02}-{:02}", output_grid_channel_offset + 1, output_grid_channel_offset + channels)
         });
+        let resource = ids::output_resource(output_grid_channel_offset, channels);
         output_grid_channel_offset += channels;
         let channels = channels as usize;
-        let flow_id = entry.resolve_flow_id(&cfg.instance_name);
+        let flow_id = entry.resolve_flow_id(&resource);
         let writer = FlowWriter::create(
             &cfg.mxl_domain,
             &mxl_so,
             cfg.sample_rate,
             flow_id,
-            ids::instance_output_source_id(&cfg.instance_name, &entry.id),
-            ids::device_id(&cfg.instance_name),
-            &label,
+            ids::output_source_id(&resource),
+            ids::device_id(),
+            &ids::naming().name(&resource),
             channels as u32,
         )
         .map_err(|e| anyhow::anyhow!("creating output grid entry {} ('{}') flow {flow_id}: {e}", entry.id, label))?;
         output_grid.insert(patch::OutputGridEntry {
             id: entry.id.clone(),
+            resource: resource.clone(),
             label: std::sync::Mutex::new(label.clone()),
             channels,
             layout: entry.layout,

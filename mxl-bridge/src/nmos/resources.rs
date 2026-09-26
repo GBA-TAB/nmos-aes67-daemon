@@ -23,8 +23,8 @@ pub fn node_json(state: &NmosState, ip: &str) -> serde_json::Value {
     serde_json::json!({
         "id": state.node_id.to_string(),
         "version": state.version(),
-        "label": state.cfg.nmos_label,
-        "description": "mxl-bridge: AES67/ALSA <-> MXL bridge",
+        "label": crate::mxl_flow::naming().app_name(),
+        "description": format!("{} - mxl-bridge: AES67/ALSA <-> MXL bridge", state.cfg.nmos_label),
         "tags": {},
         "href": format!("{base}/"),
         // Must be a real string per the IS-04 schema, never null (gethostname(2) failing at all is
@@ -63,8 +63,8 @@ pub fn device_json(state: &NmosState, ip: &str, sender_ids: &[uuid::Uuid], recei
     serde_json::json!({
         "id": state.device_id.to_string(),
         "version": state.version(),
-        "label": format!("{} Device", state.cfg.nmos_label),
-        "description": "",
+        "label": crate::mxl_flow::naming().app_name(),
+        "description": format!("{} Device", state.cfg.nmos_label),
         // Additive, non-standard tag naming which real MXL shared-memory domain (a directory -
         // load-bearing, not cosmetic: two apps on the same host with different domains cannot see
         // each other's flows) this Device's Sinks/Sources actually read/write. Lets an external
@@ -92,8 +92,8 @@ pub fn source_json(state: &NmosState, entry: &SinkEntrySnapshot) -> serde_json::
     serde_json::json!({
         "id": entry.source_id.to_string(),
         "version": version_string(entry.version),
-        "label": entry.label,
-        "description": format!("daemon Sink {} audio, mirrored via mxl-bridge", entry.daemon_id),
+        "label": crate::mxl_flow::naming().name(&crate::mxl_flow::sink_resource(entry.daemon_id)),
+        "description": format!("{} (daemon Sink {} audio, mirrored via mxl-bridge)", entry.label, entry.daemon_id),
         "tags": {},
         "device_id": state.device_id.to_string(),
         "parents": [],
@@ -109,8 +109,8 @@ pub fn flow_json(state: &NmosState, entry: &SinkEntrySnapshot) -> serde_json::Va
     serde_json::json!({
         "id": entry.flow_id.to_string(),
         "version": version_string(entry.version),
-        "label": entry.label,
-        "description": "",
+        "label": crate::mxl_flow::naming().name(&crate::mxl_flow::sink_resource(entry.daemon_id)),
+        "description": format!("{} (daemon Sink {})", entry.label, entry.daemon_id),
         "tags": {},
         "grain_rate": { "numerator": state.cfg.sample_rate, "denominator": 1 },
         "source_id": entry.source_id.to_string(),
@@ -130,8 +130,8 @@ pub fn sender_json(state: &NmosState, entry: &SinkEntrySnapshot) -> serde_json::
     serde_json::json!({
         "id": entry.sender_id.to_string(),
         "version": version_string(entry.version),
-        "label": entry.label,
-        "description": "",
+        "label": crate::mxl_flow::naming().name(&crate::mxl_flow::sink_resource(entry.daemon_id)),
+        "description": format!("{} (daemon Sink {})", entry.label, entry.daemon_id),
         "tags": {},
         "flow_id": entry.flow_id.to_string(),
         "transport": TRANSPORT_TYPE,
@@ -151,8 +151,8 @@ pub fn receiver_json(state: &NmosState, entry: &SourceEntrySnapshot) -> serde_js
     serde_json::json!({
         "id": entry.receiver_id.to_string(),
         "version": version_string(entry.version),
-        "label": entry.label,
-        "description": format!("feeds daemon Source {} for TX", entry.daemon_id),
+        "label": crate::mxl_flow::naming().name(&crate::mxl_flow::source_resource(entry.daemon_id)),
+        "description": format!("{} (feeds daemon Source {} for TX)", entry.label, entry.daemon_id),
         "tags": {},
         "device_id": state.device_id.to_string(),
         "transport": TRANSPORT_TYPE,

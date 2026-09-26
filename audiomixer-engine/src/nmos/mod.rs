@@ -63,7 +63,6 @@ pub struct NmosState {
 
 impl NmosState {
     pub fn new(cfg: Config, mxl_so_path: std::path::PathBuf, mixer: Arc<MixerState>, domain_id: String) -> Self {
-        let instance = cfg.instance_name.clone();
         let output_ids = mixer
             .output_grid
             .snapshot()
@@ -72,16 +71,16 @@ impl NmosState {
                 (
                     e.id.clone(),
                     OutputIds {
-                        source_id: crate::ids::instance_output_source_id(&instance, &e.id),
-                        sender_id: crate::ids::instance_output_sender_id(&instance, &e.id),
+                        source_id: crate::ids::output_source_id(&e.resource),
+                        sender_id: crate::ids::output_sender_id(&e.resource),
                     },
                 )
             })
             .collect();
 
         Self {
-            node_id: crate::ids::node_id(&instance),
-            device_id: crate::ids::device_id(&instance),
+            node_id: crate::ids::node_id(),
+            device_id: crate::ids::device_id(),
             node_version: std::sync::Mutex::new(now_version()),
             domain_id,
             cfg,

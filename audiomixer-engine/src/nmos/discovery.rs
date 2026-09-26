@@ -140,8 +140,10 @@ fn apply_diff(state: &NmosState, known: &mut HashMap<String, Candidate>, candida
                 let grid_channel_start = state.mixer.input_grid.reserve_channel_range(candidate.channels as u32);
                 let channel_labels: Vec<String> =
                     (0..candidate.channels).map(|i| format!("Grid In {:02}", grid_channel_start + i as u32 + 1)).collect();
+                let resource = crate::ids::input_resource(grid_channel_start, candidate.channels as u32);
                 state.mixer.input_grid.insert(InputGridEntry {
-                    receiver_id: crate::ids::instance_input_receiver_id(&state.cfg.instance_name, &entry_id),
+                    receiver_id: crate::ids::input_receiver_id(&resource),
+                    resource,
                     id: entry_id,
                     label: std::sync::Mutex::new(candidate.label.clone()),
                     channels: candidate.channels,

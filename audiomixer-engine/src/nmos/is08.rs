@@ -325,6 +325,7 @@ mod tests {
 
     fn test_input_entry(id: &str, channels: usize) -> InputGridEntry {
         InputGridEntry {
+            resource: String::new(),
             id: id.to_string(),
             label: Mutex::new(format!("Grid In {id}")),
             channels,

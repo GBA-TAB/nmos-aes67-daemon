@@ -294,7 +294,7 @@ impl NmosState {
                 entry.flow_id,
                 entry.source_id,
                 self.device_id,
-                &entry.label,
+                &mxl_flow::naming().name(&mxl_flow::sink_resource(entry.daemon_id)),
                 entry.channels,
             ) {
                 Ok(flow) => entry.flow = Some(flow),
@@ -347,7 +347,7 @@ impl NmosState {
                 entry.flow_id,
                 entry.source_id,
                 self.device_id,
-                &entry.label,
+                &mxl_flow::naming().name(&mxl_flow::sink_resource(entry.daemon_id)),
                 entry.channels,
             ) {
                 Ok(flow) => entry.flow = Some(flow),

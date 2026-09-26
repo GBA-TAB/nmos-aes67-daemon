@@ -471,7 +471,7 @@ async fn realize_packed_flows(state: &NmosState, is08: &Is08State) -> anyhow::Re
                 flow_id,
                 source_id,
                 state.device_id,
-                &format!("packed-rx:{name}"),
+                &mxl_flow::naming().name(&mxl_flow::packed_rx_resource(&name)),
                 slots.len() as u32,
             )
             .map_err(|e| e.context(format!("creating packed-rx flow '{name}'")))?;

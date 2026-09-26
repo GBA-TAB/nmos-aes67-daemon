@@ -46,6 +46,11 @@ pub struct Config {
     #[serde(default = "default_instance_name")]
     pub instance_name: String,
 
+    /// The mxl-bridge instance's app name on this host (its `MXL_APP_NAME`, e.g. `bridge-1`):
+    /// names the bridge flows `sink_daemon_id` / `packed_rx_name` / `packed_tx_name` refer to.
+    #[serde(default = "default_bridge_app")]
+    pub bridge_app: String,
+
     /// Where live runtime state (gain/fader/mute/solo/sends, DSP stage params, patches -- see
     /// persistence.rs) is saved to and, if it already exists, loaded from at startup. `None`
     /// (the default) disables persistence entirely -- every start is config-only, same as before
@@ -145,6 +150,10 @@ fn default_instance_name() -> String {
         String::new()
     };
     if name.is_empty() { "default".to_string() } else { name }
+}
+
+fn default_bridge_app() -> String {
+    "bridge-1".to_string()
 }
 
 fn default_channels() -> u32 {
@@ -696,11 +705,11 @@ pub struct OutputGridEntryConfig {
 impl OutputGridEntryConfig {
     /// Resolves this entry's real MXL flow_id -- identical shape to `BusConfig::resolve_flow_id`,
     /// just keyed by this entry's own string id via `ids::instance_output_flow_id`.
-    pub fn resolve_flow_id(&self, instance_name: &str) -> uuid::Uuid {
+    pub fn resolve_flow_id(&self, resource: &str) -> uuid::Uuid {
         match &self.target {
             Some(BusTarget::FlowId(s)) => s.parse().unwrap_or_else(|e| panic!("invalid flow_id '{s}': {e}")),
             Some(BusTarget::PackedTxName(name)) => crate::ids::packed_tx_flow_id(name),
-            None => crate::ids::instance_output_flow_id(instance_name, &self.id),
+            None => crate::ids::output_flow_id(resource),
         }
     }
 }
