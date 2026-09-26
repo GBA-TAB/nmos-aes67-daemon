@@ -1,5 +1,6 @@
 #include "ravenna_ptp.hpp"
 #include "phc_source.hpp"
+#include "media_clock.hpp"
 #include "clock_discipline.hpp"
 #include "shm_clock.h"
 #include "drivers/audio_clock_driver.hpp"
@@ -81,6 +82,9 @@ static void usage(const char* prog) {
         "                       ptp_source=1) from this PHC, disciplined by ptp4l (e.g. /dev/ptp0);\n"
         "                       poll interval defaults to 125 ms\n"
         "  --ptp4l-uds PATH     ptp4l's read-only management socket (default /var/run/ptp4l-ro)\n"
+        "  --media-clock PATH   with --phc: publish MXL's media clock record there (MXL_MEDIA_CLOCK),\n"
+        "                       e.g. <MXL domain>/.media-clock. --phc turns the CLOCK_TAI discipline\n"
+        "                       off (the system clock stays on NTP); --tai turns it back on\n"
         "  --help\n",
         prog);
 }
@@ -93,17 +97,28 @@ int main(int argc, char** argv) {
     std::string phc_device;
     std::string ptp4l_uds = "/var/run/ptp4l-ro";
     bool poll_given = false;
+    std::string media_clock_path;
+    bool tai_given = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--help") { usage(argv[0]); return 0; }
-        else if (a == "--no-tai")   do_tai      = false;
+        else if (a == "--no-tai")   { do_tai = false; tai_given = true; }
+        else if (a == "--tai")      { do_tai = true;  tai_given = true; }
+        else if (a == "--media-clock" && i + 1 < argc) media_clock_path = argv[++i];
         else if (a == "--pipewire") do_pipewire = true;
         else if (a == "--alsa-sink" && i + 1 < argc) alsa_sinks.push_back(argv[++i]);
         else if (a == "--poll-ms"   && i + 1 < argc) { poll_ms = static_cast<unsigned>(std::stoul(argv[++i])); poll_given = true; }
         else if (a == "--phc"       && i + 1 < argc) phc_device = argv[++i];
         else if (a == "--ptp4l-uds" && i + 1 < argc) ptp4l_uds = argv[++i];
         else { std::fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
+    }
+
+    setvbuf(stdout, nullptr, _IOLBF, 0);  /* journal gets each line as it happens, not at exit */
+    if (!phc_device.empty() && !tai_given) do_tai = false;  /* media time comes from the PHC; the system clock keeps NTP */
+    if (!media_clock_path.empty() && phc_device.empty()) {
+        std::fputs("ptp-clock-manager: --media-clock needs --phc\n", stderr);
+        return 1;
     }
 
     signal(SIGTERM, on_signal);
@@ -146,6 +161,13 @@ int main(int argc, char** argv) {
         if (!poll_given) poll_ms = 125;  /* the servo's gains assume Sync-like intervals */
         std::printf("ptp-clock-manager: external PTP mode from %s (ptp4l at %s)\n", phc_device.c_str(), ptp4l_uds.c_str());
     }
+    MediaClockServo mc_servo;
+    std::unique_ptr<MediaClockPublisher> mc_pub;
+    if (!media_clock_path.empty()) {
+        mc_pub = std::make_unique<MediaClockPublisher>(media_clock_path);
+        if (!mc_pub->open()) return 1;
+        std::printf("ptp-clock-manager: publishing MXL media clock at %s\n", media_clock_path.c_str());
+    }
     Ptp4lState p4l;
     unsigned loops = 0;
     int last_err = 0;
@@ -170,6 +192,15 @@ int main(int argc, char** argv) {
                 if (p4l.locked != was)
                     std::printf("ptp-clock-manager: ptp4l %s (offset %lld ns)\n", p4l.locked ? "locked" : "not locked",
                                 static_cast<long long>(p4l.master_offset));
+            }
+            if (mc_pub) {
+                if (auto r = phc->sample(CLOCK_MONOTONIC_RAW)) {
+                    if (mc_servo.feed(static_cast<int64_t>(r->mono_ns), static_cast<int64_t>(r->ptp_ns)))
+                        mc_pub->publish(mc_servo.mapping(), static_cast<int64_t>(r->mono_ns), p4l.locked, p4l.gmid);
+                    if (loops % 80 == 1)  /* every ~10 s */
+                        std::printf("ptp-clock-manager: media clock rate %+.3f ppm vs raw, phase error %lld ns, steps %u\n",
+                                    (mc_servo.mapping().rate - 1.0) * 1e6, static_cast<long long>(mc_servo.last_phase_error_ns()), mc_servo.steps());
+                }
             }
             if (auto s = phc->sample()) {
                 int err = ptp.send_external_sample(s->ptp_ns, s->mono_ns, p4l.gmid, p4l.locked);

@@ -21,6 +21,7 @@ set(SOURCES
     main.cpp
     ravenna_ptp.cpp
     phc_source.cpp
+    media_clock.cpp
     clock_discipline.cpp
     drivers/clock_tai_driver.cpp
     drivers/alsa_src_driver.cpp
@@ -59,3 +60,7 @@ endif()
 install(TARGETS ptp-clock-manager RUNTIME DESTINATION /usr/local/bin)
 install(FILES systemd/ptp-clock-manager.service
         DESTINATION /etc/systemd/system)
+
+# Media clock servo test (no framework: asserts, exit code)
+add_executable(media-clock-test media_clock_test.cpp media_clock.cpp)
+target_include_directories(media-clock-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -1,4 +1,4 @@
-# External PTP mode: NIC hardware timestamps for the RAVENNA driver (prototype)
+# Media clock from PTP: NIC hardware timestamps for the RAVENNA driver and MXL (prototype)
 
 Status: **prototype, not yet run end to end** (2026-09-26). Off by default; nothing changes unless
 the driver is loaded with `ptp_source=1` and ptp-clock-manager is started with `--phc`.
@@ -46,6 +46,35 @@ RAVENNA driver, ptp_source=1:       ProcessExternalSample() = a Sync (T2 = local
   `ptp_source=1` the driver ignores them.
 - **Status**: `GetPTPStatus` works as before (lock state, GMID, offset), so the daemon, its web UI
   and ptp-clock-manager's CLOCK_TAI discipline keep working.
+
+## MXL media clock (`--media-clock`)
+
+MXL's time (`mxlGetTime()`, every flow index) is `CLOCK_TAI` - the system clock, steered by NTP. The
+RAVENNA media clock follows the PTP grandmaster. With a free-running grandmaster the two drift apart
+(lab, 2026-09-26: +27 ppm), and every MXL flow bridged to 2110 slips against its hardware: mxl-bridge
+raised its tx read delay by 1 ms every few minutes and snapped its rx write index about once a minute
+per stream. NTP wander would do the same on a smaller scale even with a GPS grandmaster.
+
+So MXL gets its own clock, decoupled from the system clock (which stays on NTP):
+
+```
+ptp4l (hw timestamps) -> /dev/ptp0 -> ptp-clock-manager --phc /dev/ptp0 --media-clock <domain>/.media-clock
+                                      8 Hz: PHC vs CLOCK_MONOTONIC_RAW -> servo -> record
+MXL apps: MXL_MEDIA_CLOCK=<domain in the pod>/.media-clock  (libmxl, GBA-TAB/mxl 083e0cf1)
+          media time = refMediaNs + (CLOCK_MONOTONIC_RAW - refRawNs) * rate   (lock-free seqlock read)
+```
+
+- The record (`mxl/mediaclock.h`, mirrored in `media_clock.hpp`) lives in the MXL domain directory,
+  which every MXL pod already mounts; MXL ignores it when listing flows.
+- The servo (`MediaClockServo`) re-anchors at the current mapped time on every update, so MXL time is
+  continuous and never runs backwards, and steers the phase error out over 2 s. Only a PHC step of
+  more than 1 ms (ptp4l at startup) is followed as a jump. Test: `media-clock-test` (+27 ppm, 30 ns
+  read noise, a 5 ms step: monotonic, one re-anchor, settled error < 130 ns).
+- libmxl holds over on the last rate if updates stop; it never falls back to `CLOCK_TAI`.
+- The timescale is the grandmaster's. With a GPS-locked grandmaster that is TAI; either way MXL
+  indices then equal RTP timestamps (mod 2^32).
+- `--phc` turns ptp-clock-manager's `CLOCK_TAI` discipline off (`--tai` re-enables it): the system
+  clock stays on NTP.
 
 ## Pieces
 

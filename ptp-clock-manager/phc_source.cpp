@@ -36,18 +36,18 @@ static uint64_t now_ns(clockid_t c) {
     return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + ts.tv_nsec;
 }
 
-std::optional<PhcSample> PhcSource::sample() {
+std::optional<PhcSample> PhcSource::sample(clockid_t clock) {
     if (fd_ < 0) return std::nullopt;
     ptp_sys_offset_extended req{};
     req.n_samples = 5;
     // Kernels >= 6.13 take the system clock to bracket with in the first reserved word (clockid);
     // older ones reject a non-zero value, then REALTIME is converted below.
-    if (monotonic_ioctl_) req.rsv[0] = CLOCK_MONOTONIC;
+    if (monotonic_ioctl_) req.rsv[0] = static_cast<unsigned>(clock);
     if (ioctl(fd_, PTP_SYS_OFFSET_EXTENDED, &req) < 0) {
         if (errno == EINVAL && monotonic_ioctl_) {
             std::fputs("PhcSource: kernel brackets with CLOCK_REALTIME only - converting\n", stderr);
             monotonic_ioctl_ = false;
-            return sample();
+            return sample(clock);
         }
         std::perror("PhcSource: PTP_SYS_OFFSET_EXTENDED");
         return std::nullopt;
@@ -61,9 +61,9 @@ std::optional<PhcSample> PhcSource::sample() {
     }
     uint64_t sys = ns_of(req.ts[best][0]) + best_w / 2;
     if (!monotonic_ioctl_) {
-        // REALTIME -> MONOTONIC: both advance at the same (NTP-adjusted) rate; only a step differs.
-        uint64_t rt = now_ns(CLOCK_REALTIME), mono = now_ns(CLOCK_MONOTONIC);
-        sys = sys - rt + mono;
+        // REALTIME -> the requested clock, read back to back (good to a microsecond or so).
+        uint64_t rt = now_ns(CLOCK_REALTIME), target = now_ns(clock);
+        sys = sys - rt + target;
     }
     return PhcSample{ns_of(req.ts[best][1]), sys, static_cast<uint32_t>(best_w)};
 }

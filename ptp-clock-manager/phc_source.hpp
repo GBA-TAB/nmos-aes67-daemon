@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <ctime>
 
 /*
  * PTP time from a NIC's hardware clock (PHC) that ptp4l disciplines with hardware timestamps,
@@ -15,7 +16,7 @@
  */
 struct PhcSample {
     uint64_t ptp_ns;     /* PHC time (PTP timescale) */
-    uint64_t mono_ns;    /* CLOCK_MONOTONIC at the same instant */
+    uint64_t mono_ns;    /* the requested system clock (CLOCK_MONOTONIC by default) at the same instant */
     uint32_t window_ns;  /* width of the best read's system-time bracket (its uncertainty) */
 };
 
@@ -31,7 +32,8 @@ public:
     ~PhcSource();
 
     bool open();
-    std::optional<PhcSample> sample();
+    /* PHC against `clock`: CLOCK_MONOTONIC for the RAVENNA driver, CLOCK_MONOTONIC_RAW for MXL. */
+    std::optional<PhcSample> sample(clockid_t clock = CLOCK_MONOTONIC);
     /* Queries ptp4l; cheap enough for once a second (spawns pmc). */
     Ptp4lState ptp4l_state();
 
