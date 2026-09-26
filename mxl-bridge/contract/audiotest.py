@@ -70,6 +70,22 @@ def pod_bin():
     return "/app/mxl-bridge"
 
 
+MEDIA_CLOCK = os.environ.get("MEDIA_CLOCK_RECORD", "/dev/shm/mxl-demo-domain/.media-clock")
+MEDIA_NODE = os.environ.get("MEDIA_CLOCK_NODE", "headroom-test-worker")
+
+
+def media_minus_tai_ns():
+    """media clock - CLOCK_TAI now (0 without a media clock record): MXL indices follow the record
+    when the apps run with MXL_MEDIA_CLOCK, while capture timestamps are CLOCK_TAI."""
+    r = subprocess.run(["docker", "exec", MEDIA_NODE, "cat", MEDIA_CLOCK], capture_output=True)
+    if len(r.stdout) < 72 or struct.unpack_from("<I", r.stdout, 0)[0] != 0x434D584D:
+        return 0
+    _, _, _, _, ref_raw, ref_media, rate, _ = struct.unpack_from("<IIIIqqdq", r.stdout, 0)
+    raw = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    tai = time.clock_gettime_ns(time.CLOCK_TAI)
+    return ref_media + round((raw - ref_raw) * rate) - tai
+
+
 def capture(group, seconds):
     """RTP packets for group:5004 on the media NIC: list of (ts, seq, payload)."""
     image = "mxl-bridge:latest"
@@ -81,10 +97,12 @@ def capture(group, seconds):
     proc = subprocess.run(args + [image, "audiotest", "capture", IFACE, group, "5004", str(seconds)], capture_output=True, check=True)
     out = proc.stdout
     capture.drops = int(proc.stderr.decode().rsplit("capture_drops=", 1)[-1].split()[0]) if b"capture_drops=" in proc.stderr else None
+    # Arrival times on MXL's clock (the media clock when there is one); drift over a capture is ppm.
+    shift = media_minus_tai_ns()
     pk, i = [], 0
     while i + 16 <= len(out):
         tai, ts, seq, n = struct.unpack_from("<QIHH", out, i)
-        pk.append((ts, seq, out[i + 16:i + 16 + n], tai))
+        pk.append((ts, seq, out[i + 16:i + 16 + n], tai + shift))
         i += 16 + n
     return pk
 
@@ -121,7 +139,7 @@ def test_tx(n, seconds, binary, receivers, seed):
     flow = str(uuid.uuid4())
     gen = subprocess.Popen(["kubectl", "-n", NS, "exec", POD, "--", binary, "audiotest", "gen", CONFIG, flow, "8", str(seconds + 6), str(seed), str(BLOCK)],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    start = json.loads(gen.stdout.readline())
+    start = next(json.loads(l) for l in gen.stdout if l.startswith("{"))  # skip libmxl log lines
     staged = f"{NODE}/x-nmos/connection/v1.2/single/receivers/{rx_id}/staged"
     try:
         http("PATCH", staged, {"master_enable": True, "activation": {"mode": "activate_immediate"},
@@ -212,6 +230,8 @@ def _test_rx(n, seconds, binary, group, channels, flow):
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     pk = capture(group, seconds + 1)
     raw = dump.communicate()[0]
+    while raw and not raw.startswith(b"{"):  # libmxl log lines before the header
+        raw = raw.partition(b"\n")[2]
     head, _, body = raw.partition(b"\n")
     hdr = json.loads(head)
     nbytes = hdr["frames"] * channels * 4

@@ -100,7 +100,14 @@ class Soak:
         p = subprocess.Popen(["kubectl", "-n", A.NS, "exec", self.writer_pod, "--", self.binary, "audiotest", "gen", self.writer_cfg, flow, "8",
                               str(secs), str(SEEDS[name]), str(BLOCKS[name])],
                              stdout=subprocess.PIPE, stderr=open(os.path.join(self.out, f"gen-{name}.err"), "a"), text=True)
-        first = json.loads(p.stdout.readline())
+        # libmxl logs to stdout too (e.g. its media clock line): skip to the writer's JSON.
+        first = None
+        for line in p.stdout:
+            if line.startswith("{"):
+                first = json.loads(line)
+                break
+        if first is None:
+            raise RuntimeError(f"writer {name} exited before writing")
         threading.Thread(target=self.heartbeats, args=(name, p), daemon=True).start()
         self.gens[name] = (p, flow, first["first_index"])
         self.say(f"writer {name}: flow {flow[:8]}, seed {SEEDS[name]}, block {BLOCKS[name]}")
@@ -323,7 +330,10 @@ class Soak:
         flow = self.rx_flow(n, sinks)["flow_id"]
         r = subprocess.run(["kubectl", "-n", A.NS, "exec", self.writer_pod, "--", self.binary, "audiotest", "dump", self.writer_cfg, flow, "8", "2"],
                            capture_output=True, timeout=60)
-        head, _, body = r.stdout.partition(b"\n")
+        out = r.stdout
+        while out and not out.startswith(b"{"):  # libmxl log lines before the header
+            out = out.partition(b"\n")[2]
+        head, _, body = out.partition(b"\n")
         hdr = json.loads(head)
         nbytes = hdr["frames"] * 8 * 4
         import struct
