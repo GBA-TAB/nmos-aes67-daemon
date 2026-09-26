@@ -123,3 +123,40 @@ std::optional<RavennaPtpStatus> RavennaPtp::get_status() {
     out.ptp_offset_ns   = ptp->i64PTPOffset;
     return out;
 }
+
+int RavennaPtp::send_external_sample(uint64_t ptp_ns, uint64_t mono_ns, uint64_t gmid, bool locked) {
+    if (fd_ < 0) return -1;
+    struct {
+        struct nlmsghdr nlh;
+        struct MT_ALSA_msg msg;
+        TPTPExternalSample sample;
+    } __attribute__((packed)) req{};
+
+    req.nlh.nlmsg_len   = sizeof(req);
+    req.nlh.nlmsg_type  = NLMSG_DONE;
+    req.nlh.nlmsg_pid   = static_cast<uint32_t>(getpid());
+    req.msg.id          = MT_ALSA_Msg_SetPTPExternalSample;
+    req.msg.dataSize    = sizeof(TPTPExternalSample);
+    req.sample.ui64PTPTime   = ptp_ns;
+    req.sample.ui64LocalTime = mono_ns;
+    req.sample.ui64GMID      = gmid;
+    req.sample.ui8Locked     = locked ? 1 : 0;
+
+    struct sockaddr_nl dest{};
+    dest.nl_family = AF_NETLINK;
+    if (::sendto(fd_, &req, sizeof(req), 0, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest)) < 0) {
+        std::perror("RavennaPtp: sendto");
+        return -1;
+    }
+    // Every command gets a reply; take this command's and skip anything else, so the channel
+    // never desyncs (see the 2026-09-12 netlink fix).
+    for (int tries = 0; tries < 4; ++tries) {
+        alignas(alignof(struct nlmsghdr)) char buf[NLMSG_SPACE(MAX_PAYLOAD)];
+        ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
+        if (n < 0) return -1;
+        if (n < static_cast<ssize_t>(NLMSG_HDRLEN + sizeof(MT_ALSA_msg))) continue;
+        const auto* msg = reinterpret_cast<const MT_ALSA_msg*>(NLMSG_DATA(reinterpret_cast<const struct nlmsghdr*>(buf)));
+        if (msg->id == MT_ALSA_Msg_SetPTPExternalSample) return msg->errCode;
+    }
+    return -1;
+}

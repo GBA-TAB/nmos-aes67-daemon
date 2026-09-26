@@ -20,6 +20,7 @@ option(WITH_PIPEWIRE  "Build PipeWire AES67 driver" OFF)
 set(SOURCES
     main.cpp
     ravenna_ptp.cpp
+    phc_source.cpp
     clock_discipline.cpp
     drivers/clock_tai_driver.cpp
     drivers/alsa_src_driver.cpp

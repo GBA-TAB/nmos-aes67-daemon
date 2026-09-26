@@ -33,6 +33,11 @@ public:
     /* Query TPTPStatus from kernel module; returns nullopt on timeout/error */
     std::optional<RavennaPtpStatus> get_status();
 
+    /* External PTP mode (driver module option ptp_source=1): one (PTP time, CLOCK_MONOTONIC) pair.
+     * Returns the driver's error code (0 = taken, -401 = the driver runs its own PTP), or -1 on a
+     * transport error. */
+    int send_external_sample(uint64_t ptp_ns, uint64_t mono_ns, uint64_t gmid, bool locked);
+
 private:
     int fd_{-1};
 };

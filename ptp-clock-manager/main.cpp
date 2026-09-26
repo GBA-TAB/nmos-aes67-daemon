@@ -1,4 +1,5 @@
 #include "ravenna_ptp.hpp"
+#include "phc_source.hpp"
 #include "clock_discipline.hpp"
 #include "shm_clock.h"
 #include "drivers/audio_clock_driver.hpp"
@@ -76,6 +77,10 @@ static void usage(const char* prog) {
         "  --alsa-sink DEVICE   add ALSA SRC driver for device (e.g. hw:2)\n"
         "  --pipewire           add PipeWire AES67 driver\n"
         "  --no-tai             disable CLOCK_TAI discipline\n"
+        "  --phc DEVICE         external PTP mode: feed the RAVENNA driver (module option\n"
+        "                       ptp_source=1) from this PHC, disciplined by ptp4l (e.g. /dev/ptp0);\n"
+        "                       poll interval defaults to 125 ms\n"
+        "  --ptp4l-uds PATH     ptp4l's read-only management socket (default /var/run/ptp4l-ro)\n"
         "  --help\n",
         prog);
 }
@@ -85,6 +90,9 @@ int main(int argc, char** argv) {
     bool     do_tai     = true;
     bool     do_pipewire = false;
     std::vector<std::string> alsa_sinks;
+    std::string phc_device;
+    std::string ptp4l_uds = "/var/run/ptp4l-ro";
+    bool poll_given = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -92,7 +100,9 @@ int main(int argc, char** argv) {
         else if (a == "--no-tai")   do_tai      = false;
         else if (a == "--pipewire") do_pipewire = true;
         else if (a == "--alsa-sink" && i + 1 < argc) alsa_sinks.push_back(argv[++i]);
-        else if (a == "--poll-ms"   && i + 1 < argc) poll_ms = static_cast<unsigned>(std::stoul(argv[++i]));
+        else if (a == "--poll-ms"   && i + 1 < argc) { poll_ms = static_cast<unsigned>(std::stoul(argv[++i])); poll_given = true; }
+        else if (a == "--phc"       && i + 1 < argc) phc_device = argv[++i];
+        else if (a == "--ptp4l-uds" && i + 1 < argc) ptp4l_uds = argv[++i];
         else { std::fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
 
@@ -128,6 +138,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    /* External PTP mode: PHC (ptp4l, hardware timestamps) -> driver */
+    std::unique_ptr<PhcSource> phc;
+    if (!phc_device.empty()) {
+        phc = std::make_unique<PhcSource>(phc_device, ptp4l_uds);
+        if (!phc->open()) return 1;
+        if (!poll_given) poll_ms = 125;  /* the servo's gains assume Sync-like intervals */
+        std::printf("ptp-clock-manager: external PTP mode from %s (ptp4l at %s)\n", phc_device.c_str(), ptp4l_uds.c_str());
+    }
+    Ptp4lState p4l;
+    unsigned loops = 0;
+    int last_err = 0;
+
     /* Create SHM */
     PtpClockShm* shm = shm_create();
     if (!shm) return 1;
@@ -140,6 +162,24 @@ int main(int argc, char** argv) {
 
     while (g_running) {
         auto tick_start = std::chrono::steady_clock::now();
+
+        if (phc) {
+            if (loops++ % 8 == 0) {
+                bool was = p4l.locked;
+                p4l = phc->ptp4l_state();
+                if (p4l.locked != was)
+                    std::printf("ptp-clock-manager: ptp4l %s (offset %lld ns)\n", p4l.locked ? "locked" : "not locked",
+                                static_cast<long long>(p4l.master_offset));
+            }
+            if (auto s = phc->sample()) {
+                int err = ptp.send_external_sample(s->ptp_ns, s->mono_ns, p4l.gmid, p4l.locked);
+                if (err != last_err) {
+                    std::fprintf(stderr, "ptp-clock-manager: external sample -> driver: %d%s\n", err,
+                                 err == -401 ? " (driver not loaded with ptp_source=1)" : "");
+                    last_err = err;
+                }
+            }
+        }
 
         auto status = ptp.get_status();
         if (status) {
