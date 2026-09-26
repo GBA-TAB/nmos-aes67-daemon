@@ -24,6 +24,14 @@ fn default_rx_buffer_periods() -> u32 {
     32
 }
 
+// Host boot: the bridge pod can start before the aes67-daemon. Everything else (the capacity
+// layout, the ALSA width, the mirror) depends on the daemon, and the ALSA width cannot change once
+// the devices are open - so wait for it first (lab reboot test, 2026-09-26: without the wait the
+// bridge opened 64 of 128 channels and streams 8-15 were not bridged).
+fn default_daemon_wait_secs() -> u64 {
+    120
+}
+
 fn default_tx_mxl_delay_ms() -> f64 {
     3.0
 }
@@ -94,6 +102,10 @@ pub struct Config {
     /// latency for changes the daemon makes independently (e.g. via its own web UI).
     #[serde(default = "default_daemon_poll_interval_ms")]
     pub daemon_poll_interval_ms: u64,
+    /// How long to wait at startup for the daemon's API before falling back (see the note at the
+    /// defaults); 0 = do not wait.
+    #[serde(default = "default_daemon_wait_secs")]
+    pub daemon_wait_secs: u64,
     /// Fallback alsa_channels ceiling used only if the daemon is unreachable when mxl-bridge starts
     /// (the live value from GET /api/config is authoritative once a poll succeeds).
     #[serde(default = "default_alsa_channels_fallback")]

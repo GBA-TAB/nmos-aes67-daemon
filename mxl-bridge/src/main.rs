@@ -99,6 +99,22 @@ async fn main() -> anyhow::Result<()> {
     // ongoing polling loop below. A failure here (daemon unreachable at startup) isn't fatal:
     // fall back to the configured ceiling and start with an empty mirror set, exactly as
     // `alsa_channels_fallback`'s own doc comment (config.rs) says it's for.
+    // Wait for the daemon first: the ALSA width is fixed once the devices are open.
+    {
+        let http = reqwest::Client::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(cfg.daemon_wait_secs);
+        let mut logged = false;
+        while daemon_alsa_channels(&http, &cfg.daemon_api_url).await.is_err() && std::time::Instant::now() < deadline {
+            if !logged {
+                tracing::warn!(url = %cfg.daemon_api_url, wait_s = cfg.daemon_wait_secs, "aes67-daemon not reachable yet - waiting for it");
+                logged = true;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        if logged {
+            tracing::info!("aes67-daemon reachable (or wait over)");
+        }
+    }
     // Declared capacity first (provision.rs), so the mirror below is built from the final layout.
     if let Some(cap) = cfg.capacity.clone() {
         let http = reqwest::Client::new();
@@ -135,9 +151,11 @@ async fn main() -> anyhow::Result<()> {
     let initial_state = match daemon_client.poll_once(&daemon_client::DaemonState::default()).await {
         Ok((new_state, source_changes, sink_changes)) => daemon_client::DaemonDiff { state: new_state, source_changes, sink_changes },
         Err(e) => {
-            tracing::warn!(error = %e, "initial daemon poll failed, starting with an empty mirror set and the configured alsa_channels fallback");
+            // with a capacity layout its width is the one the daemon must run at
+            let width = cfg.capacity.as_ref().map(|c| c.alsa_channels).unwrap_or(cfg.alsa_channels_fallback as u32);
+            tracing::warn!(error = %e, alsa_channels = width, "initial daemon poll failed, starting with an empty mirror set and the fallback ALSA width");
             daemon_client::DaemonDiff {
-                state: daemon_client::DaemonState { alsa_channels: cfg.alsa_channels_fallback, ..Default::default() },
+                state: daemon_client::DaemonState { alsa_channels: width as _, ..Default::default() },
                 source_changes: Vec::new(),
                 sink_changes: Vec::new(),
             }
