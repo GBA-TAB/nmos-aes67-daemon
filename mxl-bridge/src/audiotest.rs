@@ -23,7 +23,9 @@
 //!       <to-group> + i, with TTL 0 and multicast loopback: the packets never leave the host but
 //!       reach its own RAVENNA driver, which does not receive its own transmissions otherwise.
 //!       Loads the rx side with the tx streams' audio (RTP timestamps kept) for soak tests.
-//!       <seconds> 0 = until killed. Same privileges as capture.
+//!       <seconds> 0 = until killed. Same privileges as capture. Also checks every stream's RTP
+//!       continuity and logs each irregularity (missing packets, skipped sequence numbers only,
+//!       timestamp jumps) plus a JSON "relay totals" line every 60 s on stderr.
 //!
 //! Logs go to stderr; stdout carries only the data.
 
@@ -94,12 +96,28 @@ fn generate(config: &str, flow: &str, channels: u32, seconds: f64, seed: u64, bl
     let end = next + (seconds * cfg.sample_rate as f64) as u64;
     println!("{}", serde_json::json!({ "event": "writing", "flow": flow, "first_index": next, "seed": seed, "channels": channels }));
     std::io::stdout().flush()?;
+    // Once a minute a heartbeat line: keeps an otherwise idle `kubectl exec` stream alive (the
+    // kubelet closes idle streams after 4 h) and reports how late this writer committed its blocks
+    // (lateness = how far "now" was past the block's end), to tell a late writer from a reader fault.
+    let mut beat = std::time::Instant::now();
+    let (mut max_late, mut late_over_2ms, mut blocks) = (0u64, 0u64, 0u64);
     while next < end {
         while next + block as u64 <= w.current_index() && next < end {
             let planar: Vec<Vec<f32>> =
                 (0..channels).map(|ch| (0..block as u64).map(|k| to_f32(pattern(seed, ch, next + k))).collect()).collect();
+            let late = w.current_index().saturating_sub(next + block as u64);
             w.write_at(next, &planar)?;
             next += block as u64;
+            blocks += 1;
+            max_late = max_late.max(late);
+            late_over_2ms += (late * 1000 > 2 * cfg.sample_rate as u64) as u64;
+        }
+        if beat.elapsed() >= Duration::from_secs(60) {
+            let ms = |v: u64| v as f64 * 1000.0 / cfg.sample_rate as f64;
+            println!("{}", serde_json::json!({ "event": "alive", "tai_s": tai_ns() / 1_000_000_000, "blocks": blocks, "max_late_ms": ms(max_late), "late_over_2ms": late_over_2ms }));
+            std::io::stdout().flush()?;
+            (max_late, late_over_2ms, blocks) = (0, 0, 0);
+            beat = std::time::Instant::now();
         }
         std::thread::sleep(Duration::from_micros(500));
     }
@@ -304,6 +322,54 @@ fn capture(iface: &str, group: std::net::Ipv4Addr, port: u16, seconds: f64) -> a
     Ok(())
 }
 
+/// Per-stream RTP continuity as the relay sees it (every packet this host transmits).
+#[derive(Default, Debug)]
+struct Continuity {
+    last: Option<(u16, u32)>,
+    /// RTP timestamp step of a regular packet (learned from the first consecutive pair).
+    step: u32,
+    packets: u64,
+    /// Sequence and timestamp both jump: packets really missing.
+    missing: u64,
+    /// Sequence jumps but the timestamp is continuous: only numbers skipped.
+    seq_only: u64,
+    /// Consecutive sequence, irregular timestamp.
+    ts_jump: u64,
+    /// Anything else (duplicates, reordering, restarts).
+    other: u64,
+}
+
+impl Continuity {
+    /// Returns a description of an irregularity, if this packet shows one.
+    fn packet(&mut self, seq: u16, ts: u32) -> Option<String> {
+        self.packets += 1;
+        let Some((ls, lt)) = self.last.replace((seq, ts)) else { return None };
+        let (dseq, dts) = (seq.wrapping_sub(ls), ts.wrapping_sub(lt));
+        if dseq == 1 && self.step == 0 {
+            self.step = dts;
+        }
+        if dseq == 1 && dts == self.step {
+            return None;
+        }
+        let kind = if self.step == 0 {
+            return None;
+        } else if dseq > 1 && dseq < 1000 && dts == self.step * dseq as u32 {
+            self.missing += dseq as u64 - 1;
+            "missing"
+        } else if dseq > 1 && dseq < 1000 && dts == self.step {
+            self.seq_only += dseq as u64 - 1;
+            "seq-only"
+        } else if dseq == 1 {
+            self.ts_jump += 1;
+            "ts-jump"
+        } else {
+            self.other += 1;
+            "other"
+        };
+        Some(format!("{kind} seq {ls}->{seq} ts {lt}->{ts} (step {})", self.step))
+    }
+}
+
 fn relay(iface: &str, from: std::net::Ipv4Addr, to: std::net::Ipv4Addr, count: u32, seconds: f64) -> anyhow::Result<()> {
     let (fd, ifindex) = packet_socket(iface)?;
     let tx = std::net::UdpSocket::bind("0.0.0.0:0")?;
@@ -317,11 +383,21 @@ fn relay(iface: &str, from: std::net::Ipv4Addr, to: std::net::Ipv4Addr, count: u
     anyhow::ensure!(rc == 0, "IP_MULTICAST_IF {iface}: {}", std::io::Error::last_os_error());
     let (base, dest) = (u32::from(from), u32::from(to));
     let deadline = (seconds > 0.0).then(|| std::time::Instant::now() + Duration::from_secs_f64(seconds));
-    let mut counts = vec![0u64; count as usize];
-    let mut errors = 0u64;
+    let mut streams: Vec<Continuity> = (0..count).map(|_| Continuity::default()).collect();
+    let mut last_ch0: Vec<Option<i32>> = vec![None; count as usize];
+    let (mut errors, mut drops) = (0u64, 0u64);
     let mut last_report = std::time::Instant::now();
     let mut buf = vec![0u8; 9000];
     eprintln!("relay: {from}+0..{count} -> {to}+0..{count} on {iface} (TTL 0, loopback)");
+    let report = |streams: &[Continuity], errors: u64, drops: u64, what: &str| {
+        let sum = |f: fn(&Continuity) -> u64| streams.iter().map(f).sum::<u64>();
+        eprintln!(
+            "relay {what}: {{\"t\":{},\"packets\":{},\"missing\":{},\"seq_only\":{},\"ts_jump\":{},\"other\":{},\"send_errors\":{errors},\"socket_drops\":{drops},\"per_stream_missing\":{:?}}}",
+            tai_ns() / 1_000_000_000,
+            sum(|c| c.packets), sum(|c| c.missing), sum(|c| c.seq_only), sum(|c| c.ts_jump), sum(|c| c.other),
+            streams.iter().map(|c| c.missing).collect::<Vec<_>>()
+        );
+    };
     while deadline.map_or(true, |d| std::time::Instant::now() < d) {
         let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_ll>() as u32;
@@ -329,23 +405,55 @@ fn relay(iface: &str, from: std::net::Ipv4Addr, to: std::net::Ipv4Addr, count: u
         if n > 0 && sll.sll_pkttype == libc::PACKET_OUTGOING as u8 {
             if let Some((dst, port, payload)) = udp_of(&buf[..n as usize]) {
                 let i = u32::from_be_bytes(dst).wrapping_sub(base);
-                if i < count {
+                if i < count && payload.len() >= 12 {
+                    let p = &buf[payload.clone()];
+                    let seq = u16::from_be_bytes([p[2], p[3]]);
+                    let ts = u32::from_be_bytes([p[4], p[5], p[6], p[7]]);
+                    let body = &p[12..];
+                    if let Some(what) = streams[i as usize].packet(seq, ts) {
+                        // The audio either side (L24, channel 0): whether the samples skip too or
+                        // only the timestamp does can then be checked against a known pattern.
+                        let first = body.get(..3).map(|b| i32::from_be_bytes([b[0], b[1], b[2], 0]) >> 8);
+                        eprintln!(
+                            "relay: stream {i} {what} at TAI {} | ch0 last before {:?}, first after {:?}",
+                            tai_ns() / 1_000_000,
+                            last_ch0[i as usize],
+                            first
+                        );
+                    }
+                    // Channel 0 of the last frame (8-channel L24 streams).
+                    last_ch0[i as usize] = body.len().checked_sub(24).map(|o| i32::from_be_bytes([body[o], body[o + 1], body[o + 2], 0]) >> 8);
                     let target = std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(dest + i), port);
-                    match tx.send_to(&buf[payload], target) {
-                        Ok(_) => counts[i as usize] += 1,
-                        Err(_) => errors += 1,
+                    if tx.send_to(p, target).is_err() {
+                        errors += 1;
                     }
                 }
             }
         }
         if last_report.elapsed() >= Duration::from_secs(60) {
-            eprintln!("relay: packets per stream {counts:?}, send errors {errors}");
+            drops += socket_drops(fd);
+            report(&streams, errors, drops, "totals");
             last_report = std::time::Instant::now();
         }
     }
+    drops += socket_drops(fd);
     unsafe { libc::close(fd) };
-    eprintln!("relay: done, packets per stream {counts:?}, send errors {errors}");
+    report(&streams, errors, drops, "done");
     Ok(())
+}
+
+/// Packets the kernel dropped for this AF_PACKET socket since the last call (it resets them).
+fn socket_drops(fd: i32) -> u64 {
+    #[repr(C)]
+    struct TpacketStats {
+        tp_packets: u32,
+        tp_drops: u32,
+    }
+    let mut st = TpacketStats { tp_packets: 0, tp_drops: 0 };
+    let mut len = std::mem::size_of::<TpacketStats>() as u32;
+    const PACKET_STATISTICS: i32 = 6;
+    unsafe { libc::getsockopt(fd, libc::SOL_PACKET, PACKET_STATISTICS, &mut st as *mut _ as *mut libc::c_void, &mut len) };
+    st.tp_drops as u64
 }
 
 #[cfg(test)]
@@ -361,6 +469,20 @@ mod tests {
             assert!((-(1 << 20)..(1 << 20)).contains(&v));
             assert_eq!((to_f32(v) * 8_388_608.0) as i32, v, "float32 carries 24-bit samples exactly");
         }
+    }
+
+    #[test]
+    fn continuity_classifies_gaps() {
+        let mut c = Continuity::default();
+        assert!(c.packet(10, 1000).is_none());
+        assert!(c.packet(11, 1048).is_none());
+        assert!(c.packet(14, 1192).unwrap().starts_with("missing"));
+        assert!(c.packet(16, 1240).unwrap().starts_with("seq-only"));
+        assert!(c.packet(17, 1300).unwrap().starts_with("ts-jump"));
+        assert!(c.packet(17, 1348).unwrap().starts_with("other"));
+        assert!(c.packet(u16::MAX, 1396).is_some());
+        assert!(c.packet(0, 1444).is_none(), "sequence wraps");
+        assert_eq!((c.missing, c.seq_only, c.ts_jump, c.other), (2, 1, 1, 2));
     }
 
     /// Pinned values: contract/audiotest.py asserts the same ones.

@@ -21,7 +21,7 @@ Checks:
 Output: <out>/soak.jsonl (one record per probe/sample), <out>/soak.log (readable), and
 <out>/summary.json at the end. Everything changed is restored on exit (also on SIGTERM/SIGINT).
 
-usage: soak.py --until 08:30 [--out ~/soak-<date>] [--probe-secs 150]
+usage: soak.py --until 08:30 [--out ~/soak-<date>] [--probe-secs 150] [--writer-pod sig-gen-audio-0]
 """
 import argparse, datetime, json, os, signal, subprocess, sys, threading, time, urllib.request, uuid
 
@@ -40,8 +40,13 @@ def now():
 
 
 class Soak:
-    def __init__(self, out, until):
+    def __init__(self, out, until, writer_pod=None):
         self.out, self.until = out, until
+        # Pod the pattern writers and rx dumps run in: by default the bridge's own (then they share
+        # its pinned core), better a pod on the shared CPUs with the same MXL domain.
+        self.writer_pod = writer_pod or A.POD
+        self.writer_cfg = A.CONFIG
+        self.writer_uid = None
         os.makedirs(out, exist_ok=True)
         self.jl = open(os.path.join(out, "soak.jsonl"), "a")
         self.log = open(os.path.join(out, "soak.log"), "a")
@@ -92,13 +97,39 @@ class Soak:
     def start_gen(self, name):
         flow = str(uuid.uuid4())
         secs = max(60, int(self.until - time.time()) + 900)
-        p = subprocess.Popen(["kubectl", "-n", A.NS, "exec", A.POD, "--", self.binary, "audiotest", "gen", A.CONFIG, flow, "8",
+        p = subprocess.Popen(["kubectl", "-n", A.NS, "exec", self.writer_pod, "--", self.binary, "audiotest", "gen", self.writer_cfg, flow, "8",
                               str(secs), str(SEEDS[name]), str(BLOCKS[name])],
                              stdout=subprocess.PIPE, stderr=open(os.path.join(self.out, f"gen-{name}.err"), "a"), text=True)
         first = json.loads(p.stdout.readline())
-        threading.Thread(target=lambda: p.stdout.read(), daemon=True).start()
+        threading.Thread(target=self.heartbeats, args=(name, p), daemon=True).start()
         self.gens[name] = (p, flow, first["first_index"])
         self.say(f"writer {name}: flow {flow[:8]}, seed {SEEDS[name]}, block {BLOCKS[name]}")
+
+    def heartbeats(self, name, p):
+        for line in p.stdout:
+            try:
+                hb = json.loads(line)
+            except ValueError:
+                continue
+            self.rec("writer", writer=name, **hb)
+            if hb.get("late_over_2ms"):
+                self.say(f"writer {name} late: {hb['late_over_2ms']} blocks over 2 ms (max {hb['max_late_ms']:.1f} ms) in the last minute")
+
+    def prepare_writer_pod(self):
+        """Copies the host-built binary into the writer pod and, for a pod other than the bridge,
+        gives it a config: the bridge's, with that pod's own libmxl."""
+        subprocess.run(["kubectl", "-n", A.NS, "cp", A.HOST_BIN, f"{self.writer_pod}:/tmp/mxl-bridge-audiotest"], check=True)
+        self.binary = "/tmp/mxl-bridge-audiotest"
+        if self.writer_pod == A.POD:
+            self.writer_cfg = A.CONFIG
+            return
+        cfg = json.loads(self.kubectl("exec", A.POD, "--", "cat", A.CONFIG).stdout)
+        so = self.kubectl("exec", self.writer_pod, "--", "sh", "-c", "find / -name libmxl.so 2>/dev/null | head -1").stdout.strip()
+        if so:
+            cfg["mxl_so_path"] = so
+        self.writer_cfg = "/tmp/audiotest-config.json"
+        subprocess.run(["kubectl", "-n", A.NS, "exec", "-i", self.writer_pod, "--", "sh", "-c", f"cat > {self.writer_cfg}"],
+                       input=json.dumps(cfg), text=True, check=True)
 
     def gen_for(self, n):
         return "A" if n % 2 == 0 else "B"
@@ -160,20 +191,25 @@ class Soak:
         self.saved = {"sinks": sinks, "rx_senders": senders, "tx_receivers": tx_active}
         with open(os.path.join(self.out, "saved-state.json"), "w") as f:
             json.dump(self.saved, f, indent=1, default=str)
-        self.binary = A.pod_bin()
-        self.pod_uid = self.pod_info()[A.POD][0]
+        info = self.pod_info()
+        self.pod_uid = info[A.POD][0]
+        self.writer_uid = info[self.writer_pod][0]
+        self.prepare_writer_pod()
         for g in SEEDS:
             self.start_gen(g)
         self.connect_tx()
         self.start_relay()
         self.point_sinks()
         self.activate_rx_senders()
+        self.say(f"writers and rx dumps in pod {self.writer_pod}")
         self.say(f"load up: 16 tx (writers A/B, tx {sorted(KEEP_TX)} kept), 16 rx via relay; until {datetime.datetime.fromtimestamp(self.until):%H:%M}")
 
     def teardown(self):
         self.say("teardown: restoring routes, Sinks, senders; stopping writers and relay")
         for name, (p, _, _) in self.gens.items():
             p.terminate()
+        with open(os.path.join(self.out, "relay.log"), "a") as f:
+            subprocess.run(["docker", "logs", RELAY_NAME], stdout=f, stderr=subprocess.STDOUT)
         subprocess.run(["docker", "rm", "-f", RELAY_NAME], capture_output=True)
         if not self.saved:
             return
@@ -209,11 +245,23 @@ class Soak:
                 except Exception:
                     time.sleep(2)
             self.pod_uid = uid
-            self.binary = A.pod_bin()
+            if self.writer_pod == A.POD:
+                self.writer_uid = uid
+                self.prepare_writer_pod()
             for g in SEEDS:
                 self.start_gen(g)
             self.connect_tx()
             self.activate_rx_senders()
+        wuid = info.get(self.writer_pod, (None,))[0]
+        if self.writer_pod != A.POD and wuid != self.writer_uid:
+            self.event("writer pod replaced", old=self.writer_uid, new=wuid)
+            self.writer_uid = wuid
+            time.sleep(10)
+            self.prepare_writer_pod()
+            for g in SEEDS:
+                self.gens[g][0].terminate()
+                self.start_gen(g)
+            self.connect_tx()
         for g, (p, _, _) in list(self.gens.items()):
             if p.poll() is not None:
                 self.event("writer exited", writer=g, code=p.returncode)
@@ -273,7 +321,7 @@ class Soak:
         seed = SEEDS[g]
         sinks = {s["id"]: s for s in A.http("GET", f"{A.DAEMON}/api/sinks")["sinks"]}
         flow = self.rx_flow(n, sinks)["flow_id"]
-        r = subprocess.run(["kubectl", "-n", A.NS, "exec", A.POD, "--", self.binary, "audiotest", "dump", A.CONFIG, flow, "8", "2"],
+        r = subprocess.run(["kubectl", "-n", A.NS, "exec", self.writer_pod, "--", self.binary, "audiotest", "dump", self.writer_cfg, flow, "8", "2"],
                            capture_output=True, timeout=60)
         head, _, body = r.stdout.partition(b"\n")
         hdr = json.loads(head)
@@ -328,6 +376,9 @@ class Soak:
         try:
             ptp = A.http("GET", f"{A.DAEMON}/api/ptp/status")
             out["ptp"] = ptp.get("status")
+            # The driver's worst 1 ms tick wake-up lateness since the daemon last asked (us): a
+            # tick more than a frame late skips 1 ms of RTP time on every tx stream.
+            out["ptp_jitter_us"] = ptp.get("jitter")
         except Exception as e:
             out["ptp"] = f"error {e}"
         k = subprocess.run(["journalctl", "-k", "--since", "-61s", "--no-pager", "-q"], capture_output=True, text=True).stdout.splitlines()
@@ -336,6 +387,15 @@ class Soak:
         out["kernel_lines"] = len(kern)
         if kern:
             out["kernel_sample"] = [l[-200:] for l in kern[:3]]
+        rl = subprocess.run(["docker", "logs", "--since", "61s", RELAY_NAME], capture_output=True, text=True)
+        rlines = (rl.stdout + rl.stderr).splitlines()
+        gaps = [l for l in rlines if l.startswith("relay: stream")]
+        out["rtp_irregular"] = len(gaps)
+        if gaps:
+            out["rtp_irregular_sample"] = gaps[:5]
+        tot = [l for l in rlines if l.startswith("relay totals:")]
+        if tot:
+            out["relay_totals"] = json.loads(tot[-1].split(": ", 1)[1])
         out["load"] = open("/proc/loadavg").read().split()[:3]
         self.rec("sample", **out)
         flag = []
@@ -345,9 +405,11 @@ class Soak:
             flag.append(f"{len(warn)} bridge WARN/ERROR")
         if kern:
             flag.append(f"{len(kern)} kernel lines: {kern[0][-120:]}")
+        if gaps:
+            flag.append(f"{len(gaps)} RTP irregularities: {gaps[0][7:]}")
         if out.get("ptp") not in ("locked",):
             flag.append(f"ptp {out.get('ptp')}")
-        self.say(f"sample cpu {out.get('bridge_cpu_pct')}% load {' '.join(out['load'])}" + (" | " + "; ".join(flag) if flag else " | ok"))
+        self.say(f"sample cpu {out.get('bridge_cpu_pct')}% tick jitter {out.get('ptp_jitter_us')} us load {' '.join(out['load'])}" + (" | " + "; ".join(flag) if flag else " | ok"))
         return out
 
     def run(self, probe_secs):
@@ -414,6 +476,7 @@ def main():
     ap.add_argument("--until", required=True, help="HH:MM (next occurrence) or seconds from now (e.g. 600s)")
     ap.add_argument("--out", default=os.path.expanduser(f"~/soak-{datetime.date.today():%Y%m%d}"))
     ap.add_argument("--probe-secs", type=float, default=150)
+    ap.add_argument("--writer-pod", help="pod (same MXL domain) to run the pattern writers and rx dumps in; default the bridge's own")
     a = ap.parse_args()
     if a.until.endswith("s"):
         until = time.time() + float(a.until[:-1])
@@ -423,7 +486,7 @@ def main():
         if t <= datetime.datetime.now():
             t += datetime.timedelta(days=1)
         until = t.timestamp()
-    s = Soak(a.out, until)
+    s = Soak(a.out, until, a.writer_pod)
 
     def stop(*_):
         s.stopping = True
