@@ -81,7 +81,8 @@ static void usage(const char* prog) {
         "  --phc DEVICE         external PTP mode: feed the RAVENNA driver (module option\n"
         "                       ptp_source=1) from this PHC, disciplined by ptp4l (e.g. /dev/ptp0);\n"
         "                       poll interval defaults to 125 ms\n"
-        "  --ptp4l-uds PATH     ptp4l's read-only management socket (default /var/run/ptp4l-ro)\n"
+        "  --ptp4l-uds PATH     ptp4l's read-only management socket (default /var/run/ptp4lro)\n"
+        "  --ptp-domain N       ptp4l's PTP domain, for its management queries (default 0)\n"
         "  --media-clock PATH   with --phc: publish MXL's media clock record there (MXL_MEDIA_CLOCK),\n"
         "                       e.g. <MXL domain>/.media-clock. --phc turns the CLOCK_TAI discipline\n"
         "                       off (the system clock stays on NTP); --tai turns it back on\n"
@@ -95,7 +96,8 @@ int main(int argc, char** argv) {
     bool     do_pipewire = false;
     std::vector<std::string> alsa_sinks;
     std::string phc_device;
-    std::string ptp4l_uds = "/var/run/ptp4l-ro";
+    std::string ptp4l_uds = "/var/run/ptp4lro";  /* linuxptp's read-only management socket */
+    int ptp_domain = 0;
     bool poll_given = false;
     std::string media_clock_path;
     bool tai_given = false;
@@ -111,6 +113,7 @@ int main(int argc, char** argv) {
         else if (a == "--poll-ms"   && i + 1 < argc) { poll_ms = static_cast<unsigned>(std::stoul(argv[++i])); poll_given = true; }
         else if (a == "--phc"       && i + 1 < argc) phc_device = argv[++i];
         else if (a == "--ptp4l-uds" && i + 1 < argc) ptp4l_uds = argv[++i];
+        else if (a == "--ptp-domain" && i + 1 < argc) ptp_domain = std::stoi(argv[++i]);
         else { std::fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
 
@@ -156,7 +159,7 @@ int main(int argc, char** argv) {
     /* External PTP mode: PHC (ptp4l, hardware timestamps) -> driver */
     std::unique_ptr<PhcSource> phc;
     if (!phc_device.empty()) {
-        phc = std::make_unique<PhcSource>(phc_device, ptp4l_uds);
+        phc = std::make_unique<PhcSource>(phc_device, ptp4l_uds, ptp_domain);
         if (!phc->open()) return 1;
         if (!poll_given) poll_ms = 125;  /* the servo's gains assume Sync-like intervals */
         std::printf("ptp-clock-manager: external PTP mode from %s (ptp4l at %s)\n", phc_device.c_str(), ptp4l_uds.c_str());

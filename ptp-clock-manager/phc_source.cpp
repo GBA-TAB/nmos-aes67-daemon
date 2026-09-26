@@ -10,8 +10,8 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-PhcSource::PhcSource(std::string device, std::string ptp4l_uds)
-    : device_(std::move(device)), uds_(std::move(ptp4l_uds)) {}
+PhcSource::PhcSource(std::string device, std::string ptp4l_uds, int ptp_domain)
+    : device_(std::move(device)), uds_(std::move(ptp4l_uds)), domain_(ptp_domain) {}
 
 PhcSource::~PhcSource() {
     if (fd_ >= 0) ::close(fd_);
@@ -72,8 +72,8 @@ Ptp4lState PhcSource::ptp4l_state() {
     Ptp4lState st;
     char cmd[512];
     std::snprintf(cmd, sizeof(cmd),
-                  "pmc -u -b 0 -s '%s' -i /tmp/ptp-clock-manager.pmc 'GET TIME_STATUS_NP' 2>/dev/null",
-                  uds_.c_str());
+                  "pmc -u -b 0 -d %d -s '%s' -i /tmp/ptp-clock-manager.pmc 'GET TIME_STATUS_NP' 2>/dev/null",
+                  domain_, uds_.c_str());
     FILE* p = popen(cmd, "r");
     if (!p) return st;
     char line[256];
@@ -95,6 +95,12 @@ Ptp4lState PhcSource::ptp4l_state() {
         }
     }
     pclose(p);
+    // ptp4l drops management messages for another domain without a word: say so once.
+    if (!have_offset && !warned_silent_) {
+        std::fprintf(stderr, "PhcSource: no answer from ptp4l at %s for domain %d (running? --ptp-domain?)\n", uds_.c_str(), domain_);
+        warned_silent_ = true;
+    }
+    if (have_offset) warned_silent_ = false;
     // Locked: a grandmaster is present and ptp4l's servo has pulled the PHC within 1 us of it.
     st.locked = gm_present && have_offset && std::llabs(st.master_offset) < 1000;
     return st;

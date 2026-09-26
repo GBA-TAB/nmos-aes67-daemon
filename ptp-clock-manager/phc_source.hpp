@@ -28,7 +28,7 @@ struct Ptp4lState {
 
 class PhcSource {
 public:
-    PhcSource(std::string device, std::string ptp4l_uds);
+    PhcSource(std::string device, std::string ptp4l_uds, int ptp_domain);
     ~PhcSource();
 
     bool open();
@@ -42,6 +42,8 @@ public:
 private:
     std::string device_;
     std::string uds_;
+    int domain_;
+    bool warned_silent_{false};
     int fd_{-1};
     bool monotonic_ioctl_{true}; /* the kernel takes clockid = CLOCK_MONOTONIC; else convert from REALTIME */
 };

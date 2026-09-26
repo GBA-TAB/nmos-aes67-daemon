@@ -82,7 +82,7 @@ MXL apps: MXL_MEDIA_CLOCK=<domain in the pod>/.media-clock  (libmxl, GBA-TAB/mxl
 |---|---|
 | driver | module option `ptp_source` (0 default / 1), `ProcessExternalSample()` in `PTP.c`, command in `manager.c` |
 | shared header | `MT_ALSA_Msg_SetPTPExternalSample` appended (existing ids unchanged), `TPTPExternalSample` |
-| ptp-clock-manager | `--phc DEVICE`, `--ptp4l-uds PATH` (default `/var/run/ptp4l-ro`), `phc_source.cpp` |
+| ptp-clock-manager | `--phc DEVICE`, `--ptp4l-uds PATH` (default `/var/run/ptp4lro`), `--ptp-domain N` (ptp4l's domain), `phc_source.cpp` |
 | ptp4l | `phc-mode/ptp4l.conf`: slave only, hardware timestamps, `priority1`/`clockClass` 255 |
 
 ## Trying it (root)
@@ -94,7 +94,7 @@ sudo ptp4l -f ptp-clock-manager/phc-mode/ptp4l.conf -m
 sudo modprobe -r MergingRavennaALSA
 sudo modprobe MergingRavennaALSA ptp_source=1 audio_cpu_affinity=6
 # 3. ptp-clock-manager feeding it (as root for /dev/ptp0; the service user needs a udev rule, below)
-sudo ./build/ptp-clock-manager --phc /dev/ptp0
+sudo ./build/ptp-clock-manager --phc /dev/ptp0 --ptp-domain 127
 # 4. start aes67-daemon; PTP status should read locked, GMID = the grandmaster
 ```
 
