@@ -37,7 +37,9 @@ pub struct Config {
     #[serde(default = "default_meter_hz")]
     pub meter_hz: f64,
 
-    /// Identifies this app instance for deriving bus flow ids when a bus has no explicit `target`
+    /// Identifies this app instance: node, device, receiver and output flow ids derive from it, so
+    /// it must be unique per instance on a shared registry. Default: the host name (see
+    /// `default_instance_name`). For deriving bus flow ids when a bus has no explicit `target`
     /// (see `BusTarget`/`ids::instance_bus_flow_id`) — set this to the pod name (Kubernetes'
     /// downward API exposes it as `$(POD_NAME)`) so replicas in a container/Kubernetes deployment
     /// each get distinct bus flows without any per-replica config authoring.
@@ -127,8 +129,22 @@ fn default_nmos_registry_port() -> u16 {
     80
 }
 
+/// The host name: the pod name in Kubernetes (stable per StatefulSet replica, e.g.
+/// `mxl-audiomixer-0`), the machine name elsewhere. Unique per instance and reproducible across
+/// restarts. The old default, the literal "default", gave every instance started without an
+/// explicit name (the orchestrator starts the binary directly, bypassing docker-entrypoint.sh, and
+/// a Mac build did the same) identical node/device/sender/flow ids: in a shared registry the last
+/// one to register replaced the other (2026-09-26: the lab mixer vanished behind a Mac's).
 fn default_instance_name() -> String {
-    "default".to_string()
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    let name = if rc == 0 {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).trim().to_string()
+    } else {
+        String::new()
+    };
+    if name.is_empty() { "default".to_string() } else { name }
 }
 
 fn default_channels() -> u32 {
