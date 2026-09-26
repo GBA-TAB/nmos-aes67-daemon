@@ -183,8 +183,10 @@ mirrors whatever streams the daemon has. The lab layout, 128 channels each way (
   played stale audio (repeated old periods). 48 x 4 is verified; re-run the tx audiotest after changing
   either.
 - **Measured** (audiotest, sample-exact alignment): tx MXL-commit -> wire about **12 ms** with a 1 ms
-  writer, about 13 ms from the audiomixer (2 ms periods); rx wire -> readable in MXL about **1 ms** on
-  top of the daemon's playout `delay`.
+  writer, about 13 ms from the audiomixer (2 ms periods), 18-23 ms from a 10 ms-block writer. Soak
+  (6 h 45 min, 2026-09-26): MXL -> wire -> MXL round trip median **37.6 ms** (27.8-75 ms), i.e. rx
+  about 18 ms of which 12 ms is the playout `delay`. (An earlier "rx about 1 ms" was measured while
+  the too-small capture buffer made the delay wrap to nothing, see above.)
 - **RT threads** need CAP_SYS_NICE: the image sets it on the binary as a *permitted* file capability
   (`setcap cap_sys_nice+p`, after the `chown` - chown clears capabilities) and `rt.rs` raises it with
   `capset` before `sched_setscheduler`; the orchestrator's pod template adds `SYS_NICE`. Without it the
@@ -249,7 +251,12 @@ MXL index of the same sample (tx), or against when that index became readable in
 - rx content over an NMOS connection: the control matrix's only transmitting 2110 audio sender in the
   lab was silent; rx bit-exactness is verified with a Mac RAVENNA stream and the soak's relay.
 - IS-08 channel mapping on the bridge's packed 8-channel flows.
-- Sustained load: `soak.py` (first overnight run 2026-09-26).
+- Soak findings to resolve (first overnight run 2026-09-26, 81 tx + 81 rx probes, 74 + 78 PASS):
+  - tx: 5 probes saw 3-7 RTP packets missing in 2 s (sequence gaps, no capture drops) - not yet
+    known whether the driver skips them or the capture misses them;
+  - tx: each self-tuning read-delay step (a writer late by more than the current delay) skips 1 ms
+    of audio; the rx failures were those skips seen on the round trip. Writers in the bridge's own
+    pod on its pinned core, so possibly the test writers' fault.
 - Cross-host MXL (Fabrics/RDMA).
 
 ## Building
