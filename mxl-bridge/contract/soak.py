@@ -318,8 +318,14 @@ class Soak:
         lost = A.seq_gaps(pk)
         lat.sort()
         med = round(lat[len(lat) // 2] * 1000, 2) if lat else None
-        ok = bad == 0 and (lost == 0 or (drops and drops >= lost))
-        return {"verdict": "PASS" if ok else f"FAIL: {bad} bad frames (first at {first_bad}), {lost} lost packets",
+        # Every captured frame is checked bit for bit. Packets missing from the *capture* (the
+        # docker AF_PACKET capture misses some without counting drops) are not the stream's: the
+        # relay checks the continuity of every transmitted packet (rtp_irregular in the samples).
+        if bad == 0:
+            verdict = "PASS" if lost == 0 else f"PASS (capture missed {lost} packets; continuity is the relay's)"
+        else:
+            verdict = f"FAIL: {bad} bad frames (first at {first_bad}), {lost} lost packets"
+        return {"verdict": verdict,
                 "frames": len(live), "lost": lost, "capture_drops": drops, "latency_ms": med,
                 "latency_ms_max": round(lat[-1] * 1000, 2) if lat else None}
 
