@@ -23,7 +23,7 @@ Output: <out>/soak.jsonl (one record per probe/sample), <out>/soak.log (readable
 
 usage: soak.py --until 08:30 [--out ~/soak-<date>] [--probe-secs 150] [--writer-pod sig-gen-audio-0]
 """
-import argparse, datetime, json, os, signal, subprocess, sys, threading, time, urllib.request, uuid
+import argparse, datetime, json, os, re, signal, subprocess, sys, threading, time, urllib.request, uuid
 
 import audiotest as A
 
@@ -369,9 +369,13 @@ class Soak:
             self.cpu_prev = (t, u)
         except Exception:
             pass
-        logs = self.kubectl("logs", A.POD, "--since=61s").stdout.splitlines()
+        # the bridge logs with colour codes: strip them, or " WARN " never matches
+        logs = [re.sub(r"\x1b\[[0-9;]*m", "", l) for l in self.kubectl("logs", A.POD, "--since=61s").stdout.splitlines()]
         warn = [l for l in logs if " WARN " in l or " ERROR " in l]
         out["bridge_warn"] = len(warn)
+        out["rx_index_snaps"] = sum("drifted from the real clock" in l for l in logs)
+        out["tx_delay_steps"] = sum("tx read delay raised" in l for l in logs)
+        out["write_errors"] = sum("failed to write samples" in l for l in logs)
         if warn:
             out["bridge_warn_sample"] = [l[-220:] for l in warn[:3]]
         bad = {}
@@ -412,7 +416,9 @@ class Soak:
         if bad:
             flag.append(f"sinks {bad}")
         if warn:
-            flag.append(f"{len(warn)} bridge WARN/ERROR")
+            flag.append(f"{len(warn)} bridge WARN/ERROR (rx snaps {out['rx_index_snaps']}, write errors {out['write_errors']})")
+        if out["tx_delay_steps"]:
+            flag.append(f"{out['tx_delay_steps']} tx delay steps")
         if kern:
             flag.append(f"{len(kern)} kernel lines: {kern[0][-120:]}")
         if gaps:
