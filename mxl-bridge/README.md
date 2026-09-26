@@ -251,13 +251,17 @@ MXL index of the same sample (tx), or against when that index became readable in
 - rx content over an NMOS connection: the control matrix's only transmitting 2110 audio sender in the
   lab was silent; rx bit-exactness is verified with a Mac RAVENNA stream and the soak's relay.
 - IS-08 channel mapping on the bridge's packed 8-channel flows.
-- Soak findings to resolve (first overnight run 2026-09-26, 81 tx + 81 rx probes, 74 + 78 PASS):
-  - tx: 5 probes saw 3-7 RTP packets missing in 2 s (sequence gaps, no capture drops) - not yet
-    known whether the driver skips them or the capture misses them;
-  - tx: each self-tuning read-delay step (a writer late by more than the current delay) skips 1 ms
-    of audio; the rx failures were those skips seen on the round trip. Writers in the bridge's own
-    pod on its pinned core, so possibly the test writers' fault.
-- Cross-host MXL (Fabrics/RDMA).
+- Soak findings, **resolved** (2026-09-26):
+  - the tx "lost packets" were the test capture's: the relay's continuity check counted every one
+    of 111 M transmitted packets and none were missing;
+  - the 1 ms RTP timestamp jumps were the RAVENNA driver's timer waking late. Fixed by pinning the
+    timer and giving its softirq thread real-time priority (mxl-stack `host` step);
+  - the tx read-delay creep and the rx index snaps were MXL (`CLOCK_TAI`, NTP) and the audio
+    hardware (PTP) running 27 ppm apart. Fixed by the media clock: MXL time from PTP
+    (GBA-TAB/mxl `docs/MediaClock.md`).
+
+  2-hour soak after all three fixes: tx 24/24 and rx 23/23 bit-exact, no rx snaps or write errors,
+  tx latency flat at 21-25 ms, 0 RTP irregularities.
 
 ## Building
 
