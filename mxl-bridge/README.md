@@ -241,6 +241,15 @@ silent sender passes as "connection verified"), rx-disconnect (Sink parked, not 
 what it changed. Env: `REMOS`, `ORCH`, `DAEMON_NODE`, plus audiotest's `BRIDGE_POD`, `BRIDGE_NODE`,
 `DAEMON`, `IFACE`, `BRIDGE_BIN`.
 
+The tools find the bridge's resources by name and derive other apps' ids, following
+`mxl-<host>-<domain>-<app>-<resource>` (GBA-TAB/mxl `docs/Naming.md`; `audiotest.mxl_name` and
+`mxl_id` are the Python twin of `mxl::naming`): tx n's receiver is `…-bridge-1-tx<nn>`, rx n's sender
+`…-bridge-1-rx<nn>`, IS-08 packed flows `…-packedrx-<name>` / `…-packedtx-<name>`, Test Tones
+`…-sig-gen-audio-audio`, Grid Out `…-audiomixer-gridout01-08`. Env: `MXL_HOST_NICKNAME` (default
+`caspar`), `MXL_DOMAIN_NICKNAME` (default `demo`), `BRIDGE_APP` (default `bridge-1`), and for
+`nmos_control.py` `SIGGEN_APP`, `MIXER_APP`. Old daemon-style labels ("ALSA Source n") are still
+accepted.
+
 Samples are aligned by content (the pattern for tx, the dumped flow for rx) at one constant RTP/MXL
 offset, since the lab grandmaster's epoch is not TAI (RTP time and the MXL index differ by a constant).
 Latency is then timed on the host's own clock: packet arrival (CLOCK_TAI, from the capture) against the
