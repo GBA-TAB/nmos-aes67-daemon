@@ -23,7 +23,7 @@ usage:
 env: BRIDGE_POD (mxl-bridge-1-0), BRIDGE_NODE (http://172.30.3.214:3213), DAEMON (http://localhost:8080),
      IFACE (enp4s0), BRIDGE_BIN (host-built mxl-bridge to copy into the pod; default: the pod's own)
 """
-import argparse, bisect, json, os, struct, subprocess, sys, tempfile, time, urllib.request, uuid
+import argparse, bisect, json, os, re, struct, subprocess, sys, tempfile, time, urllib.request, uuid
 
 POD = os.environ.get("BRIDGE_POD", "mxl-bridge-1-0")
 NS = os.environ.get("NAMESPACE", "mxl-orchestrator")
@@ -68,6 +68,32 @@ def pod_bin():
         subprocess.run(["kubectl", "-n", NS, "cp", HOST_BIN, f"{POD}:/tmp/mxl-bridge-audiotest"], check=True)
         return "/tmp/mxl-bridge-audiotest"
     return "/app/mxl-bridge"
+
+
+# MXL names (GBA-TAB/mxl docs/Naming.md): mxl-<host>-<app>-<resource>, ids UUIDv5(NS, "<name>#<kind>")
+HOST_NICKNAME = os.environ.get("MXL_HOST_NICKNAME", "caspar")
+BRIDGE_APP = os.environ.get("BRIDGE_APP", "bridge-1")
+NAMING_NS = uuid.uuid5(uuid.NAMESPACE_URL, "urn:x-mxl:naming:v1")
+
+
+def _norm(part):
+    part = re.sub(r"[^a-z0-9]+", "-", part.lower()).strip("-")
+    return part
+
+
+def mxl_name(app, resource=None, host=None):
+    app = _norm(app)
+    app = app[4:] if app.startswith("mxl-") else app
+    parts = ["mxl", _norm(host or HOST_NICKNAME), app] + ([_norm(resource)] if resource else [])
+    return "-".join(parts)
+
+
+def mxl_id(name, kind):
+    return str(uuid.uuid5(NAMING_NS, f"{name}#{kind}"))
+
+
+def bridge_name(resource):
+    return mxl_name(BRIDGE_APP, resource)
 
 
 MEDIA_CLOCK = os.environ.get("MEDIA_CLOCK_RECORD", "/dev/shm/mxl-demo-domain/.media-clock")
@@ -126,7 +152,7 @@ def near64(ref, low32):
 
 
 def receiver_for_tx(n, receivers):
-    names = {f"Bridge TX {n + 1}", f"ALSA Source {n}"}
+    names = {bridge_name(f"tx{n:02}"), f"Bridge TX {n + 1}", f"ALSA Source {n}"}
     for r in receivers:
         if r["label"] in names:
             return r["id"]
@@ -207,8 +233,8 @@ def test_rx(n, seconds, binary):
     channels = len(sinks[n]["map"])
     senders = http("GET", f"{NODE}/x-nmos/node/v1.3/senders/")
     flows = {f["id"]: f for f in http("GET", f"{NODE}/x-nmos/node/v1.3/flows/")}
-    label = sinks[n]["name"]
-    sender = next((s for s in senders if s["label"] == label), None)
+    label = bridge_name(f"rx{n:02}")
+    sender = next((s for s in senders if s["label"] in (label, sinks[n]["name"])), None)
     if not sender:
         raise SystemExit(f"no bridge MXL Sender labelled {label!r}")
     flow = sender["flow_id"]

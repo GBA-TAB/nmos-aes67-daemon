@@ -16,13 +16,12 @@ constant per-stream offset). Then, through the bridge's IS-08 API:
 
 usage: is08_test.py [--writer-pod sig-gen-audio-0]
 """
-import argparse, json, os, struct, subprocess, sys, time, urllib.error, urllib.request, uuid
+import argparse, json, os, struct, subprocess, sys, time, urllib.error, urllib.request
 
 import audiotest as A
 import soak as S
 
 MAP = f"{A.NODE}/x-nmos/channelmapping/v1.0"
-ID_NAMESPACE = uuid.UUID(bytes=bytes([0x6d, 0x78, 0x6c, 0x2d, 0x62, 0x72, 0x69, 0x64, 0x67, 0x65, 0x2d, 0x6e, 0x73, 0x2d, 0x00, 0x00]))
 RX_NAME, TX_NAME = "is08test", "is08tx"
 RX_SINKS = [0, 3, 5, 6, 9, 12, 14, 15]   # packed channel k <- Sink RX_SINKS[k] ...
 RX_CH = [7, 6, 5, 4, 3, 2, 1, 0]         # ... channel RX_CH[k]
@@ -99,8 +98,8 @@ def main():
     try:
         s.setup()
         time.sleep(20)  # past the setup transient: re-pointed Sinks re-anchor their rx indices once
-        rx_flow = str(uuid.uuid5(ID_NAMESPACE, f"mxl-bridge-packed-rx-flow:{RX_NAME}"))
-        tx_flow = str(uuid.uuid5(ID_NAMESPACE, f"mxl-bridge-packed-tx-flow:{TX_NAME}"))
+        rx_flow = A.mxl_id(A.bridge_name(f"packedrx-{RX_NAME}"), "flow")
+        tx_flow = A.mxl_id(A.bridge_name(f"packedtx-{TX_NAME}"), "flow")
         out_rx = f"packed-rx:{RX_NAME}"
 
         print("== rx: packing 8 Sinks' channels into one MXL flow")

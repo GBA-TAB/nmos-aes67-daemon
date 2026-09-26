@@ -89,8 +89,8 @@ class Soak:
         return A.http("GET", f"{A.NODE}/x-nmos/node/v1.3/receivers/")
 
     def rx_flow(self, n, sinks):
-        label = sinks[n]["name"]
-        sender = next(s for s in A.http("GET", f"{A.NODE}/x-nmos/node/v1.3/senders/") if s["label"] == label)
+        labels = (A.bridge_name(f"rx{n:02}"), sinks[n]["name"])
+        sender = next(s for s in A.http("GET", f"{A.NODE}/x-nmos/node/v1.3/senders/") if s["label"] in labels)
         return sender
 
     # ---- load

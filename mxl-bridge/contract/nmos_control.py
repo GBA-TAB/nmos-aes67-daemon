@@ -23,8 +23,8 @@ import audiotest as A
 REMOS = os.environ.get("REMOS", "http://localhost:5195")
 ORCH = os.environ.get("ORCH", "http://localhost:8088")
 DAEMON_NODE = os.environ.get("DAEMON_NODE", "http://172.30.3.77:3212")
-TEST_TONES = "4a7e0ff1-3d87-58c3-9f13-7081598b4c34"
-GRID_OUT = "2e427a7f-0f12-598c-9f0a-722d80ff5084"
+TEST_TONES = A.mxl_id(A.mxl_name(os.environ.get("SIGGEN_APP", "sig-gen-audio"), "audio"), "sender")
+GRID_OUT = A.mxl_id(A.mxl_name(os.environ.get("MIXER_APP", "audiomixer"), "gridout01-08"), "sender")
 ERT = "940f6786-e184-5e77-8646-1dddacd87a15"
 
 
