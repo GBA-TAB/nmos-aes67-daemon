@@ -25,16 +25,26 @@ async fn register_resource(client: &reqwest::Client, base: &str, rtype: &str, da
 
 /// Registers Node/Device and every bus's Source/Flow/Sender and every track's Receiver, then
 /// heartbeats every 5s — same registration_worker cadence mxl-bridge's own registration.rs
-/// matches (itself following the C++ daemon's own pattern). Since this app's resource set is
-/// fixed at startup (no daemon to poll, unlike mxl-bridge), a full registration pass is simply
-/// re-run wholesale on every re-registration rather than needing separate incremental add/remove
-/// handling.
+/// matches (itself following the C++ daemon's own pattern). Each pass is a full one; the input
+/// grid can change at runtime (registry discovery), so a pass also deletes the receivers of
+/// inputs that left the grid, and the first pass starts from a clean node (see below).
 pub async fn run(state: Arc<NmosState>, ip: String) {
     let Some(base) = registry_base(&state) else {
         tracing::info!("no nmos_registry_address configured, skipping registry registration");
         return;
     };
     let client = reqwest::Client::new();
+
+    // Start clean: a previous run of this app (same node id, derived from its name) may have left
+    // resources this run does not have (e.g. receivers of discovered inputs). Deleting the node
+    // makes the registry drop everything under it; a 404 just means there was nothing.
+    let url = format!("{base}/resource/nodes/{}", state.node_id);
+    match client.delete(&url).send().await {
+        Ok(r) if r.status().is_success() => tracing::info!("removed this node's earlier registration"),
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {}
+        Ok(r) => tracing::warn!(status = %r.status(), "could not remove this node's earlier registration"),
+        Err(e) => tracing::warn!(error = %e, "could not remove this node's earlier registration"),
+    }
 
     loop {
         if let Err(e) = register_all(&client, &base, &state, &ip).await {
@@ -107,7 +117,9 @@ async fn register_all(client: &reqwest::Client, base: &str, state: &NmosState, i
         .await?;
     }
 
+    let mut current = std::collections::HashSet::new();
     for e in state.mixer.input_grid.snapshot() {
+        current.insert(e.receiver_id);
         // Not just "has a reader" any more: a read failure (engine.rs's input-read step) sets
         // e.fault, so this honestly reflects whether it's genuinely receiving.
         let active = e.reader.lock().unwrap().is_some() && e.fault.lock().unwrap().is_none();
@@ -120,6 +132,19 @@ async fn register_all(client: &reqwest::Client, base: &str, state: &NmosState, i
         )
         .await?;
     }
+
+    // Receivers that left the grid since the last pass (a discovered sender went away): delete
+    // them, or the registry keeps advertising inputs this engine no longer has.
+    let gone: Vec<uuid::Uuid> = state.registered_receivers.lock().unwrap().difference(&current).copied().collect();
+    for id in gone {
+        let url = format!("{base}/resource/receivers/{id}");
+        match client.delete(&url).send().await {
+            Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND => {}
+            Ok(r) => tracing::warn!(receiver_id = %id, status = %r.status(), "deleting a removed input's receiver failed"),
+            Err(e) => tracing::warn!(receiver_id = %id, error = %e, "deleting a removed input's receiver failed"),
+        }
+    }
+    *state.registered_receivers.lock().unwrap() = current;
 
     Ok(())
 }

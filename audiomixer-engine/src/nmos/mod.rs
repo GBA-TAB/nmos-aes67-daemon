@@ -59,6 +59,10 @@ pub struct NmosState {
     /// this only holds the activation log `GET`/`DELETE .../map/activations/:id` needs, which is
     /// pure NMOS-API surface, not mixer domain.
     pub is08: is08::Is08State,
+
+    /// Receivers the last registration pass registered, so the next one can delete those that
+    /// left the input grid (a discovered sender went away). registration.rs.
+    pub registered_receivers: std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>,
 }
 
 impl NmosState {
@@ -88,6 +92,7 @@ impl NmosState {
             mixer,
             output_ids,
             is08: is08::Is08State::default(),
+            registered_receivers: Default::default(),
         }
     }
 

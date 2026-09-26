@@ -15,10 +15,12 @@
 //! (matching `device_id`) — redundant with the more direct `bus-out:`/`master-out:` source kinds
 //! (`patch.rs`), and pointless to loop a shared-memory flow back through its own writer for.
 //!
-//! A plain unpaginated poll-and-diff, same shape as mxl-bridge's own `daemon_client.rs` (there,
-//! against the daemon's `/api/streams`; here, against the registry's Query API) — acceptable for a
-//! test app's scope; a registry with enough Senders to need `Link`-header pagination is out of
-//! scope for what this app is meant to exercise.
+//! A poll-and-diff, same shape as mxl-bridge's own `daemon_client.rs` (there, against the daemon's
+//! `/api/streams`; here, against the registry's Query API). The Query API pages its results (10 per
+//! page by default on nmos-cpp), so every list is read in full (`get_all`: `paging.limit` plus the
+//! `Link: rel="next"` chain). Reading only the first page made the candidate set change from poll
+//! to poll once there were more than 10 senders or flows: entries were removed and re-added every
+//! few seconds, each time taking a new channel range (fixed 2026-09-27).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,27 +62,54 @@ pub async fn run(state: Arc<NmosState>) {
 /// offer a combined endpoint the way the daemon's own `/api/streams` did) and resolves them down to
 /// exactly the candidates this app could actually open: MXL-transport, audio-format, not this
 /// instance's own device.
+/// Upper bound on pages followed per list, against a registry whose `next` links never end.
+const MAX_PAGES: usize = 100;
+
+/// The `rel="next"` target of a `Link` header, if any.
+fn next_link(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers.get_all(reqwest::header::LINK).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).find_map(|part| {
+        let (url, params) = part.split_once(';')?;
+        params.contains("rel=\"next\"").then(|| url.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+    })
+}
+
+/// Every resource of a Query API list, across pages. nmos-cpp's default page is the *newest* one
+/// and `rel="next"` points to newer resources, so the walk starts at the oldest
+/// (`paging.since=0:0`) and follows `next` until a page adds nothing new. The registry caps
+/// `paging.limit` (100 on nmos-cpp). De-duplicated by id (pages can overlap at their edges).
+async fn get_all(client: &reqwest::Client, base: &str, kind: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut url = format!("{base}/{kind}?paging.since=0:0&paging.limit=1000");
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for _ in 0..MAX_PAGES {
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("GET {url}: {e}"))?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("GET /{kind} returned an error status: {e}"))?;
+        let next = next_link(resp.headers());
+        let page: Vec<serde_json::Value> = resp.json().await.map_err(|e| anyhow::anyhow!("parsing /{kind} response: {e}"))?;
+        let mut added = false;
+        for r in page {
+            let Some(id) = r.get("id").and_then(|v| v.as_str()).map(str::to_string) else { continue };
+            if seen.insert(id) {
+                out.push(r);
+                added = true;
+            }
+        }
+        match next {
+            Some(n) if added && n != url => url = n,
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
 async fn poll_once(client: &reqwest::Client, base: &str, own_device_id: uuid::Uuid) -> anyhow::Result<HashMap<String, Candidate>> {
-    let senders: Vec<serde_json::Value> = client
-        .get(format!("{base}/senders"))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("GET {base}/senders: {e}"))?
-        .error_for_status()
-        .map_err(|e| anyhow::anyhow!("GET /senders returned an error status: {e}"))?
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("parsing /senders response: {e}"))?;
-    let flows: Vec<serde_json::Value> = client
-        .get(format!("{base}/flows"))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("GET {base}/flows: {e}"))?
-        .error_for_status()
-        .map_err(|e| anyhow::anyhow!("GET /flows returned an error status: {e}"))?
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("parsing /flows response: {e}"))?;
+    let senders = get_all(client, base, "senders").await?;
+    let flows = get_all(client, base, "flows").await?;
 
     let flow_channels: HashMap<String, usize> = flows
         .iter()
@@ -115,17 +144,20 @@ async fn poll_once(client: &reqwest::Client, base: &str, own_device_id: uuid::Uu
 /// `Candidate`'s `PartialEq` derive is what makes "changed" mean "label, flow_id, or channel count
 /// actually differs", not just "still present", so a no-op poll doesn't needlessly reopen readers.
 fn apply_diff(state: &NmosState, known: &mut HashMap<String, Candidate>, candidates: HashMap<String, Candidate>) {
+    let mut changed = false;
     for id in known.keys() {
         if !candidates.contains_key(id) {
             state.mixer.input_grid.remove(&format!("{ENTRY_PREFIX}{id}"));
+            changed = true;
             tracing::info!(sender_id = id, "input grid discovery: sender no longer present, entry removed");
         }
     }
 
-    for (id, candidate) in &candidates {
-        if known.get(id) == Some(candidate) {
-            continue;
-        }
+    // New or changed senders in label order, so a restart that finds the same senders numbers
+    // them the same way (their receivers' names and ids follow the channel range).
+    let mut todo: Vec<(&String, &Candidate)> = candidates.iter().filter(|(id, c)| known.get(*id) != Some(*c)).collect();
+    todo.sort_by(|a, b| a.1.label.cmp(&b.1.label).then(a.0.cmp(b.0)));
+    for (id, candidate) in todo {
         let entry_id = format!("{ENTRY_PREFIX}{id}");
         match crate::flow::FlowReader::open(&state.cfg.mxl_domain, &state.mxl_so_path, &candidate.flow_id, candidate.channels) {
             Ok(reader) => {
@@ -137,7 +169,7 @@ fn apply_diff(state: &NmosState, known: &mut HashMap<String, Candidate>, candida
                 // the rest of the grid's own numbering. Not stable across a disconnect/reconnect of
                 // the same sender (see that doc comment) -- an accepted trade-off for a best-effort
                 // discovered source.
-                let grid_channel_start = state.mixer.input_grid.reserve_channel_range(candidate.channels as u32);
+                let grid_channel_start = state.mixer.input_grid.reserve_channel_range_for(&entry_id, candidate.channels as u32);
                 let channel_labels: Vec<String> =
                     (0..candidate.channels).map(|i| format!("Grid In {:02}", grid_channel_start + i as u32 + 1)).collect();
                 let resource = crate::ids::input_resource(grid_channel_start, candidate.channels as u32);
@@ -159,6 +191,7 @@ fn apply_diff(state: &NmosState, known: &mut HashMap<String, Candidate>, candida
                     fault: std::sync::Mutex::new(None),
                     fault_retry_after: std::sync::Mutex::new(None),
                 });
+                changed = true;
                 tracing::info!(sender_id = id, label = %candidate.label, channels = candidate.channels, "input grid discovery: entry ready");
             }
             Err(e) => {
@@ -168,4 +201,29 @@ fn apply_diff(state: &NmosState, known: &mut HashMap<String, Candidate>, candida
     }
 
     *known = candidates;
+    if changed {
+        // Registers the new receivers and deletes the removed ones (registration.rs).
+        state.notify_changed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_link_is_found_among_the_registry_links() {
+        // as nmos-cpp sends it (2026-09-27)
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::LINK,
+            "<http://r/x-nmos/query/v1.3/senders?paging.order=update&paging.limit=5&paging.until=1:2>; rel=\"prev\", \
+             <http://r/x-nmos/query/v1.3/senders?paging.order=update&paging.limit=5&paging.since=3:4>; rel=\"next\", \
+             <http://r/x-nmos/query/v1.3/senders?paging.order=update&paging.limit=5&paging.since=0:0>; rel=\"first\""
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(next_link(&h).as_deref(), Some("http://r/x-nmos/query/v1.3/senders?paging.order=update&paging.limit=5&paging.since=3:4"));
+        assert_eq!(next_link(&reqwest::header::HeaderMap::new()), None);
+    }
 }

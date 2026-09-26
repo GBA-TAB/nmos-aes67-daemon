@@ -207,6 +207,8 @@ pub struct InputGrid {
     entries: Mutex<HashMap<String, Arc<InputGridEntry>>>,
     /// The whole grid's own running channel-numbering counter -- see `reserve_channel_range`.
     next_offset: std::sync::atomic::AtomicU32,
+    /// Ranges handed out by `reserve_channel_range_for`, by key: (start, channels).
+    sticky: Mutex<HashMap<String, (u32, u32)>>,
 }
 
 impl InputGrid {
@@ -227,6 +229,23 @@ impl InputGrid {
     /// this way, so its own range is stable for the life of the process.
     pub fn reserve_channel_range(&self, channels: u32) -> u32 {
         self.next_offset.fetch_add(channels, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `reserve_channel_range`, but sticky per `key` (a discovered entry's id): the same key with
+    /// the same channel count gets its earlier range back, so a sender that drops out of the
+    /// registry and returns keeps its "Grid In NN" numbers (and its receiver's name and id) for
+    /// the life of the process instead of taking a fresh range each time. A changed channel count
+    /// takes a new range.
+    pub fn reserve_channel_range_for(&self, key: &str, channels: u32) -> u32 {
+        let mut sticky = self.sticky.lock().unwrap();
+        if let Some(&(start, n)) = sticky.get(key) {
+            if n == channels {
+                return start;
+            }
+        }
+        let start = self.reserve_channel_range(channels);
+        sticky.insert(key.to_string(), (start, channels));
+        start
     }
 
     /// Resolves a 1-based position in the grid's own unified running numbering (e.g. `9` for
@@ -1185,6 +1204,19 @@ mod tests {
         // With the entry gone, master_in_json falls back to its own "channels" default (empty
         // per-channel lists), same as a master that never had a patch set at all.
         assert_eq!(patch_state.master_in_json(0, 1)[0].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn reserve_channel_range_for_is_sticky_per_key() {
+        let grid = InputGrid::default();
+        assert_eq!(grid.reserve_channel_range(8), 0);
+        assert_eq!(grid.reserve_channel_range_for("registry:a", 8), 8);
+        assert_eq!(grid.reserve_channel_range_for("registry:b", 8), 16);
+        // a returns: same range, the counter does not move
+        assert_eq!(grid.reserve_channel_range_for("registry:a", 8), 8);
+        assert_eq!(grid.reserve_channel_range_for("registry:c", 2), 24);
+        // a changed channel count takes a new range
+        assert_eq!(grid.reserve_channel_range_for("registry:a", 16), 26);
     }
 
     #[test]
