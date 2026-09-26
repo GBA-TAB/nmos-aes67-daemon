@@ -196,9 +196,21 @@ impl Is08State {
     /// Reads one period from the named packed-tx flow, if it's currently open — same "None is
     /// harmless, self-heals" note as `write_packed_rx`. Called from alsa_playback.rs's plain OS
     /// thread.
-    pub fn read_packed_tx(&self, name: &str, count: usize, timeout: std::time::Duration) -> Option<anyhow::Result<Vec<Vec<f32>>>> {
+    /// Reads one period of the named packed-tx flow `delay` behind MXL's now, like a per-Source
+    /// read (alsa_playback.rs): the caller tunes `delay` per flow. `None` if the flow is not open.
+    pub fn read_packed_tx(&self, name: &str, count: usize, delay: u64, tolerance: u64, timeout: std::time::Duration) -> Option<anyhow::Result<Vec<Vec<f32>>>> {
         let mut flows = self.packed_tx_flows.blocking_lock();
-        flows.get_mut(name).map(|f| f.read_next(count, timeout))
+        flows.get_mut(name).map(|f| {
+            let now = f.current_index();
+            f.read_aligned(count, now, delay, tolerance, timeout)
+        })
+    }
+
+    /// Forgets the named packed-tx reader's position: its next read starts at its target again.
+    pub fn realign_packed_tx(&self, name: &str) {
+        if let Some(f) = self.packed_tx_flows.blocking_lock().get_mut(name) {
+            f.realign();
+        }
     }
 
     /// Resyncs the named packed-tx flow's reader to its current head after a `read_packed_tx`

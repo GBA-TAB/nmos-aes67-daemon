@@ -242,14 +242,6 @@ impl MxlAudioFlow {
     }
 }
 
-/// The current MXL index at `rate`: samples since the TAI epoch (MXL's own definition, the same
-/// clock `get_current_index` reads).
-pub fn tai_index(rate: u32) -> u64 {
-    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_TAI, &mut t) };
-    (t.tv_sec as u128 * rate as u128 + t.tv_nsec as u128 * rate as u128 / 1_000_000_000) as u64
-}
-
 /// Index of the FIRST sample of a just-read capture block of `count` frames, given the current
 /// index (`now`) and the frames still pending in the capture buffer (newer than the block).
 pub fn capture_start_index(now: u64, pending_frames: u64, count: usize) -> u64 {
@@ -272,6 +264,10 @@ pub struct MxlAudioFlowSource {
     reader: mxl::SamplesReader,
     channels: usize,
     next_index: Option<u64>,
+    // for `current_index`: MXL's own time (the media clock when MXL_MEDIA_CLOCK is set), never
+    // CLOCK_TAI read directly - that would disagree with every flow's index on a media clock
+    instance: mxl::MxlInstance,
+    sample_rate: mxl::Rational,
 }
 
 impl MxlAudioFlowSource {
@@ -303,9 +299,13 @@ impl MxlAudioFlowSource {
             .to_samples_reader()
             .map_err(|e| anyhow::anyhow!("to_samples_reader failed: {e:?}"))?;
 
-        // `instance` isn't stored on Self: `SamplesReader` already keeps its own
-        // Arc<InstanceContext> alive internally, so nothing here needs a separate handle to it.
-        Ok(Self { reader, channels, next_index: None })
+        let sample_rate = mxl::Rational { numerator: cfg.sample_rate as i64, denominator: 1 };
+        Ok(Self { reader, channels, next_index: None, instance, sample_rate })
+    }
+
+    /// "Now" as an index of this flow's rate, on MXL's clock (see the field note).
+    pub fn current_index(&self) -> u64 {
+        self.instance.get_current_index(&self.sample_rate)
     }
 
     /// Current write head of the flow — the sensible starting point for a fresh reader (matches
@@ -352,32 +352,6 @@ impl MxlAudioFlowSource {
         Ok(())
     }
 
-    /// Blocking read of `count` samples, continuing this reader's own monotonic index from
-    /// wherever the previous call left off (seeded from `head_index()` on the first call, or after
-    /// `resync_to_head`). Each SourceEntry's reader tracks this independently (Phase 2: readers are
-    /// opened/closed per-activation, not one global index like Phase 1).
-    ///
-    /// Same accumulate-and-never-re-verify shape as `MxlAudioFlow::write_next` before its own
-    /// drift fix (see that function's doc comment) - not given the same treatment here, because
-    /// the correct reference is different: a reader is *supposed* to trail `head_index()` by a
-    /// stable playout margin, not track it tightly, so naively snapping to a fresh `head_index()`
-    /// every period the way the writer snaps to `get_current_index()` would fight that margin
-    /// instead of correcting real drift. The right check is "has the *gap* to `head_index()` grown
-    /// or shrunk over time," not "does this index differ from a fresh reference" - genuinely
-    /// different from the writer's case, not yet built, and not verified live the way the write
-    /// side's drift was (that was measured against a real Sink; no Source/Receiver was activated
-    /// in that same session to check this side empirically). Flagging this as the same open
-    /// question, not silently assuming it's fine.
-    pub fn read_next(&mut self, count: usize, timeout: std::time::Duration) -> anyhow::Result<Vec<Vec<f32>>> {
-        let index = match self.next_index {
-            Some(i) => i,
-            None => self.head_index()?,
-        };
-        tracing::debug!(index, count, "read_next");
-        let planar = self.read_samples_at(index, count, timeout)?;
-        self.next_index = Some(index + count as u64);
-        Ok(planar)
-    }
 
     /// Blocking read of `count` samples ending at `index` (same end-of-batch indexing convention as
     /// write_next). Returns owned planar float32 data, one Vec<f32> per channel.

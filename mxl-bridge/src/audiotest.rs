@@ -9,7 +9,7 @@
 //!       reads an existing flow and writes to stdout one JSON header line
 //!       {"first_index", "channels", "frames"} followed by frames x channels little-endian i32
 //!       (sample * 2^23, exact for 24-bit audio carried as float32), then a newline and a JSON
-//!       trailer {"heads": [[tai_ns, head_index], ...]}: when each sample became readable.
+//!       trailer {"heads": [[mxl_time_ns, head_index], ...]}: when each sample became readable.
 //!
 //!   audiotest capture <iface> <group> <port> <seconds>
 //!       records the RTP packets sent to <group>:<port> as seen on <iface> - both what this host
@@ -133,7 +133,8 @@ fn dump(config: &str, flow: &str, channels: usize, seconds: f64) -> anyhow::Resu
     let first_index = end + 1 - BLOCK as u64;
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     writeln!(out, "{}", serde_json::json!({ "first_index": first_index, "channels": channels, "frames": frames }))?;
-    // (TAI ns, head) whenever the head moves: when each sample became readable.
+    // (MXL time in ns, head) whenever the head moves: when each sample became readable, on the
+    // same clock as the indices (the media clock when MXL_MEDIA_CLOCK is set).
     let mut heads: Vec<(u64, u64)> = Vec::new();
     let mut last_head = 0;
     let mut done = 0;
@@ -141,7 +142,7 @@ fn dump(config: &str, flow: &str, channels: usize, seconds: f64) -> anyhow::Resu
         loop {
             let h = r.head_index()?;
             if h != last_head {
-                heads.push((tai_ns(), h));
+                heads.push((r.current_index() * 1_000_000_000 / cfg.sample_rate as u64, h));
                 last_head = h;
             }
             if h >= end {

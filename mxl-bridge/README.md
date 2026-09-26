@@ -250,7 +250,15 @@ MXL index of the same sample (tx), or against when that index became readable in
 
 - rx content over an NMOS connection: the control matrix's only transmitting 2110 audio sender in the
   lab was silent; rx bit-exactness is verified with a Mac RAVENNA stream and the soak's relay.
-- IS-08 channel mapping on the bridge's packed 8-channel flows.
+- IS-08 channel mapping: **verified** (`contract/is08_test.py`, 2026-09-26). 8 channels from 8
+  Sinks packed into one MXL flow (reversed order), a live swap, unmapping, a packed MXL flow
+  scattered (permuted) onto a tx stream, and pairing validation. All bit-exact against the known
+  patterns. It found two bridge gaps, now fixed:
+  - packed-tx flows were read with no read delay, so every read landed before the writer and the
+    scatter was silent. They now get the same self-tuning delay and back-off as Sources;
+  - the tx path took "now" from `CLOCK_TAI` directly instead of from libmxl, so on the media clock
+    it always fell back to reading behind the writer's head. It now uses MXL's time
+    (`MxlAudioFlowSource::current_index`).
 - Soak findings, **resolved** (2026-09-26):
   - the tx "lost packets" were the test capture's: the relay's continuity check counted every one
     of 111 M transmitted packets and none were missing;

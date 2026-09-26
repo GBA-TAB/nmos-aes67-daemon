@@ -102,6 +102,10 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
     // Consecutive failed reads (about 50 ms) before a Source counts as gone and is backed off.
     let backoff_after = (50 * rate as usize / 1000 / period).max(1) as u32;
     let mut packed_retry_at: HashMap<String, Instant> = HashMap::new();
+    // packed-tx flows get the same self-tuning read delay and back-off as Sources (IS-08 test,
+    // 2026-09-26: without it every read landed before the writer and the scatter stayed silent)
+    let mut packed_delays: HashMap<String, u64> = HashMap::new();
+    let mut packed_failures: HashMap<String, u32> = HashMap::new();
     let mut recoveries = 0u32;
     let mut last_recovery_log = Instant::now();
 
@@ -118,7 +122,8 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
             if retry_at.get(&entry.daemon_id).is_some_and(|t| Instant::now() < *t) {
                 continue; // backing off a failed Source: silence, and no blocking read this period
             }
-            let planar = match reader.read_aligned(period, crate::mxl_flow::tai_index(rate), delay, tolerance, read_timeout) {
+            let now = reader.current_index();
+            let planar = match reader.read_aligned(period, now, delay, tolerance, read_timeout) {
                 Ok(p) => {
                     retry_at.remove(&entry.daemon_id);
                     failures.remove(&entry.daemon_id);
@@ -174,16 +179,31 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
         // overrides a Source's own default connection for that specific channel — the more
         // deliberate routing action wins.
         let routing = state.is08.routing_snapshot();
+        packed_delays.retain(|name, _| routing.scatter.contains_key(name));
+        packed_failures.retain(|name, _| routing.scatter.contains_key(name));
         for (name, table) in &routing.scatter {
             if packed_retry_at.get(name).is_some_and(|t| Instant::now() < *t) {
                 continue; // same back-off as a failed Source above
             }
-            let planar = match state.is08.read_packed_tx(name, period, read_timeout) {
+            let delay = *packed_delays.entry(name.clone()).or_insert(base_delay);
+            let planar = match state.is08.read_packed_tx(name, period, delay, tolerance, read_timeout) {
                 Some(Ok(p)) => {
                     packed_retry_at.remove(name);
+                    packed_failures.remove(name);
                     p
                 }
                 Some(Err(e)) => {
+                    if delay < max_delay {
+                        let d = (delay + delay_step).min(max_delay);
+                        packed_delays.insert(name.clone(), d);
+                        state.is08.realign_packed_tx(name);
+                        tracing::info!(flow_name = name, delay_ms = d as f64 * 1000.0 / rate as f64, "packed-tx read delay raised to fit its writer");
+                    }
+                    let n = packed_failures.entry(name.clone()).or_insert(0);
+                    *n += 1;
+                    if *n < backoff_after {
+                        continue;
+                    }
                     if !packed_retry_at.contains_key(name) {
                         tracing::warn!(flow_name = name, error = %e, "read failed, silencing this flow and retrying every {FAILED_SOURCE_BACKOFF:?}");
                     }
