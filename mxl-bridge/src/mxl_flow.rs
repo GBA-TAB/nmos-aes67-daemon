@@ -1,7 +1,7 @@
 use crate::config::Config;
 
-// Names and ids follow `mxl-<host>-<app>-<resource>` (GBA-TAB/mxl docs/Naming.md): unique across
-// hosts running the same apps on one registry, stable across restarts. host = MXL_HOST_NICKNAME,
+// Names and ids follow `mxl-<host>-<domain>-<app>-<resource>` (GBA-TAB/mxl docs/Naming.md): unique across
+// hosts running the same apps on one registry, stable across restarts. host = MXL_HOST_NICKNAME, domain = MXL_DOMAIN_NICKNAME,
 // app = MXL_APP_NAME (the orchestrator's instance name; default "bridge"). Resources: `rx<nn>` for
 // daemon Sink nn's MXL source/flow/sender, `tx<nn>` for daemon Source nn's receiver,
 // `packedrx-<name>` / `packedtx-<name>` for IS-08 packed flows.

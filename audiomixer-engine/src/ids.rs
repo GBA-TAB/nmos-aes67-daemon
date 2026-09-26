@@ -1,4 +1,4 @@
-//! Names and ids follow `mxl-<host>-<app>-<resource>` (GBA-TAB/mxl docs/Naming.md), so the same
+//! Names and ids follow `mxl-<host>-<domain>-<app>-<resource>` (GBA-TAB/mxl docs/Naming.md), so the same
 //! app on several hosts sharing one registry never collides, and ids are stable across restarts.
 //! This app's own resources: `gridin<NN>-<NN>` (input-grid receivers) and `gridout<NN>-<NN>`
 //! (output-grid source/flow/sender), keyed by grid position - the channel range the labels show.
@@ -98,7 +98,7 @@ mod tests {
     /// The bridge's ids, as mxl-bridge derives them (same crate, same names).
     #[test]
     fn bridge_ids_follow_the_bridges_names() {
-        let b = Naming::new("caspar", "bridge-1");
-        assert_eq!(b.id("rx03", Kind::Flow), mxl::naming::id_of("mxl-caspar-bridge-1-rx03", Kind::Flow));
+        let b = Naming::new("caspar", "main", "bridge-1");
+        assert_eq!(b.id("rx03", Kind::Flow), mxl::naming::id_of("mxl-caspar-main-bridge-1-rx03", Kind::Flow));
     }
 }

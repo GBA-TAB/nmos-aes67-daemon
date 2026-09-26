@@ -70,8 +70,9 @@ def pod_bin():
     return "/app/mxl-bridge"
 
 
-# MXL names (GBA-TAB/mxl docs/Naming.md): mxl-<host>-<app>-<resource>, ids UUIDv5(NS, "<name>#<kind>")
+# MXL names (GBA-TAB/mxl docs/Naming.md): mxl-<host>-<domain>-<app>-<resource>, ids UUIDv5(NS, "<name>#<kind>")
 HOST_NICKNAME = os.environ.get("MXL_HOST_NICKNAME", "caspar")
+DOMAIN_NICKNAME = os.environ.get("MXL_DOMAIN_NICKNAME", "demo")
 BRIDGE_APP = os.environ.get("BRIDGE_APP", "bridge-1")
 NAMING_NS = uuid.uuid5(uuid.NAMESPACE_URL, "urn:x-mxl:naming:v1")
 
@@ -81,10 +82,10 @@ def _norm(part):
     return part
 
 
-def mxl_name(app, resource=None, host=None):
+def mxl_name(app, resource=None, host=None, domain=None):
     app = _norm(app)
     app = app[4:] if app.startswith("mxl-") else app
-    parts = ["mxl", _norm(host or HOST_NICKNAME), app] + ([_norm(resource)] if resource else [])
+    parts = ["mxl", _norm(host or HOST_NICKNAME), _norm(domain or DOMAIN_NICKNAME), app] + ([_norm(resource)] if resource else [])
     return "-".join(parts)
 
 

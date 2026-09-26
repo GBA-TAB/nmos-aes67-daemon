@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "audiomixer-engine.conf".to_string());
     let cfg = Config::load(&config_path)?;
-    // names/ids: mxl-<host>-<app>-<resource> (ids.rs, GBA-TAB/mxl docs/Naming.md)
+    // names/ids: mxl-<host>-<domain>-<app>-<resource> (ids.rs, GBA-TAB/mxl docs/Naming.md)
     ids::init(&cfg.instance_name, &cfg.bridge_app);
     tracing::info!(app = %ids::naming().app_name(), bridge = %cfg.bridge_app, "MXL naming");
     let rt_priority = cfg.rt_priority;
