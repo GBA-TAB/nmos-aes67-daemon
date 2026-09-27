@@ -46,7 +46,10 @@ fn find_mxl_so() -> anyhow::Result<std::path::PathBuf> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
+    // RUST_LOG if set, else info: without it only errors were printed, and input read failures
+    // (warnings) went unseen.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "audiomixer-engine.conf".to_string());
     let cfg = Config::load(&config_path)?;

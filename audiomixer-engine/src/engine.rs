@@ -400,7 +400,7 @@ pub fn run(state: Arc<MixerState>) {
                             }
                         }
                     } else {
-                        tracing::warn!(entry_id = %entry.id, error = ?e, "input grid read failed, resyncing to flow head");
+                        tracing::warn!(entry_id = %entry.id, error = %format!("{e:#}"), lag = r.lag(), "input grid read failed, resyncing to flow head");
                         if let Err(resync_err) = r.resync_to_head() {
                             tracing::error!(entry_id = %entry.id, error = %resync_err, "failed to resync input grid entry to flow head");
                         }

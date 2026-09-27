@@ -158,12 +158,32 @@ impl std::fmt::Display for ChannelCountExceedsPlaceholder {
 
 impl std::error::Error for ChannelCountExceedsPlaceholder {}
 
+/// Upper bound on a reader's lag behind its writer's head: 0.5 s at 48 kHz.
+const MAX_READ_LAG: u64 = 24_000;
+
+/// The next lag after a read found its samples not yet written: at least two reads' worth, then
+/// doubling, capped. A writer committing big blocks (GStreamer's audiotestsrc: 1024 samples,
+/// 21 ms) needs a lag of about one block; one committing every millisecond (mxl-bridge) keeps the
+/// minimum.
+fn grown_lag(lag: u64, count: usize) -> u64 {
+    (lag * 2).max(2 * count as u64).min(MAX_READ_LAG)
+}
+
 /// Reads an existing MXL audio flow — some other producer (mxl-bridge, or another MXL app) writes
 /// it, this app consumes and mixes it.
+///
+/// Reads follow the writer's head at a lag (`lag`, samples): every period reads the next `count`
+/// samples, and they must be written within the engine's read timeout (two periods). Reading
+/// right at the head only works for writers that commit at least that often; a writer committing
+/// larger blocks left most reads timing out (each one a fault, 500 ms of silence and a resync) -
+/// with several inputs on one such flow only the one with lucky timing played (2026-09-27, Test
+/// Tones on four grid inputs). A read that finds its samples not yet written now grows the lag
+/// (`grown_lag`); the resync then lands that far behind the head, where the samples are there.
 pub struct FlowReader {
     reader: mxl::SamplesReader,
     channels: usize,
     next_index: Option<u64>,
+    lag: u64,
 }
 
 impl FlowReader {
@@ -195,7 +215,12 @@ impl FlowReader {
         }
 
         let reader = reader.to_samples_reader().map_err(|e| anyhow::anyhow!("to_samples_reader failed: {e:?}"))?;
-        Ok(Self { reader, channels, next_index: None })
+        Ok(Self { reader, channels, next_index: None, lag: 0 })
+    }
+
+    /// Current lag behind the writer's head, in samples.
+    pub fn lag(&self) -> u64 {
+        self.lag
     }
 
     pub fn head_index(&self) -> anyhow::Result<u64> {
@@ -207,17 +232,35 @@ impl FlowReader {
         Ok(self.reader.get_runtime_info().map_err(|e| anyhow::Error::from(e).context("get_runtime_info failed"))?.headIndex)
     }
 
+    /// Re-anchors the read position `lag` samples behind the writer's head - at the next read, not
+    /// now: the engine backs a failed input off for 500 ms before reading again, and an anchor
+    /// taken before that wait is 500 ms stale by then, older than libmxl lets a reader go (half
+    /// the flow's buffer, ~200 ms here), so every retry failed "too late" and re-anchored stale
+    /// again, forever. Only inputs whose very first read succeeded ever played (2026-09-27).
     pub fn resync_to_head(&mut self) -> anyhow::Result<()> {
-        self.next_index = Some(self.head_index()?);
+        self.next_index = None;
         Ok(())
     }
 
     pub fn read_next(&mut self, count: usize, timeout: std::time::Duration) -> anyhow::Result<Vec<Vec<f32>>> {
         let index = match self.next_index {
             Some(i) => i,
-            None => self.head_index()?,
+            None => self.head_index()?.saturating_sub(self.lag),
         };
-        let planar = self.read_samples_at(index, count, timeout)?;
+        let planar = match self.read_samples_at(index, count, timeout) {
+            Ok(p) => p,
+            Err(e) => {
+                self.next_index = None; // re-anchor at the next read (see resync_to_head)
+                if matches!(e.downcast_ref::<mxl::Error>(), Some(mxl::Error::Timeout | mxl::Error::OutOfRangeTooEarly)) {
+                    let lag = grown_lag(self.lag, count);
+                    if lag != self.lag {
+                        tracing::info!(from = self.lag, to = lag, "input read ahead of its writer, growing the read lag");
+                        self.lag = lag;
+                    }
+                }
+                return Err(e);
+            }
+        };
         self.next_index = Some(index + count as u64);
         Ok(planar)
     }
@@ -236,5 +279,23 @@ impl FlowReader {
             planar.push(samples);
         }
         Ok(planar)
+    }
+}
+
+#[cfg(test)]
+mod lag_tests {
+    use super::*;
+
+    #[test]
+    fn lag_grows_to_cover_a_big_writer_block_then_caps() {
+        let mut lag = 0;
+        let mut steps = 0;
+        while lag < 1024 {
+            lag = grown_lag(lag, 96);
+            steps += 1;
+        }
+        assert_eq!(lag, 1536); // 192, 384, 768, 1536: four resyncs to cover a 1024-sample writer
+        assert_eq!(steps, 4);
+        assert_eq!(grown_lag(20_000, 96), MAX_READ_LAG);
     }
 }
