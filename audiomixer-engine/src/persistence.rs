@@ -159,6 +159,10 @@ pub fn capture(mixer: &MixerState) -> serde_json::Value {
         "masters": masters,
         "topology": { "tracks": dyn_tracks, "buses": dyn_buses, "masters": dyn_masters },
         "downmix": downmix,
+        // The output grid's patch (what feeds each Grid Out channel). Missing before 2026-09-27:
+        // every restart left all outputs unpatched, so the mixer's outputs (and whatever reads
+        // them, e.g. mxl-bridge tx) went silent although tracks and masters still had signal.
+        "outputs": mixer.patch.outputs_json(),
     })
 }
 
@@ -301,6 +305,31 @@ pub fn apply_snapshot(mixer: &MixerState, snapshot: &serde_json::Value) {
                     }
                     Err(e) => tracing::warn!(master_id = master.id, error = %e, "state file: malformed input_patch, skipped"),
                 }
+            }
+        }
+    }
+
+    // Output-grid patches, after tracks/buses/masters exist and carry their own values (a patch
+    // is validated against them). A patch for an output that no longer exists is kept but unused.
+    if let Some(outputs) = snapshot.get("outputs").and_then(|v| v.as_object()) {
+        for (id, v) in outputs {
+            match crate::patch::PatchState::parse_track_in(v) {
+                Ok(patch) => {
+                    let channels = patch.len();
+                    if let Err(e) = mixer.patch.set_output(
+                        &track_list,
+                        &bus_channels,
+                        &master_channels,
+                        &mixer.input_grid,
+                        &mixer.app_input_grid,
+                        id,
+                        channels,
+                        patch,
+                    ) {
+                        tracing::warn!(output_id = %id, error = %e, "state file: output patch rejected, skipped");
+                    }
+                }
+                Err(e) => tracing::warn!(output_id = %id, error = %e, "state file: malformed output patch, skipped"),
             }
         }
     }
@@ -768,6 +797,26 @@ mod tests {
         assert_eq!(*fresh_track0.gain_db.lock().unwrap(), 4.0);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn output_patch_round_trips() {
+        let mixer = test_mixer(&[2]);
+        let patch = crate::patch::PatchState::parse_track_in(&serde_json::json!([
+            { "source": "track-out:0", "channel": 0 },
+            { "source": "track-out:0", "channel": 1 },
+            null
+        ]))
+        .unwrap();
+        let tracks = mixer.tracks_snapshot();
+        mixer.patch.set_output(&tracks, &[], &[], &mixer.input_grid, &mixer.app_input_grid, "out-01", 3, patch).unwrap();
+        let snapshot = capture(&mixer);
+        assert_eq!(snapshot["outputs"]["out-01"][0]["source"], "track-out:0");
+
+        let fresh = test_mixer(&[2]);
+        apply_snapshot(&fresh, &snapshot);
+        assert_eq!(fresh.patch.output_json("out-01", 3), mixer.patch.output_json("out-01", 3));
+        assert_eq!(fresh.patch.output_json("out-01", 3)[2], serde_json::Value::Null);
     }
 
     #[test]

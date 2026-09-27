@@ -686,6 +686,19 @@ impl PatchState {
         serde_json::json!(patch.iter().map(|slot| slot.iter().map(SourceRef::to_json).collect::<Vec<_>>()).collect::<Vec<_>>())
     }
 
+    /// Every patched output-grid entry's patch, by entry id (persistence.rs).
+    pub fn outputs_json(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.output
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, patch)| {
+                let v = serde_json::json!(patch.iter().map(|s| s.as_ref().map(SourceRef::to_json).unwrap_or(serde_json::Value::Null)).collect::<Vec<_>>());
+                (id.clone(), v)
+            })
+            .collect()
+    }
+
     pub fn output_json(&self, output_id: &str, channels: usize) -> serde_json::Value {
         let guard = self.output.lock().unwrap();
         let empty = vec![None; channels];
