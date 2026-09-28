@@ -133,6 +133,10 @@ struct StreamInfo {
   bool sink_use_sdp{true};
   std::string sink_source;
   std::string sink_sdp;
+  // A Sink's configured channel map (its ALSA channels). The stream connected to it may be
+  // narrower (stream[0].m_byNbOfChannels, from its SDP): the API and the saved state report
+  // this map, so a Sink stays the slot it was configured as whatever stream it receives.
+  std::vector<uint8_t> sink_map;
   uint32_t session_id{0};
   uint32_t session_version{0};
   SDPOrigin origin;

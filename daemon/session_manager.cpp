@@ -186,14 +186,30 @@ bool SessionManager::parse_sdp(const std::string& sdp, StreamInfo& info) const {
                   info.stream[mid].m_byWordLength =
                       get_codec_word_length(fields[1]);
                   info.stream[mid].m_ui32SamplingRate = std::stoul(fields[2]);
-                  if (info.stream[mid].m_byNbOfChannels !=
-                      std::stoi(fields[3])) {
-                    BOOST_LOG_TRIVIAL(warning)
-                        << "session_manager:: invalid audio channel "
-                           "number in SDP at line "
-                        << num << ", using "
-                        << (int)info.stream[mid].m_byNbOfChannels;
-                    /*return false; */
+                  // The stream's channel count decides how a packet is split into
+                  // frames. A Sink's map may be wider than a stream connected to it
+                  // later (IS-05: an 8-channel Sink receiving a 2-channel intercom
+                  // endpoint): keeping the map's count read every 2-channel packet
+                  // as 8-channel frames - a quarter of the samples in the right
+                  // place, the rest zeros. Take the stream's count and the first
+                  // channels of the map; a stream wider than the map has nowhere to
+                  // go and is refused.
+                  const int sdp_channels = std::stoi(fields[3]);
+                  const int map_channels = info.stream[mid].m_byNbOfChannels;
+                  if (sdp_channels != map_channels) {
+                    if (map_channels > 0 && sdp_channels > map_channels) {
+                      BOOST_LOG_TRIVIAL(error)
+                          << "session_manager:: SDP at line " << num << " has "
+                          << sdp_channels << " channels, the sink maps only "
+                          << map_channels;
+                      return false;
+                    }
+                    BOOST_LOG_TRIVIAL(info)
+                        << "session_manager:: SDP at line " << num << ": "
+                        << sdp_channels << " channels (sink map "
+                        << map_channels << "), using the first "
+                        << sdp_channels;
+                    info.stream[mid].m_byNbOfChannels = sdp_channels;
                   }
                 }
               } else if (name == "sync-time") {
@@ -418,8 +434,11 @@ StreamSink SessionManager::get_sink_(uint8_t id, const StreamInfo& info) const {
           info.sink_sdp,
           info.stream[0].m_ui32PlayOutDelay,
           info.ignore_refclk_gmid,
-          {info.stream[0].m_aui32Routing,
-           info.stream[0].m_aui32Routing + info.stream[0].m_byNbOfChannels}};
+          info.sink_map.empty()
+              ? std::vector<uint8_t>(info.stream[0].m_aui32Routing,
+                                      info.stream[0].m_aui32Routing +
+                                         info.stream[0].m_byNbOfChannels)
+              : info.sink_map};
 }
 
 bool SessionManager::load_status() {
@@ -920,6 +939,7 @@ std::error_code SessionManager::add_sink(const StreamSink& sink) {
   info.stream[1].m_uiIfPortId = 0;
   info.stream[0].m_byNbOfChannels = sink.map.size();
   std::copy(sink.map.begin(), sink.map.end(), info.stream[0].m_aui32Routing);
+  info.sink_map.assign(sink.map.begin(), sink.map.end());
   info.stream[0].m_ui32PlayOutDelay = sink.delay;
   info.stream[0].m_ui32RTCPSrcIP = config_->get_ip_addr();
   memcpy(&info.stream[1], &info.stream[0], sizeof(info.stream[0]));
