@@ -1,0 +1,4 @@
+# leftovers of local builds/runs from before the move
+/target/
+/scratch/
+*-state.json
