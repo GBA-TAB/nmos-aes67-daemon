@@ -271,7 +271,8 @@ fn bytemuck_cast_f32_slice(src: &[f32]) -> &[u8] {
 /// out over ALSA). Which flow_id to open is an IS-05 activation concern (not yet wired up — see
 /// README), passed in directly for now.
 pub struct MxlAudioFlowSource {
-    reader: mxl::SamplesReader,
+    /// None between releasing a stale reader and opening the flow again.
+    reader: Option<mxl::SamplesReader>,
     channels: usize,
     next_index: Option<u64>,
     /// The flow this reads, to open it again when its writer was replaced.
@@ -282,6 +283,10 @@ pub struct MxlAudioFlowSource {
     /// same block forever (2026-10-02: three music streams frozen after their players restarted).
     last_head: u64,
     head_since: std::time::Instant,
+    /// The stand-still was reported (once, until the head moves again).
+    stale_reported: bool,
+    /// Opened again since the caller last asked ([`Self::take_reopened`]).
+    reopened: bool,
     // for `current_index`: MXL's own time (the media clock when MXL_MEDIA_CLOCK is set), never
     // CLOCK_TAI read directly - that would disagree with every flow's index on a media clock
     instance: mxl::MxlInstance,
@@ -319,12 +324,14 @@ impl MxlAudioFlowSource {
 
         let sample_rate = mxl::Rational { numerator: cfg.sample_rate as i64, denominator: 1 };
         Ok(Self {
-            reader,
+            reader: Some(reader),
             channels,
             next_index: None,
             flow_id: flow_id.to_string(),
             last_head: 0,
             head_since: std::time::Instant::now(),
+            stale_reported: false,
+            reopened: false,
             instance,
             sample_rate,
         })
@@ -340,7 +347,7 @@ impl MxlAudioFlowSource {
     /// behind that.
     pub fn head_index(&self) -> anyhow::Result<u64> {
         Ok(self
-            .reader
+            .rd()?
             .get_runtime_info()
             .map_err(|e| anyhow::anyhow!("get_runtime_info failed: {e:?}"))?
             .headIndex)
@@ -375,36 +382,60 @@ impl MxlAudioFlowSource {
     /// replaying the last block.
     fn live_head(&mut self) -> anyhow::Result<u64> {
         const STALE_HEAD: std::time::Duration = std::time::Duration::from_millis(500);
-        let head = self.head_index()?;
-        if head != self.last_head {
-            self.last_head = head;
+        if self.reader.is_some() {
+            let head = self.head_index()?;
+            if head != self.last_head {
+                self.last_head = head;
+                self.head_since = std::time::Instant::now();
+                self.stale_reported = false;
+                return Ok(head);
+            }
+            if self.head_since.elapsed() < STALE_HEAD {
+                return Ok(head);
+            }
+            // Stood still. The instance hands back the reader it already holds for this flow id
+            // (still mapping the replaced flow): release it first, then open the flow again.
+            self.reader = None;
+            self.next_index = None;
             self.head_since = std::time::Instant::now();
-            return Ok(head);
+            if !self.stale_reported {
+                self.stale_reported = true;
+                tracing::warn!(flow = %self.flow_id, head, "flow head stood still: released the reader, opening the flow again");
+            }
+        } else if self.head_since.elapsed() < STALE_HEAD {
+            anyhow::bail!("flow {} has no writer", self.flow_id);
         }
-        if self.head_since.elapsed() < STALE_HEAD {
-            return Ok(head);
-        }
-        // stood still: open the flow again (a restarted writer created it anew)
         self.head_since = std::time::Instant::now();
-        let reopened = self
+        let reader = self
             .instance
             .create_flow_reader(&self.flow_id)
-            .map_err(|e| anyhow::anyhow!("flow {} stopped and cannot be opened again: {e:?}", self.flow_id))?
+            .map_err(|e| anyhow::anyhow!("flow {} cannot be opened: {e:?}", self.flow_id))?
             .to_samples_reader()
             .map_err(|e| anyhow::anyhow!("to_samples_reader failed: {e:?}"))?;
-        let new_head = reopened
+        let head = reader
             .get_runtime_info()
             .map_err(|e| anyhow::anyhow!("get_runtime_info failed: {e:?}"))?
             .headIndex;
-        self.reader = reopened;
-        self.next_index = None;
-        self.last_head = new_head;
-        if new_head == head {
-            // no writer: silence (the caller reports it once and backs off), not a replay
+        self.reader = Some(reader);
+        if head == self.last_head {
+            // still the same head: no writer yet (silence, retried every STALE_HEAD), no replay
             anyhow::bail!("flow {} has no writer (head stands still)", self.flow_id);
         }
-        tracing::warn!(flow = %self.flow_id, old_head = head, new_head, "flow replaced by a new writer: reading the new one");
-        Ok(new_head)
+        tracing::info!(flow = %self.flow_id, head, "flow opened again: reading its new writer");
+        self.last_head = head;
+        self.stale_reported = false;
+        self.reopened = true;
+        Ok(head)
+    }
+
+    /// Whether the flow was opened again since the last call: the caller then starts over with its
+    /// base read delay (the failed reads in between raised it for no lateness of the writer).
+    pub fn take_reopened(&mut self) -> bool {
+        std::mem::take(&mut self.reopened)
+    }
+
+    fn rd(&self) -> anyhow::Result<&mxl::SamplesReader> {
+        self.reader.as_ref().ok_or_else(|| anyhow::anyhow!("flow {} not open", self.flow_id))
     }
 
     /// Forgets the read position: the next `read_aligned` starts at its target again.
@@ -429,7 +460,7 @@ impl MxlAudioFlowSource {
         timeout: std::time::Duration,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
         let data = self
-            .reader
+            .rd()?
             .get_samples(index, count, timeout)
             .map_err(|e| anyhow::anyhow!("get_samples failed: {e:?}"))?;
 

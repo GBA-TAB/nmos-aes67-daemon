@@ -127,6 +127,10 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
                 Ok(p) => {
                     retry_at.remove(&entry.daemon_id);
                     failures.remove(&entry.daemon_id);
+                    if reader.take_reopened() {
+                        // a replaced flow: its new writer is read at the base delay again
+                        delays.insert(entry.daemon_id, base_delay);
+                    }
                     p
                 }
                 Err(e) => {
@@ -135,7 +139,7 @@ pub fn run(state: Arc<NmosState>) -> anyhow::Result<()> {
                         let d = (delay + delay_step).min(max_delay);
                         delays.insert(entry.daemon_id, d);
                         reader.realign();
-                        tracing::info!(daemon_id = entry.daemon_id, delay_ms = d as f64 * 1000.0 / rate as f64, "tx read delay raised to fit this Source's writer");
+                        tracing::info!(daemon_id = entry.daemon_id, delay_ms = d as f64 * 1000.0 / rate as f64, error = %e, now, head = ?reader.head_index().ok(), "tx read delay raised to fit this Source's writer");
                     }
                     // One late block is silence for one period; only a Source that keeps failing
                     // is backed off.
