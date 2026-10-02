@@ -274,6 +274,14 @@ pub struct MxlAudioFlowSource {
     reader: mxl::SamplesReader,
     channels: usize,
     next_index: Option<u64>,
+    /// The flow this reads, to open it again when its writer was replaced.
+    flow_id: String,
+    /// The head last seen and since when it has not moved: a head that stands still while time
+    /// passes is a writer that stopped, or a flow that was created anew under the same id (a
+    /// restarted writer) while this reader still maps the old one. Read on, it would replay the
+    /// same block forever (2026-10-02: three music streams frozen after their players restarted).
+    last_head: u64,
+    head_since: std::time::Instant,
     // for `current_index`: MXL's own time (the media clock when MXL_MEDIA_CLOCK is set), never
     // CLOCK_TAI read directly - that would disagree with every flow's index on a media clock
     instance: mxl::MxlInstance,
@@ -310,7 +318,16 @@ impl MxlAudioFlowSource {
             .map_err(|e| anyhow::anyhow!("to_samples_reader failed: {e:?}"))?;
 
         let sample_rate = mxl::Rational { numerator: cfg.sample_rate as i64, denominator: 1 };
-        Ok(Self { reader, channels, next_index: None, instance, sample_rate })
+        Ok(Self {
+            reader,
+            channels,
+            next_index: None,
+            flow_id: flow_id.to_string(),
+            last_head: 0,
+            head_since: std::time::Instant::now(),
+            instance,
+            sample_rate,
+        })
     }
 
     /// "Now" as an index of this flow's rate, on MXL's clock (see the field note).
@@ -341,7 +358,7 @@ impl MxlAudioFlowSource {
     pub fn read_aligned(&mut self, count: usize, now: u64, delay: u64, tolerance: u64, timeout: std::time::Duration) -> anyhow::Result<Vec<Vec<f32>>> {
         // A writer keeping up (head within `delay` of now) is read exactly `delay` behind now:
         // deterministic. Only one lagging further is read `delay` behind its own head.
-        let head = self.head_index()?;
+        let head = self.live_head()?;
         let target_end = if head + delay >= now { now.saturating_sub(delay) } else { head.saturating_sub(delay) };
         let end = match self.next_index {
             Some(i) if i.abs_diff(target_end) <= tolerance => i,
@@ -350,6 +367,44 @@ impl MxlAudioFlowSource {
         let planar = self.read_samples_at(end, count, timeout)?;
         self.next_index = Some(end + count as u64);
         Ok(planar)
+    }
+
+    /// The flow's head, checked for a writer that stopped or was replaced: a head that has not
+    /// moved for `STALE_HEAD` makes this reader open the flow again (a replaced flow then reads
+    /// from its new writer); while it still does not move, reads fail (silence) instead of
+    /// replaying the last block.
+    fn live_head(&mut self) -> anyhow::Result<u64> {
+        const STALE_HEAD: std::time::Duration = std::time::Duration::from_millis(500);
+        let head = self.head_index()?;
+        if head != self.last_head {
+            self.last_head = head;
+            self.head_since = std::time::Instant::now();
+            return Ok(head);
+        }
+        if self.head_since.elapsed() < STALE_HEAD {
+            return Ok(head);
+        }
+        // stood still: open the flow again (a restarted writer created it anew)
+        self.head_since = std::time::Instant::now();
+        let reopened = self
+            .instance
+            .create_flow_reader(&self.flow_id)
+            .map_err(|e| anyhow::anyhow!("flow {} stopped and cannot be opened again: {e:?}", self.flow_id))?
+            .to_samples_reader()
+            .map_err(|e| anyhow::anyhow!("to_samples_reader failed: {e:?}"))?;
+        let new_head = reopened
+            .get_runtime_info()
+            .map_err(|e| anyhow::anyhow!("get_runtime_info failed: {e:?}"))?
+            .headIndex;
+        self.reader = reopened;
+        self.next_index = None;
+        self.last_head = new_head;
+        if new_head == head {
+            // no writer: silence (the caller reports it once and backs off), not a replay
+            anyhow::bail!("flow {} has no writer (head stands still)", self.flow_id);
+        }
+        tracing::warn!(flow = %self.flow_id, old_head = head, new_head, "flow replaced by a new writer: reading the new one");
+        Ok(new_head)
     }
 
     /// Forgets the read position: the next `read_aligned` starts at its target again.
