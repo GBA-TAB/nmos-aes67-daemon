@@ -164,6 +164,11 @@ impl Default for Is08State {
 }
 
 impl Is08State {
+    /// Drops every packed-rx writer: their flows are released (SIGTERM, C-LIFE-2).
+    pub async fn release_flows(&self) {
+        self.packed_rx_flows.lock().await.clear();
+    }
+
     /// Seeds/resizes the always-present `source-stream:<daemon_id>` Output to match the daemon
     /// Source's current channel count — called by nmos/sync.rs on every Added/Changed daemon
     /// Source diff. Existing crosspoint entries are preserved where their channel index is still

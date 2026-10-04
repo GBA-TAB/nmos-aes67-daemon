@@ -5,6 +5,7 @@ mod rt;
 mod alsa_playback;
 mod clock;
 mod config;
+mod contract;
 mod daemon_client;
 mod mxl_domain;
 mod mxl_flow;
@@ -56,11 +57,45 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config_path = std::env::args()
-        .nth(1)
+    // The media function contract (contract.rs): --version and --preflight, the BR_ namespace,
+    // sysexits codes, the startup preflight.
+    if args.iter().any(|a| a == "--version") {
+        println!("mxl-bridge {} (libmxl {})", env!("CARGO_PKG_VERSION"), contract::LIBMXL);
+        std::process::exit(mxl_function::exit::OK);
+    }
+    let env = Arc::new(contract::env());
+    env.warn_unknown();
+    let config_path = env
+        .get("CONFIG")
+        .map(str::to_string)
+        .or_else(|| args.iter().skip(1).find(|a| !a.starts_with("--")).cloned())
         .unwrap_or_else(|| "mxl-bridge.conf".to_string());
-    let cfg = Config::load(&config_path)?;
+    env.set_effective("CONFIG", config_path.clone());
+    let cfg = match Config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("{e:#}");
+            std::process::exit(mxl_function::exit::CONFIG);
+        }
+    };
     tracing::info!(?cfg, "loaded config");
+    let preflight = mxl_function::preflight::run(std::path::Path::new(&cfg.mxl_domain), contract::allow(&env));
+    if args.iter().any(|a| a == "--preflight") {
+        preflight.print();
+        std::process::exit(preflight.exit_code());
+    }
+    for f in &preflight.findings {
+        match f.severity {
+            mxl_function::preflight::Severity::Ok => tracing::info!(check = f.check, "preflight: {}", f.sentence),
+            mxl_function::preflight::Severity::Warn => tracing::warn!(check = f.check, "preflight: {}", f.sentence),
+            mxl_function::preflight::Severity::Fail => tracing::error!(check = f.check, "preflight: {}", f.sentence),
+        }
+    }
+    if preflight.findings.iter().any(|f| f.check != "clock" && f.severity == mxl_function::preflight::Severity::Fail) {
+        std::process::exit(mxl_function::exit::UNAVAILABLE);
+    }
+    let clock_problem =
+        preflight.findings.iter().find(|f| f.check == "clock" && f.severity == mxl_function::preflight::Severity::Fail).map(|f| f.sentence.clone());
 
     let mxl_so = match &cfg.mxl_so_path {
         Some(p) => std::path::PathBuf::from(p),
@@ -195,7 +230,27 @@ async fn main() -> anyhow::Result<()> {
     });
     tokio::spawn(nmos::sync::run(state.clone(), diff_rx));
 
-    nmos::run(state).await
+    // The contract's routes (/api/v1/live, health, status, version, settings, descriptor, /metrics).
+    let instance = mxl_flow::naming().app_name();
+    let contract = {
+        let info = mxl_function::FunctionInfo {
+            type_name: "mxl-bridge".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            libmxl: contract::LIBMXL.into(),
+            env_prefix: contract::PREFIX.into(),
+            instance_name: instance.clone(),
+            nmos_mode: "native".into(),
+        };
+        let (hs, ss, ds) = (state.clone(), state.clone(), state.clone());
+        Arc::new(
+            mxl_function::FunctionState::new(info, env, Arc::new(mxl_function::Registry::new(&instance)))
+                .with_domain(&state.cfg.mxl_domain)
+                .with_health(move || contract::health(&hs, clock_problem.as_deref()))
+                .with_status(move || contract::status(&ss))
+                .with_descriptor(move || contract::descriptor(&ds)),
+        )
+    };
+    nmos::run(state, mxl_function::router(contract)).await
 }
 
 /// The daemon's `alsa_channels` (GET /api/config).

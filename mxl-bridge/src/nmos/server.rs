@@ -66,7 +66,7 @@ pub fn router(state: S) -> Router {
         .route("/x-nmos/connection/v1.2/bulk/senders", get(|| async { bulk_not_implemented() }))
         .route("/x-nmos/connection/v1.2/bulk/receivers", get(|| async { bulk_not_implemented() }))
         .merge(is08::router())
-        .fallback(|| async { not_found() })
+        .fallback(|uri: axum::http::Uri| async move { not_found_at(uri.path()) })
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -125,6 +125,12 @@ async fn list(items: &[&str]) -> Json<Vec<String>> {
 
 fn client_ip(state: &NmosState) -> String {
     state.cfg.ip_addr.clone()
+}
+
+/// A 404 whose `error` is a sentence naming the path (the media function contract, C-API-7).
+fn not_found_at(path: &str) -> axum::response::Response {
+    let error = format!("Nothing is served at {path}.");
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"code": 404, "error": error, "debug": null}))).into_response()
 }
 
 fn not_found() -> axum::response::Response {

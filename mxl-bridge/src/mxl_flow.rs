@@ -76,7 +76,7 @@ pub fn build_audio_flow_def(
     label: &str,
     channel_count: u32,
 ) -> String {
-    serde_json::json!({
+    let def = serde_json::json!({
         "id": flow_id.to_string(),
         "device_id": device_id.to_string(),
         "source_id": source_id.to_string(),
@@ -88,17 +88,17 @@ pub fn build_audio_flow_def(
         "channel_count": channel_count,
         "bit_depth": 32,
         "parents": [],
-        "tags": {
-            // Fixed, never interpolated with `label`: MXL's FlowParser requires this tag's value
-            // as a strict "<scope>:<value>" pair where scope must literally be "device" or
-            // "node" (confirmed the hard way — a packed flow's label, e.g. "packed-rx:mix1",
-            // itself contains a colon, which broke this when it used to be
-            // `format!("mxl-bridge:{label}")`). Every flow mxl-bridge creates shares one device,
-            // so one fixed grouphint value is both correct and simpler.
-            "urn:x-nmos:tag:grouphint/v1.0": ["device:mxl-bridge"]
-        }
-    })
-    .to_string()
+    });
+    // A complete IS-04 Flow (`version`) grouped `<instance>:<role>` (the media function contract
+    // of mxl-k8s-operator, C-ID-4/5/7). MXL's FlowParser takes the grouphint as
+    // `<group>:<role>[:device|node]` with no ':' inside a part (the old fixed `device:mxl-bridge`
+    // came from misreading that); `grouphint` replaces any ':' (a packed flow's `packed-rx:mix1`).
+    // The role is the flow's resource: its label is `<app>-<resource>` (naming), else the label.
+    let mut def = def;
+    let instance = naming().app_name();
+    let role = label.strip_prefix(&format!("{instance}-")).unwrap_or(label);
+    mxl_function::identity::complete_flow_def(&mut def, &instance, role, None, None);
+    def.to_string()
 }
 
 /// How far `next_index` may diverge from `MxlInstance::get_current_index` (the real,
