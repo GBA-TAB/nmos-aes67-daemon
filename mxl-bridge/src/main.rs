@@ -44,6 +44,10 @@ pub(crate) fn find_mxl_so() -> anyhow::Result<std::path::PathBuf> {
     anyhow::bail!("could not find libmxl.so under {build_dir:?}/mxl-sys-*/out/lib/")
 }
 
+
+/// The port `--emit-type` declares (the manifest's `httpPort`): this function's conventional
+/// `nmos_node_port`. Under the operator the configuration must keep it.
+const HTTP_PORT: u16 = 3213;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Test tooling (contract/audiotest.py), not the bridge: no tracing on stdout, no server.
@@ -64,20 +68,28 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(mxl_function::exit::OK);
     }
     let env = Arc::new(contract::env());
+    if args.iter().any(|a| a == "--emit-type") {
+        let info = mxl_function::FunctionInfo {
+            type_name: "mxl-bridge".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            libmxl: contract::LIBMXL.into(),
+            env_prefix: contract::PREFIX.into(),
+            instance_name: String::new(),
+            nmos_mode: "native".into(),
+        };
+        print!("{}", mxl_function::manifest::render(&info, &env, &contract::type_spec(HTTP_PORT)));
+        std::process::exit(mxl_function::exit::OK);
+    }
     env.warn_unknown();
-    let config_path = env
-        .get("CONFIG")
-        .map(str::to_string)
-        .or_else(|| args.iter().skip(1).find(|a| !a.starts_with("--")).cloned())
-        .unwrap_or_else(|| "mxl-bridge.conf".to_string());
-    env.set_effective("CONFIG", config_path.clone());
-    let cfg = match Config::load(&config_path) {
+    let config_path = env.config_path(&args, "mxl-bridge.conf");
+    let mut cfg = match Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("{e:#}");
             std::process::exit(mxl_function::exit::CONFIG);
         }
     };
+    cfg.mxl_domain = env.domain(&cfg.mxl_domain);
     tracing::info!(?cfg, "loaded config");
     let preflight = mxl_function::preflight::run(std::path::Path::new(&cfg.mxl_domain), contract::allow(&env));
     if args.iter().any(|a| a == "--preflight") {

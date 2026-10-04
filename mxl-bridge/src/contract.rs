@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 
-use mxl_function::config::Key;
 use mxl_function::{EnvConfig, Health};
 use serde_json::{Value, json};
 
@@ -19,14 +18,22 @@ pub const PREFIX: &str = "BR_";
 /// The MXL SDK version of our fork this is built against.
 pub const LIBMXL: &str = "1.2.0";
 
-pub fn keys() -> Vec<Key> {
-    vec![
-        Key::new("CONFIG").with_default("mxl-bridge.conf").kind("path").group("Configuration").describe(
-            "The bridge's JSON configuration (aes67-daemon API, ALSA, capacity, NMOS); else the first argument",
-        ),
-        Key::new("ALLOW_NON_TMPFS").kind("bool").group("Unsafe").describe("Run on a domain that is not RAM-backed (C-ID-12)"),
-        Key::new("ALLOW_UNSET_TAI").kind("bool").group("Unsafe").describe("Run with the kernel TAI offset unset when MXL time is CLOCK_TAI (C-ID-13)"),
-    ]
+pub fn keys() -> Vec<mxl_function::config::Key> {
+    mxl_function::config::standard_keys("mxl-bridge.conf")
+}
+
+/// What `--emit-type` says beyond the settings.
+pub fn type_spec(http_port: u16) -> mxl_function::manifest::TypeSpec {
+    mxl_function::manifest::TypeSpec {
+        display_name: "ST 2110-30 / AES67 bridge".into(),
+        notes: "aes67-linux-daemon Sinks and Sources mirrored as MXL flows over its RAVENNA ALSA device; IS-08 packed flows. The settings are the JSON document at BR_CONFIG.".into(),
+        image: "mxl-bridge".into(),
+        http_port,
+        domain_env: format!("{PREFIX}DOMAIN"),
+        config_dir_env: format!("{PREFIX}CONFIG_DIR"),
+        needs_pinning: true,
+        hardware: serde_json::json!({}),
+    }
 }
 
 pub fn env() -> EnvConfig {
