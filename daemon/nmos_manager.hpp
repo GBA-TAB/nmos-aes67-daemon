@@ -153,6 +153,8 @@ class NmosManager {
     std::string staged_sender_id;   // "" = null
     Is05Activation staged_act;
     std::vector<ReceiverTp> staged_tp;
+    // the PATCH's transport_file (an SDP), used over the registry's for the next activation
+    std::string staged_transport_file;
     // IS-05 active
     bool        active_master_enable{false};
     std::string active_sender_id;

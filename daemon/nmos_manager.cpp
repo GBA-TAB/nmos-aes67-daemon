@@ -1431,6 +1431,10 @@ bool NmosManager::patch_receiver_staged(uint8_t daemon_id,
     rr.staged_master_enable = *v;
   if (auto v = pt.get_optional<std::string>("sender_id"))
     rr.staged_sender_id = (*v == "null") ? "" : *v;
+  // IS-05: a receiver takes the sender's transport file in the PATCH itself; the registry is only
+  // asked when none came (a sender that is not registered, e.g. one in another facility, has none)
+  if (auto v = pt.get_optional<std::string>("transport_file.data"))
+    rr.staged_transport_file = (*v == "null") ? "" : *v;
 
   auto& act = rr.staged_act;
   if (auto v = pt.get_optional<std::string>("activation.mode"))
@@ -1624,8 +1628,9 @@ void NmosManager::apply_receiver_activation(uint8_t daemon_id) {
   std::vector<ReceiverTp> tp;
   std::string activation_time;
   std::string staged_act_mode;
+  std::string transport_file;
   {
-    std::shared_lock lock(resources_mutex_);
+    std::unique_lock lock(resources_mutex_);
     auto it = receivers_.find(daemon_id);
     if (it == receivers_.end()) return;
     master_enable   = it->second.staged_master_enable;
@@ -1633,11 +1638,16 @@ void NmosManager::apply_receiver_activation(uint8_t daemon_id) {
     tp              = it->second.staged_tp;
     activation_time = it->second.staged_act.activation_time;
     staged_act_mode = it->second.staged_act.mode;
+    transport_file  = std::move(it->second.staged_transport_file);
+    it->second.staged_transport_file.clear();
   }
 
-  // Resolve SDP for remote sender connection
+  // Resolve SDP for remote sender connection: the PATCH's transport file, else the sender's
   std::string sdp;
-  if (master_enable && !sender_id.empty()) {
+  if (master_enable && !transport_file.empty()) {
+    sdp = transport_file;
+    tp = build_receiver_tp_from_sdp(sdp);
+  } else if (master_enable && !sender_id.empty()) {
     uint8_t src_daemon_id = 0;
     bool found_local = false;
     {
