@@ -46,12 +46,19 @@ pub async fn snapshot(state: &NmosState) -> Activations {
     a
 }
 
+/// One save at a time: two activations close together used to save concurrently through the same
+/// temp file, and the second rename found it gone ("No such file or directory", 2026-10-07) -- that
+/// save was lost, and with it the latest activation after the next restart.
+static SAVING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Writes the current activations (atomically: temp file + rename). No-op without `state_path`.
 pub async fn save(state: &NmosState) {
     let Some(path) = state.cfg.state_path.clone() else { return };
+    let _one = SAVING.lock().await;
+    // the snapshot under the lock: the last save to finish carries the latest state
     let a = snapshot(state).await;
     let result = (|| -> anyhow::Result<()> {
-        let tmp = format!("{path}.tmp");
+        let tmp = format!("{path}.{}.tmp", std::process::id());
         std::fs::write(&tmp, serde_json::to_vec_pretty(&a)?)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
