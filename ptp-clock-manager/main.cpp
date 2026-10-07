@@ -150,11 +150,16 @@ int main(int argc, char** argv) {
                          d->name().c_str());
     }
 
-    /* Open RAVENNA netlink */
+    /* Open RAVENNA netlink: optional when only MXL's media clock is wanted (a host without a
+     * RAVENNA card: --phc and --media-clock, the record from the NIC's clock alone) */
     RavennaPtp ptp;
-    if (!ptp.open()) {
-        std::fputs("ptp-clock-manager: failed to open RAVENNA netlink socket\n", stderr);
-        return 1;
+    const bool have_ravenna = ptp.open();
+    if (!have_ravenna) {
+        if (phc_device.empty() || media_clock_path.empty()) {
+            std::fputs("ptp-clock-manager: failed to open RAVENNA netlink socket\n", stderr);
+            return 1;
+        }
+        std::puts("ptp-clock-manager: no RAVENNA driver: publishing the media clock only");
     }
 
     /* External PTP mode: PHC (ptp4l, hardware timestamps) -> driver */
@@ -212,7 +217,7 @@ int main(int argc, char** argv) {
                                     (mc_servo.mapping().rate - 1.0) * 1e6, static_cast<long long>(mc_servo.last_phase_error_ns()), mc_servo.steps());
                 }
             }
-            if (auto s = phc->sample()) {
+            if (auto s = have_ravenna ? phc->sample() : std::nullopt) {
                 int err = ptp.send_external_sample(s->ptp_ns, s->mono_ns, p4l.gmid, p4l.locked);
                 if (err != last_err) {
                     std::fprintf(stderr, "ptp-clock-manager: external sample -> driver: %d%s\n", err,
@@ -222,7 +227,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        auto status = ptp.get_status();
+        auto status = have_ravenna ? ptp.get_status() : std::nullopt;
         if (status) {
             bool locked = (status->lock_state == 2 /* PTPLS_LOCKED */);
             if (!locked) applied_freq_ppb = 0;
@@ -242,7 +247,7 @@ int main(int argc, char** argv) {
 
     std::puts("ptp-clock-manager: shutting down");
     for (auto& d : drivers) d->stop();
-    ptp.close();
+    if (have_ravenna) ptp.close();
     shm_unlink(PTP_CLOCK_SHM_NAME);
     munmap(shm, sizeof(PtpClockShm));
     return 0;
