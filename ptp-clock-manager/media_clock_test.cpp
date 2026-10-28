@@ -1,11 +1,15 @@
 // Servo test: a simulated PHC at +27 ppm vs the raw clock, with read noise and one ptp4l step.
 // MXL time must never go backwards, must follow the PHC to well under a microsecond once settled,
-// and a step must be followed (one re-anchor), not smeared.
+// and a step must be followed (one re-anchor), not smeared. The publisher adds the PHC's TAI
+// correction (PTP-HARDENING 6.2) to refMediaNs and nothing else.
+#undef NDEBUG  // the build is Release (-DNDEBUG): the checks below must run anyway
 #include "media_clock.hpp"
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <string>
+#include <unistd.h>
 
 int main() {
     MediaClockServo s;
@@ -35,6 +39,25 @@ int main() {
     assert(s.steps() == 1);
     assert(worst_settled < 500);
     assert(std::abs((s.mapping().rate - 1) * 1e6 - ppm) < 0.5);
+
+    // UTC numbering on the wire: the record = PHC + 37 s, the rate and raw anchor unchanged
+    const std::string path = "/dev/shm/media-clock-test-" + std::to_string(getpid());
+    {
+        MediaClockPublisher pub(path);
+        const bool opened = pub.open();
+        assert(opened);
+        pub.set_tai_correction_ns(37'000'000'000LL);
+        pub.publish(s.mapping(), s.mapping().ref_raw, true, 0);
+        FILE* f = std::fopen(path.c_str(), "rb");
+        mxlMediaClockRecord rec{};
+        assert(f);
+        const size_t n = std::fread(&rec, sizeof rec, 1, f);
+        assert(n == 1);
+        std::fclose(f);
+        assert(rec.refMediaNs == s.mapping().ref_media + 37'000'000'000LL);
+        assert(rec.refRawNs == s.mapping().ref_raw && rec.rate == s.mapping().rate);
+    }
+    unlink(path.c_str());
     std::puts("PASS");
     return 0;
 }

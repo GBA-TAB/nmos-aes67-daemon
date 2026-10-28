@@ -22,6 +22,7 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/timex.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -87,6 +88,11 @@ static void usage(const char* prog) {
         "  --media-clock PATH   with --phc: publish MXL's media clock record there (MXL_MEDIA_CLOCK),\n"
         "                       e.g. <MXL domain>/.media-clock. --phc turns the CLOCK_TAI discipline\n"
         "                       off (the system clock stays on NTP); --tai turns it back on\n"
+        "  --phc-class-file PATH with --media-clock: the PHC's numbering class (mxl-stack\n"
+        "                       /etc/mxl-lab/wire-offset: 37 = TAI, 0 = UTC numbering); the record\n"
+        "                       then carries PHC + (kernel TAI offset - class) = true TAI. Read once\n"
+        "                       at start: the class changes only in mxl-lab-ptp-relock, which restarts\n"
+        "                       this publisher. Missing or unreadable: no correction (PHC = TAI)\n"
         "  --help\n",
         prog);
 }
@@ -101,6 +107,7 @@ int main(int argc, char** argv) {
     int ptp_domain = 0;
     bool poll_given = false;
     std::string media_clock_path;
+    std::string phc_class_file;
     bool tai_given = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -109,6 +116,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-tai")   { do_tai = false; tai_given = true; }
         else if (a == "--tai")      { do_tai = true;  tai_given = true; }
         else if (a == "--media-clock" && i + 1 < argc) media_clock_path = argv[++i];
+        else if (a == "--phc-class-file" && i + 1 < argc) phc_class_file = argv[++i];
         else if (a == "--pipewire") do_pipewire = true;
         else if (a == "--alsa-sink" && i + 1 < argc) alsa_sinks.push_back(argv[++i]);
         else if (a == "--poll-ms"   && i + 1 < argc) { poll_ms = static_cast<unsigned>(std::stoul(argv[++i])); poll_given = true; }
@@ -181,6 +189,24 @@ int main(int argc, char** argv) {
             std::perror("ptp-clock-manager: SCHED_FIFO for the media clock publisher (continuing)");
         mc_pub = std::make_unique<MediaClockPublisher>(media_clock_path);
         if (!mc_pub->open()) return 1;
+        if (!phc_class_file.empty()) {
+            /* The wire class (mxl-stack PTP-HARDENING 6.2): behind the FS the PHC can carry UTC
+             * numbering; MXL time stays true TAI. Only 0 or the kernel's TAI offset are classes. */
+            timex tx{};
+            const int tai = adjtimex(&tx) >= 0 ? tx.tai : -1;
+            long cls = -1;
+            if (FILE* f = std::fopen(phc_class_file.c_str(), "r")) {
+                if (std::fscanf(f, "%ld", &cls) != 1) cls = -1;
+                std::fclose(f);
+            }
+            if (tai > 0 && (cls == 0 || cls == tai)) {
+                mc_pub->set_tai_correction_ns(static_cast<int64_t>(tai - cls) * 1000000000LL);
+                std::printf("ptp-clock-manager: PHC class %ld, kernel TAI offset %d: record = PHC %+ld s\n", cls, tai, tai - cls);
+            } else {
+                std::printf("ptp-clock-manager: no clear PHC class in %s (class %ld, TAI offset %d): record = PHC\n",
+                            phc_class_file.c_str(), cls, tai);
+            }
+        }
         std::printf("ptp-clock-manager: publishing MXL media clock at %s\n", media_clock_path.c_str());
     }
     Ptp4lState p4l;

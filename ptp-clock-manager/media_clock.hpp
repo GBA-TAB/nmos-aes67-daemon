@@ -66,8 +66,12 @@ public:
     bool open();
     void publish(const MediaClockServo::Mapping& m, int64_t updated_raw, bool locked, uint64_t gmid);
     const std::string& path() const { return path_; }
+    // Added to every refMediaNs: the PHC's numbering -> true TAI (mxl-stack PTP-HARDENING 6.2,
+    // phcTaiCorrectionS). 0 while the PHC carries TAI numbering; set once at start.
+    void set_tai_correction_ns(int64_t ns) { tai_correction_ns_ = ns; }
 
 private:
     std::string path_;
     mxlMediaClockRecord* rec_{nullptr};
+    int64_t tai_correction_ns_{0};
 };

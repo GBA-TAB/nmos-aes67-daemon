@@ -96,7 +96,7 @@ void MediaClockPublisher::publish(const MediaClockServo::Mapping& m, int64_t upd
     __atomic_add_fetch(&rec_->seq, 1U, __ATOMIC_RELEASE);  // odd: writing
     __atomic_thread_fence(__ATOMIC_RELEASE);
     rec_->refRawNs = m.ref_raw;
-    rec_->refMediaNs = m.ref_media;
+    rec_->refMediaNs = m.ref_media + tai_correction_ns_;
     rec_->rate = m.rate;
     rec_->updatedRawNs = updated_raw;
     rec_->flags = locked ? MXL_MEDIA_CLOCK_LOCKED : 0U;
